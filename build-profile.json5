@@ -1,0 +1,56 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "material": {
+          "certpath": "C:/Users/黄启佳/.ohos/config/openharmony/default_My_smart_home_LJrS6wMjqEdbbT_9P2F-s17VB7YExflVG6w-N0Hi6Lk=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001BD4462D2F35D2D1C26D403E6FB65A36A4F73D38FCEA144F70EE9887EBE83A76A97DF4FD09CE33FD",
+          "profile": "C:/Users/黄启佳/.ohos/config/openharmony/default_My_smart_home_LJrS6wMjqEdbbT_9P2F-s17VB7YExflVG6w-N0Hi6Lk=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:/Users/黄启佳/.ohos/config/openharmony/default_My_smart_home_LJrS6wMjqEdbbT_9P2F-s17VB7YExflVG6w-N0Hi6Lk=.p12",
+          "storePassword": "0000001B3E45A15279F61725E1C50901D2AB00B5E6E090B0391A98AE96C8291E5677ECCB28A5D5590870B8"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compileSdkVersion": 23,
+        "targetSdkVersion": 11,
+        "compatibleSdkVersion": 11,
+        "runtimeOS": "OpenHarmony",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": false
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

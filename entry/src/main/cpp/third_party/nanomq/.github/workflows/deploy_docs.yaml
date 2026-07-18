@@ -1,0 +1,112 @@
+name: Deploy Docs
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'docs/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'nanomq'
+    steps:
+    - name: clone docs
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        fetch-depth: 1
+        path: docs-files
+
+    - name: clone frontend
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        fetch-depth: 1
+        repository: 'emqx/emqx-io-docs-frontend'
+        ref: next
+        token: ${{ secrets.CI_GIT_TOKEN }}
+        path: frontend
+
+    - name: use python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: '3.10'
+
+    - name: use node.js
+      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      with:
+        node-version-file: 'frontend/.nvmrc'
+
+    - name: use pnpm
+      uses: pnpm/action-setup@08c4be7e2e672a47d11bd04269e27e5f3e8529cb # v6.0.0
+      with:
+        version: 8
+
+    - name: set env
+      run: |
+         BRANCH=$(echo ${{ github.ref }} | sed -r  "s ^refs/heads/|^refs/tags/(.*) \1 g")
+         if [ "$BRANCH" = "master" ];then
+         VERSION="latest"
+         else
+         VERSION=v$BRANCH
+         fi
+         echo "DOCS_BRANCH=$BRANCH" >> $GITHUB_ENV
+         echo "VERSION=$VERSION" >> $GITHUB_ENV
+         echo "DOCS_TYPE=nanomq" >> $GITHUB_ENV
+
+    - name: remove unused files
+      run: |
+        cd docs-files
+        python3 .github/scripts/remove_unused.py directory.json $(pwd)/docs
+
+    - name: move files
+      run: |
+        rm frontend/docs/*.md || true
+        rm frontend/README.md || true
+        mkdir -p frontend/docs/en/${VERSION}/
+        mkdir -p frontend/docs/zh/${VERSION}/
+        mkdir -p frontend/docs/public/api/
+        cp -r docs-files/docs/en_US/* frontend/docs/en/${VERSION}/
+        cp -r docs-files/docs/zh_CN/* frontend/docs/zh/${VERSION}/
+        cp docs-files/docs/directory.json frontend/docs/.vitepress/config/directory.json
+
+    - name: generate version config
+      run: |
+        echo '["latest"]' > frontend/docs/public/api/${DOCS_TYPE}_versions.json
+
+    - name: build docs
+      run: |
+        cd frontend
+        pnpm install
+        pnpm build
+
+    - name: upload dist
+      run: |
+        cd frontend/docs/.vitepress/
+        pip3 install coscmd
+        coscmd config -a ${{ secrets.TENCENT_COS_ID }} -s ${{ secrets.TENCENT_COS_KEY }} -b nanomq-io-1302406139 -r ap-hongkong
+        coscmd delete -r -f docs/en/${VERSION} || true
+        coscmd delete -r -f docs/zh/${VERSION} || true
+        coscmd config -a ${{ secrets.TENCENT_COS_ID }} -s ${{ secrets.TENCENT_COS_KEY }} -b nanomq-io-1302406139 -e cos.accelerate.myqcloud.com
+        coscmd upload -r dist/ /docs/
+
+    - name: refresh cdn cache
+      run: |
+        pip3 install tccli
+        tccli configure set secretId ${{ secrets.TENCENT_COS_ID }}
+        tccli configure set secretKey ${{ secrets.TENCENT_COS_KEY }}
+        tccli configure set region ap-hongkong
+        tccli cdn PurgePathCache --Paths '["https://nanomq.io/docs/", "https://nanomq-docs.emqx.net/"]' --FlushType delete
+
+    - name: update search index
+      uses: emqx/docsearch-scraper@main
+      env:
+        APPLICATION_ID: ${{ secrets.ALGOLIA_APPLICATION_ID }}
+        API_KEY: ${{ secrets.ALGOLIA_API_KEY }}
+      with:
+        docs_type: ${{ env.DOCS_TYPE }}
+        docs_version: ${{ env.VERSION }}

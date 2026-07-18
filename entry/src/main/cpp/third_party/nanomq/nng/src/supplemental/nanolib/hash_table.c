@@ -1,0 +1,1081 @@
+//
+// Copyright 2020 NanoMQ Team, Inc. <jaylin@emqx.io>
+//
+// This software is supplied under the terms of the MIT License, a
+// copy of which should be located in the distribution where this
+// file was obtained (LICENSE.txt).  A copy of the license may also be
+// found online at https://opensource.org/licenses/MIT.
+//
+#include "nng/supplemental/nanolib/hash_table.h"
+#include "core/nng_impl.h"
+#include "nng/nng.h"
+#include "nng/supplemental/nanolib/binary_search.h"
+#include "nng/supplemental/nanolib/khash.h"
+#include "nng/supplemental/nanolib/mqtt_db.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
+
+#define dbhash_check_init(name, h, lock) \
+	if (h == NULL) {                 \
+		h = kh_init(name);       \
+		nni_rwlock_init(&lock);  \
+	}
+
+static dbhash_atpair_t *dbhash_atpair_alloc(uint32_t alias, const char *topic);
+static void             dbhash_atpair_free(dbhash_atpair_t *atpair);
+
+KHASH_MAP_INIT_INT(alias_table, dbhash_atpair_t **)
+static nni_rwlock alias_lock;
+static khash_t(alias_table) *ah = NULL;
+// avoid hash collision
+static uint8_t g_nanomq_hash_seed[16];
+
+
+/* left operand */
+#define ROTL64(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+
+/* SipRound compression */
+#define SIPROUND do { \
+    v0 += v1; v1 = ROTL64(v1, 13); v1 ^= v0; v0 = ROTL64(v0, 32); \
+    v2 += v3; v3 = ROTL64(v3, 16); v3 ^= v2; \
+    v0 += v3; v3 = ROTL64(v3, 21); v3 ^= v0; \
+    v2 += v1; v1 = ROTL64(v1, 17); v1 ^= v2; v2 = ROTL64(v2, 32); \
+} while(0)
+
+/* * Cross-platform safe macro: Assembles 8 uint8_t values into 1 uint64_t using little-endian byte order
+ * Provides consistent interpretation across architectures (ARM, MIPS, x86, etc.)
+ */
+static inline uint64_t U8TO64_LE(const uint8_t *p) {
+    return ((uint64_t)p[0]      ) | ((uint64_t)p[1] <<  8) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
+/**
+ * @brief generate 16 byte (128bit) random Hash seed
+ * ⚠️ Must be inited first with broker at start
+ * This mitigates CVE hash-flooding (collision) attacks by using a per-process random key.
+ *
+ */
+void nanomq_init_hash_seed(void) {
+    for (int i = 0; i < 4; i++) {
+        uint32_t r = nng_random();
+        g_nanomq_hash_seed[i * 4 + 0] = (uint8_t)(r & 0xFF);
+        g_nanomq_hash_seed[i * 4 + 1] = (uint8_t)((r >> 8) & 0xFF);
+        g_nanomq_hash_seed[i * 4 + 2] = (uint8_t)((r >> 16) & 0xFF);
+        g_nanomq_hash_seed[i * 4 + 3] = (uint8_t)((r >> 24) & 0xFF);
+    }
+}
+
+/**
+ * @brief Standard SipHash-2-4 Algo for 64bit
+ */
+static uint64_t
+siphash24(const void *src, size_t src_sz, const uint8_t key[16])
+{
+    const uint8_t *ni = (const uint8_t *)src;
+    const uint8_t *end = ni + (src_sz - (src_sz % 8));
+
+    uint64_t k0 = U8TO64_LE(key);
+    uint64_t k1 = U8TO64_LE(key + 8);
+
+    uint64_t v0 = k0 ^ 0x736f6d6570736575ULL;
+    uint64_t v1 = k1 ^ 0x646f72616e646f6dULL;
+    uint64_t v2 = k0 ^ 0x6c7967656e657261ULL;
+    uint64_t v3 = k1 ^ 0x7465646279746573ULL;
+
+    uint64_t m;
+
+    for (; ni != end; ni += 8) {
+        m = U8TO64_LE(ni);
+        v3 ^= m;
+        SIPROUND;
+        SIPROUND;
+        v0 ^= m;
+    }
+
+    int left = src_sz & 7;
+    m = ((uint64_t)(src_sz & 0xff)) << 56;
+    switch (left) {
+        case 7: m |= ((uint64_t)ni[6]) << 48; // fallthrough
+        case 6: m |= ((uint64_t)ni[5]) << 40; // fallthrough
+        case 5: m |= ((uint64_t)ni[4]) << 32; // fallthrough
+        case 4: m |= ((uint64_t)ni[3]) << 24; // fallthrough
+        case 3: m |= ((uint64_t)ni[2]) << 16; // fallthrough
+        case 2: m |= ((uint64_t)ni[1]) <<  8; // fallthrough
+        case 1: m |= ((uint64_t)ni[0]);       // fallthrough
+        case 0: break;
+    }
+
+    v3 ^= m;
+    SIPROUND;
+    SIPROUND;
+    v0 ^= m;
+
+    v2 ^= 0xff;
+    SIPROUND;
+    SIPROUND;
+    SIPROUND;
+    SIPROUND;
+
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+/**
+ * @brief NanoMQ-adapted 32-bit folded hash function
+ * @param src String data (Client ID)
+ * @param src_sz Length of the string
+ * @param key Random seed key, 16 bytes (128 bits)
+ * @return uint32_t Collision-resistant secure hash value generated
+ *  
+ * Cryptographic recommendation: XOR the high and low 32 bits 
+ * of the 64-bit result for folding. This maximizes entropy 
+ * preservation across both halves while ensuring extremely 
+ * uniform distribution in the resulting 32-bit hash space.
+ */
+uint32_t nanomq_siphash_32(const void *src, size_t src_sz, const uint8_t *key) {
+	uint64_t hash64;
+	if (key != NULL)
+		hash64 = siphash24(src, src_sz, key);
+	else
+		hash64 = siphash24(src, src_sz, g_nanomq_hash_seed);
+    return (uint32_t)(hash64 ^ (hash64 >> 32));
+}
+
+uint32_t
+DJBHash(char *str)
+{
+	unsigned int hash = 5381;
+	while (*str) {
+		hash = ((hash << 5) + hash) + (*str++); /* times 33 */
+	}
+	hash &= ~(1U << 31); /* strip the highest bit */
+	return hash;
+}
+
+uint32_t
+DJBHashn(char *str, uint16_t len)
+{
+	unsigned int hash = 5381;
+	uint16_t     i    = 0;
+	while (i < len) {
+		hash = ((hash << 5) + hash) + (*str++); /* times 33 */
+		i++;
+	}
+	hash &= ~(1U << 31); /* strip the highest bit */
+	return hash;
+}
+
+uint64_t
+DJBHash64n(uint8_t* str, uint32_t len)
+{
+    uint64_t hash = 5381;
+    uint64_t i    = 0;
+
+    for(i = 0; i < len; str++, i++) {
+        hash = ((hash << 5) + hash) + (*str);
+    }
+
+    return hash;
+}
+
+uint64_t
+DJBHash64(char *str)
+{
+	uint64_t hash = 5381;
+	int      c;
+
+	while ((c = *str++))
+		hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+	                                         // hash = hash * 33 + c;
+	return hash;
+}
+
+void
+dbhash_init_alias_table(void)
+{
+	dbhash_check_init(alias_table, ah, alias_lock);
+}
+
+static dbhash_atpair_t **
+find_atpair_vec(uint32_t p)
+{
+	khint_t k = kh_get(alias_table, ah, p);
+	if (k == kh_end(ah)) {
+		return NULL;
+	}
+
+	return kh_val(ah, k);
+}
+
+void
+dbhash_insert_atpair(uint32_t p, uint32_t a, const char *t)
+{
+	int               absent;
+	dbhash_atpair_t * atpair = dbhash_atpair_alloc(a, t);
+	dbhash_atpair_t **vec    = NULL;
+	khint32_t         k      = 0;
+
+	nni_rwlock_wrlock(&alias_lock);
+	k = kh_get(alias_table, ah, p);
+	if (k == kh_end(ah)) {
+		k = kh_put(alias_table, ah, p, &absent);
+		cvector_push_back(vec, atpair);
+		kh_value(ah, k) = vec;
+
+	} else {
+		size_t index = 0;
+		vec          = kh_val(ah, k);
+
+		if (true ==
+		    binary_search((void **) vec, 0, &index, &a, alias_cmp)) {
+			dbhash_atpair_t *tmp = vec[index];
+			dbhash_atpair_free(tmp);
+			vec[index] = atpair;
+		} else {
+			if (cvector_size(vec) == index) {
+				cvector_push_back(vec, atpair);
+			} else {
+				cvector_insert(vec, index, atpair);
+			}
+		}
+
+		kh_val(ah, k) = vec;
+	}
+
+	nni_rwlock_unlock(&alias_lock);
+	return;
+}
+
+const char *
+dbhash_find_atpair(uint32_t p, uint32_t a)
+{
+	nni_rwlock_rdlock(&alias_lock);
+	const char *t = NULL;
+
+	dbhash_atpair_t **vec = find_atpair_vec(p);
+	if (vec) {
+		size_t index = 0;
+
+		if (true ==
+		    binary_search((void **) vec, 0, &index, &a, alias_cmp)) {
+			if (vec[index]) {
+				t = vec[index]->topic;
+			}
+		}
+	}
+
+	nni_rwlock_unlock(&alias_lock);
+	return t;
+}
+
+void
+dbhash_del_atpair_queue(uint32_t p)
+{
+	nni_rwlock_wrlock(&alias_lock);
+
+	khint32_t k = kh_get(alias_table, ah, p);
+	if (k == kh_end(ah)) {
+		nni_rwlock_unlock(&alias_lock);
+		return;
+	}
+
+	dbhash_atpair_t **vec = kh_val(ah, k);
+	;
+	if (vec) {
+		size_t size = cvector_size(vec);
+		for (size_t i = 0; i < size; i++) {
+			if (vec[i]) {
+				dbhash_atpair_free(vec[i]);
+			}
+		}
+		cvector_free(vec);
+	}
+
+	kh_del(alias_table, ah, k);
+	nni_rwlock_unlock(&alias_lock);
+}
+
+void
+dbhash_destroy_alias_table(void)
+{
+	// for each
+	kh_destroy(alias_table, ah);
+	ah = NULL;
+}
+
+KHASH_MAP_INIT_INT(pipe_table, topic_queue *)
+static nni_rwlock pipe_lock;
+static khash_t(pipe_table) *ph = NULL;
+
+void
+dbhash_init_pipe_table(void)
+{
+	dbhash_check_init(pipe_table, ph, pipe_lock);
+}
+
+void
+dbhash_destroy_pipe_table(void)
+{
+	kh_destroy(pipe_table, ph);
+	ph = NULL;
+	return;
+}
+
+dbhash_ptpair_t *
+dbhash_ptpair_alloc(uint32_t p, char *t)
+{
+	dbhash_ptpair_t *pt =
+	    (dbhash_ptpair_t *) nni_zalloc(sizeof(dbhash_ptpair_t));
+
+	if (pt == NULL) {
+		return NULL;
+	}
+	pt->pipe  = p;
+	pt->topic = nni_strdup(t);
+	return pt;
+}
+
+void
+dbhash_ptpair_free(dbhash_ptpair_t *pt)
+{
+	if (pt) {
+		if (pt->topic) {
+			free(pt->topic);
+			pt->topic = NULL;
+		}
+		free(pt);
+		pt = NULL;
+	}
+	return;
+}
+
+size_t
+dbhash_get_pipe_cnt(void)
+{
+	nni_rwlock_wrlock(&pipe_lock);
+	size_t size = kh_size(ph);
+	nni_rwlock_unlock(&pipe_lock);
+	return size;
+}
+
+dbhash_ptpair_t **
+dbhash_get_ptpair_all(void)
+{
+	nni_rwlock_wrlock(&pipe_lock);
+	size_t size = kh_size(ph);
+
+	dbhash_ptpair_t **res = NULL;
+	cvector_set_size(res, size);
+
+	for (khint_t k = kh_begin(ph); k != kh_end(ph); ++k) {
+		if (!kh_exist(ph, k))
+			continue;
+		topic_queue *    tq = kh_val(ph, k);
+		dbhash_ptpair_t *pt =
+		    dbhash_ptpair_alloc(kh_key(ph, k), tq->topic);
+		cvector_push_back(res, pt);
+	}
+
+	nni_rwlock_unlock(&pipe_lock);
+	return res;
+}
+
+topic_queue *
+topic_queue_init(char *topic, int topic_len)
+{
+	topic_queue *tq = nni_alloc(sizeof(topic_queue));
+	if (tq == NULL) {
+		return NULL;
+	}
+	tq->topic = nni_alloc(topic_len + 1);
+	if (tq->topic == NULL) {
+		nni_free(tq, sizeof(topic_queue));
+		return NULL;
+	}
+	for(int i = 0; i < topic_len - 1; i++) {
+		log_debug("topic[%d]: %c", i, topic[i]);
+	}
+	memcpy(tq->topic, topic, topic_len);
+	tq->topic[topic_len] = '\0';
+	tq->next            = NULL;
+	return tq;
+
+}
+
+void
+topic_queue_release(topic_queue *tq)
+{
+	while (tq != NULL) {
+		topic_queue *tmp = tq;
+		tq = tq->next;
+		if (tmp->topic != NULL) {
+			nni_free(tmp->topic, strlen(tmp->topic) + 1);
+		}
+		nni_free(tmp, sizeof(topic_queue));
+	}
+
+	return;
+}
+
+topic_queue *
+init_topic_queue_with_topic_node(topic_node *tn)
+{
+	topic_queue *tq = NULL;
+	topic_queue *curtq = NULL;
+
+	while (tn != NULL) {
+		if (tq == NULL) {
+			tq = nng_alloc(sizeof(topic_queue));
+			if (tq == NULL) {
+				log_error("nng_alloc failed");
+				return NULL;
+			}
+			curtq = tq;
+			curtq->topic = nng_strndup(tn->topic.body, tn->topic.len);
+			if (curtq->topic == NULL) {
+				log_error("nng_strdup failed");
+				topic_queue_release(tq);
+				return NULL;
+			}
+			curtq->next = NULL;
+		} else {
+			curtq->next = nng_alloc(sizeof(topic_queue));
+			if (curtq->next == NULL) {
+				log_error("nng_alloc failed");
+				topic_queue_release(tq);
+				return NULL;
+			}
+
+			curtq->next->topic = nng_strndup(tn->topic.body, tn->topic.len);
+			if (curtq->next->topic == NULL) {
+				log_error("nng_strdup failed");
+				topic_queue_release(tq);
+				return NULL;
+			}
+
+			curtq = curtq->next;
+			curtq->next = NULL;
+		}
+		tn = tn->next;
+	}
+	return tq;
+}
+
+topic_queue **
+dbhash_get_topic_queue_all(size_t *sz)
+{
+	nni_rwlock_wrlock(&pipe_lock);
+	size_t size = kh_size(ph);
+
+	topic_queue **res =
+	    (topic_queue **) malloc(size * sizeof(topic_queue *));
+
+	for (khint_t k = kh_begin(ph); k != kh_end(ph); ++k) {
+		if (kh_exist(ph, k)) {
+			*res++ = kh_value(ph, k);
+		}
+	}
+	nni_rwlock_unlock(&pipe_lock);
+
+	*sz = size;
+	return res;
+}
+
+static struct topic_queue *
+new_topic_queue(char *val, uint8_t qos)
+{
+	struct topic_queue *tq  = NULL;
+	int                 len = strlen(val);
+
+	tq = (struct topic_queue *) malloc(sizeof(struct topic_queue));
+	if (!tq) {
+		fprintf(stderr, "malloc: Out of memory\n");
+		fflush(stderr);
+		abort();
+	}
+	tq->topic = (char *) malloc(sizeof(char) * (len + 1));
+	if (!tq->topic) {
+		fprintf(stderr, "malloc: Out of memory\n");
+		fflush(stderr);
+		abort();
+	}
+	memcpy(tq->topic, val, len);
+	tq->topic[len] = '\0';
+	tq->qos = qos;
+	tq->next       = NULL;
+
+	return tq;
+}
+
+static void
+delete_topic_queue(struct topic_queue *tq)
+{
+	if (tq) {
+		if (tq->topic) {
+			free(tq->topic);
+			tq->topic = NULL;
+		}
+		free(tq);
+		tq = NULL;
+	}
+	return;
+}
+
+/*
+ * @obj. _topic_hash.
+ * @key. pipe_id.
+ * @val. topic_queue.
+ */
+
+// TODO If we have same topic to same id,
+// how to deal with ?
+void
+dbhash_insert_topic(uint32_t id, char *val, uint8_t qos)
+{
+	struct topic_queue *ntq = new_topic_queue(val, qos);
+	struct topic_queue *tq  = NULL;
+
+	nni_rwlock_wrlock(&pipe_lock);
+	khint_t k = kh_get(pipe_table, ph, id);
+	// Pipe id is find in hash table.
+	if (k != kh_end(ph)) {
+		tq                      = kh_val(ph, k);
+		struct topic_queue *tmp = tq->next;
+		tq->next                = ntq;
+		ntq->next               = tmp;
+	} else {
+		// If not find pipe id in this hash table, we add a new one.
+		int     absent;
+		khint_t l = kh_put(pipe_table, ph, id, &absent);
+		if (absent) {
+			kh_val(ph, l) = ntq;
+		}
+	}
+	nni_rwlock_unlock(&pipe_lock);
+}
+
+/*
+ * @obj. _topic_hash.
+ * @key. pipe_id.
+ * @val. topic.
+ */
+
+bool
+dbhash_check_topic(uint32_t id, char *val)
+{
+
+	// dbhash_check_init(pipe_table, ph, pipe_lock);
+	if (!dbhash_check_id(id)) {
+		return false;
+	}
+
+	bool ret = false;
+	nni_rwlock_rdlock(&pipe_lock);
+	struct topic_queue *tq = NULL;
+	khint_t             k  = kh_get(pipe_table, ph, id);
+	if (k != kh_end(ph)) {
+		tq = kh_val(ph, k);
+	}
+
+	while (tq != NULL) {
+		if (!strcmp(tq->topic, val)) {
+			ret = true;
+			break;
+		}
+		tq = tq->next;
+	}
+	nni_rwlock_unlock(&pipe_lock);
+
+	return ret;
+}
+
+char *
+dbhash_get_first_topic(uint32_t id)
+{
+	char *topic = NULL;
+	nni_rwlock_wrlock(&pipe_lock);
+	khint_t k = kh_get(pipe_table, ph, id);
+	if (k != kh_end(ph)) {
+		struct topic_queue *ret = kh_val(ph, k);
+		if (ret && ret->topic) {
+			topic = nni_strdup(ret->topic);
+		}
+	}
+	nni_rwlock_unlock(&pipe_lock);
+
+	return topic;
+}
+
+/*
+ * @obj. _topic_hash.
+ * @key. pipe_id.
+ */
+
+struct topic_queue *
+dbhash_get_topic_queue(uint32_t id)
+{
+
+	// dbhash_check_init(pipe_table, ph, pipe_lock);
+	struct topic_queue *ret = NULL;
+
+	nni_rwlock_wrlock(&pipe_lock);
+	khint_t k = kh_get(pipe_table, ph, id);
+	if (k != kh_end(ph)) {
+		ret = kh_val(ph, k);
+	}
+	nni_rwlock_unlock(&pipe_lock);
+
+	return ret;
+}
+
+struct topic_queue *
+dbhash_copy_topic_queue(uint32_t id)
+{
+	struct topic_queue *head = NULL;
+	struct topic_queue **tail = &head;
+
+	nni_rwlock_wrlock(&pipe_lock);
+	khint_t k = kh_get(pipe_table, ph, id);
+
+	if (k != kh_end(ph)) {
+		struct topic_queue *tq = kh_val(ph, k);
+		while (tq) {
+
+			if (tq->topic == NULL) {
+				tq = tq->next;
+				continue;
+			}
+
+			struct topic_queue *new_node = nng_zalloc(sizeof(struct topic_queue));
+			if (new_node == NULL) {
+				log_error("Mem alloc failed!");
+				break; 
+			}
+
+			new_node->qos = tq->qos;
+			new_node->topic = nng_strdup(tq->topic);
+			new_node->next = NULL;
+
+			*tail = new_node;
+			tail = &(new_node->next);
+			
+			tq = tq->next;
+		}
+	}
+	nni_rwlock_unlock(&pipe_lock);
+
+	return head;
+}
+
+
+/*
+ * @obj. _topic_hash.
+ * @key. pipe_id.
+ */
+
+// TODO
+void
+dbhash_del_topic(uint32_t id, char *topic)
+{
+	// dbhash_check_init(pipe_table, ph, pipe_lock);
+	struct topic_queue *tt = NULL;
+	struct topic_queue *tb = NULL;
+
+	nni_rwlock_wrlock(&pipe_lock);
+	khint_t k = kh_get(pipe_table, ph, id);
+	if (k != kh_end(ph)) {
+		tt = kh_val(ph, k);
+	}
+
+	if (tt == NULL) {
+		nni_rwlock_unlock(&pipe_lock);
+		return;
+	}
+	// If topic is the first one and no other topic follow,
+	// we should delete the topic and delete pipe id from
+	// this hash table.
+	if (!strcmp(tt->topic, topic) && tt->next == NULL) {
+		kh_del(pipe_table, ph, k);
+		delete_topic_queue(tt);
+		nni_rwlock_unlock(&pipe_lock);
+		return;
+	}
+
+	// If topic is the first one with other topic follow,
+	// we should delete it and assign the next pointer
+	// to this key.
+	if (!strcmp(tt->topic, topic)) {
+		kh_val(ph, k) = tt->next;
+		delete_topic_queue(tt);
+
+		nni_rwlock_unlock(&pipe_lock);
+		return;
+	}
+
+	while (tt) {
+		if (!strcmp(tt->topic, topic)) {
+			if (tt->next == NULL) {
+				tb->next = NULL;
+			} else {
+				tb->next = tt->next;
+			}
+			break;
+		}
+		tb = tt;
+		tt = tt->next;
+	}
+
+	delete_topic_queue(tt);
+
+	nni_rwlock_unlock(&pipe_lock);
+	return;
+}
+
+/*
+ * @obj. _topic_hash.
+ * @key.pipe_id.
+ */
+
+void *
+del_topic_queue(uint32_t id, void *(*cb)(void *, char *), void *args)
+{
+	struct topic_queue *tq = NULL;
+	khint_t             k  = kh_get(pipe_table, ph, id);
+	void *              rv = NULL;
+	if (k == kh_end(ph)) {
+		return NULL;
+	}
+
+	tq = kh_val(ph, k);
+
+	while (tq) {
+		struct topic_queue *tt = tq;
+		tq                     = tq->next;
+		if (cb && args) {
+			rv = cb(args, tt->topic);
+		}
+		delete_topic_queue(tt);
+	}
+
+	kh_del(pipe_table, ph, k);
+
+	return rv;
+}
+
+/*
+ * @obj. _topic_hash.
+ * @key.pipe_id.
+ */
+
+void *
+dbhash_del_topic_queue(uint32_t id, void *(*cb)(void *, char *), void *args)
+{
+	void *rv = NULL;
+	nni_rwlock_wrlock(&pipe_lock);
+	rv = del_topic_queue(id, cb, args);
+	nni_rwlock_unlock(&pipe_lock);
+
+	return rv;
+}
+
+/*
+ * @obj. _topic_hash.
+ */
+
+static bool
+check_id(uint32_t id)
+{
+	bool    ret = false;
+	khint_t k   = kh_get(pipe_table, ph, id);
+	if (k != kh_end(ph)) {
+		ret = true;
+	}
+	return ret;
+}
+
+/*
+ * @obj. _topic_hash.
+ */
+
+bool
+dbhash_check_id(uint32_t id)
+{
+	bool ret = false;
+	nni_rwlock_rdlock(&pipe_lock);
+	ret = check_id(id);
+	nni_rwlock_unlock(&pipe_lock);
+	return ret;
+}
+
+void *
+dbhash_check_id_and_do(uint32_t id, void *(*cb)(void *), void *arg)
+{
+	void *ret = NULL;
+	nni_rwlock_wrlock(&pipe_lock);
+	if (!check_id(id) && cb) {
+		ret = cb(arg);
+	}
+	nni_rwlock_unlock(&pipe_lock);
+	return ret;
+}
+
+/*
+ * @obj. _topic_hash.
+ * @key. pipe_id.
+ */
+
+void
+dbhash_print_topic_queue(uint32_t id)
+{
+	// dbhash_check_init(pipe_table, ph, pipe_lock);
+	struct topic_queue *tq = NULL;
+	nni_rwlock_wrlock(&pipe_lock);
+	khint_t k = kh_get(pipe_table, ph, id);
+	if (k != kh_end(ph)) {
+		tq = kh_val(ph, k);
+	}
+
+	int t_num = 0;
+	while (tq) {
+		printf("Topic number %d, topic subscribed: %s.\n", ++t_num,
+		    tq->topic);
+		tq = tq->next;
+	}
+	nni_rwlock_unlock(&pipe_lock);
+}
+
+/*
+ * @obj. _cached_topic_hash.
+ * @key. (DJBhashed) client_id.
+ * @val. cached_topic_queue.
+ */
+
+// mqtt_hash<uint32_t, topic_queue *> _cached_topic_hash;
+KHASH_MAP_INIT_INT(_cached_topic_hash, topic_queue *)
+static khash_t(_cached_topic_hash) *ch = NULL;
+static nni_rwlock cached_lock;
+
+void
+dbhash_init_cached_table(void)
+{
+	dbhash_check_init(_cached_topic_hash, ch, cached_lock);
+}
+
+void
+dbhash_destroy_cached_table(void)
+{
+	kh_destroy(_cached_topic_hash, ch);
+	ch = NULL;
+}
+
+static bool
+cached_check_id(uint32_t key)
+{
+	khint_t k = kh_get(_cached_topic_hash, ch, key);
+	if (k != kh_end(ch)) {
+		return true;
+	}
+	return false;
+}
+
+/*
+ * @obj. _cached_topic_hash.
+ * @key. (DJBhashed) client_id.
+ * @val. topic_queue
+ */
+
+static void
+delete_cached_topic_one(struct topic_queue *ctq)
+{
+	if (ctq) {
+		if (ctq->topic) {
+			free(ctq->topic);
+			ctq->topic = NULL;
+		}
+		free(ctq);
+		ctq = NULL;
+	}
+	return;
+}
+
+void
+del_cached_topic_all(uint32_t cid)
+{
+	struct topic_queue *ctq = NULL;
+	khint_t             k   = kh_get(_cached_topic_hash, ch, cid);
+	if (k != kh_end(ch)) {
+		ctq = kh_val(ch, k);
+		kh_del(_cached_topic_hash, ch, k);
+	}
+
+	while (ctq) {
+		struct topic_queue *tt = ctq;
+		ctq                    = ctq->next;
+		delete_cached_topic_one(tt);
+	}
+
+	return;
+}
+
+/*
+ * @obj. _topic_hash.
+ * @key. pipe_id.
+ * @obj. _cached_topic_hash.
+ * @key. (DJBhashed) client_id.
+ */
+
+void
+dbhash_cache_topic_all(uint32_t pid, uint32_t cid)
+{
+	struct topic_queue *tq_in_topic_hash = NULL;
+	nni_rwlock_wrlock(&pipe_lock);
+	khint_t k = kh_get(pipe_table, ph, pid);
+	if (k != kh_end(ph)) {
+		tq_in_topic_hash = kh_val(ph, k);
+		kh_del(pipe_table, ph, k);
+	}
+	nni_rwlock_unlock(&pipe_lock);
+
+	if (tq_in_topic_hash == NULL) {
+		return;
+	}
+
+	nni_rwlock_wrlock(&cached_lock);
+	if (cached_check_id(cid)) {
+		// log_info("unexpected: cached hash instance is not vacant");
+		del_cached_topic_all(cid);
+	}
+	int     absent;
+	khint_t l     = kh_put(_cached_topic_hash, ch, cid, &absent);
+	kh_val(ch, l) = tq_in_topic_hash;
+	nni_rwlock_unlock(&cached_lock);
+}
+
+/*
+ * @obj. _cached_topic_hash.
+ * @key. (DJBhashed) client_id.
+ * @obj. _topic_hash.
+ * @key. pipe_id.
+ */
+
+void
+dbhash_restore_topic_all(uint32_t cid, uint32_t pid)
+{
+	struct topic_queue *tq_in_cached = NULL;
+	nni_rwlock_wrlock(&cached_lock);
+	khint_t k = kh_get(_cached_topic_hash, ch, cid);
+	if (k != kh_end(ch)) {
+		tq_in_cached = kh_val(ch, k);
+		kh_del(_cached_topic_hash, ch, k);
+	}
+	nni_rwlock_unlock(&cached_lock);
+
+	if (tq_in_cached == NULL) {
+		return;
+	}
+
+	nni_rwlock_wrlock(&pipe_lock);
+	if (check_id(pid)) {
+		// log_info("unexpected: hash instance is not vacant");
+		del_topic_queue(pid, NULL, NULL);
+	}
+	int     absent;
+	khint_t l     = kh_put(pipe_table, ph, pid, &absent);
+	kh_val(ph, l) = tq_in_cached;
+	nni_rwlock_unlock(&pipe_lock);
+}
+
+/*
+ * @obj. _cached_topic_hash.
+ * @key. (DJBhashed) client_id.
+ * @val. topic_queue
+ */
+
+// FIXME Return pointer of topic_queue directly is not safe.
+struct topic_queue *
+dbhash_get_cached_topic(uint32_t cid)
+{
+	struct topic_queue *ctq = NULL;
+	nni_rwlock_wrlock(&cached_lock);
+	khint_t k = kh_get(_cached_topic_hash, ch, cid);
+	if (k != kh_end(ch)) {
+		ctq = kh_val(ch, k);
+	}
+	nni_rwlock_unlock(&cached_lock);
+	return ctq;
+}
+
+/*
+ * @obj. _cached_topic_hash.
+ * @key. (DJBhashed) client_id.
+ */
+
+void
+dbhash_del_cached_topic_all(uint32_t cid)
+{
+	struct topic_queue *ctq = NULL;
+	nni_rwlock_wrlock(&cached_lock);
+	khint_t k = kh_get(_cached_topic_hash, ch, cid);
+	if (k != kh_end(ch)) {
+		ctq = kh_val(ch, k);
+		kh_del(_cached_topic_hash, ch, k);
+	}
+
+	while (ctq) {
+		struct topic_queue *tt = ctq;
+		ctq                    = ctq->next;
+		delete_cached_topic_one(tt);
+	}
+
+	nni_rwlock_unlock(&cached_lock);
+	return;
+}
+
+/*
+ * @obj. _cached_topic_hash.
+ * @key. (DJBhashed) client_id.
+ */
+
+bool
+dbhash_cached_check_id(uint32_t key)
+{
+	bool ret = false;
+	nni_rwlock_rdlock(&cached_lock);
+	ret = cached_check_id(key);
+	nni_rwlock_unlock(&cached_lock);
+	return ret;
+}
+
+dbhash_atpair_t *
+dbhash_atpair_alloc(uint32_t alias, const char *topic)
+{
+	if (topic == NULL) {
+		log_error("Topic should not be NULL");
+	}
+	dbhash_atpair_t *atpair =
+	    (dbhash_atpair_t *) nni_zalloc(sizeof(dbhash_atpair_t));
+	if (atpair == NULL) {
+		log_error("Memory alloc error.");
+		return NULL;
+	}
+	atpair->alias = alias;
+	atpair->topic = nni_strdup(topic);
+
+	return atpair;
+}
+
+static void
+dbhash_atpair_free(dbhash_atpair_t *atpair)
+{
+	if (atpair) {
+		if (atpair->topic) {
+			free(atpair->topic);
+			atpair->topic = NULL;
+		}
+		free(atpair);
+		atpair = NULL;
+	}
+}

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
+  <g fill="none" stroke="#26363A" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M320 160v240M260 400h120M286 400l-48 82M354 400l48 82"/>
+    <circle cx="320" cy="224" r="24" fill="#72C9B5"/>
+    <path d="M250 170c-56 42-56 106 0 148M390 170c56 42 56 106 0 148" stroke="#65B8D6"/>
+    <path d="M206 124c-94 74-94 176 0 250M434 124c94 74 94 176 0 250" stroke="#65B8D6"/>
+    <rect x="190" y="490" width="260" height="72" rx="30" fill="#D9F0EA"/>
+  </g>
+  <text x="320" y="540" text-anchor="middle" font-family="Arial,sans-serif" font-size="40" font-weight="700" fill="#26363A">MQTT</text>
+</svg>

@@ -1,0 +1,20 @@
+{
+  "name": "my_smart_home",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "broker": "node broker.js",
+    "broker:start": "powershell -NoProfile -ExecutionPolicy Bypass -File ./start-broker.ps1",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "aedes": "^0.51.3",
+    "mqtt": "^5.15.1",
+    "ws": "^8.21.0"
+  }
+}

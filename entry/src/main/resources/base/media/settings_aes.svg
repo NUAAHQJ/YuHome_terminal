@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
+  <g fill="none" stroke="#26363A" stroke-width="17" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M320 92l184 70v134c0 126-70 208-184 252-114-44-184-126-184-252V162z" fill="#DCECF4"/>
+    <rect x="228" y="214" width="184" height="154" rx="34" fill="#F2CFA1"/>
+    <path d="M270 214v-42c0-70 100-70 100 0v42M320 268v56"/><circle cx="320" cy="264" r="18" fill="#E98F77"/>
+    <rect x="214" y="402" width="212" height="82" rx="32" fill="#7CBAD7"/>
+  </g>
+  <text x="320" y="458" text-anchor="middle" font-family="Arial,sans-serif" font-size="48" font-weight="700" fill="#26363A">AES</text>
+</svg>

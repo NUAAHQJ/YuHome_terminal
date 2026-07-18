@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
+  <g fill="none" stroke="#26363A" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="320" cy="290" r="178" fill="#DCEEF3"/>
+    <path d="M142 290h356M320 112c-62 54-88 112-88 178s26 124 88 178M320 112c62 54 88 112 88 178s-26 124-88 178M172 202h296M172 378h296"/>
+    <path d="M214 526h212" stroke="#61BCA8"/>
+    <rect x="200" y="490" width="240" height="74" rx="30" fill="#F4D99B"/>
+  </g>
+  <text x="320" y="540" text-anchor="middle" font-family="Arial,sans-serif" font-size="39" font-weight="700" fill="#26363A">HTTP</text>
+</svg>

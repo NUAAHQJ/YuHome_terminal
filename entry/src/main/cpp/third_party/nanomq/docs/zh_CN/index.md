@@ -1,0 +1,43 @@
+# NanoMQ 介绍
+
+[NanoMQ](https://nanomq.io/zh) 是于 2021 年初发布的边缘计算开源项目，是面向物联网边缘计算场景的下一代轻量级高性能 **MQTT** 消息服务器。
+
+Github 仓库地址: [https://github.com/emqx/nanomq](https://github.com/emqx/nanomq)
+
+IoT 时代数据是第一生产力，而边缘则是数据诞生的地方。在边缘复杂的网络环境中对数据进行快速汇聚分发，一个高实时、高吞吐的边缘消息总线至关重要。然而由于产业链条长和各垂直行业的历史原因，使得边缘存在协议碎片化和多种消息模式，而且嵌入式环境的算力和功耗也有严格限制。这些问题都对边缘消息总线提出了新的要求与挑战。[NanoMQ](https://nanomq.io/zh) 致力于解决这些问题，提供一个能够在边缘端统一数据流动的轻量级高性能消息总线。同时提供极佳的拓展性和可移植性，适配各类嵌入式平台。让分散在边缘的碎片数据能够被轻松管理和获取。
+
+**NanoMQ** 与 **NNG**深度合作，**NanoMQ** 基于 **NNG** 异步 IO 和多线程模型面向 **MQTT** 协议深度优化后诞生。依靠 **NNG** 出色的网络 API 设计，**NanoMQ** 自身可以专注于 MQTT 服务器性能和更多的拓展功能。目标为边缘设备和 MEC 提供更好的 SMP 支持和极高的性能性价比。
+
+<img src="./images/NanoMQ-introduction.png" alt="img" style="zoom:50%;" />
+
+## 功能特性
+
+**完整支持 MQTT 5.0**：完整支持 MQTT 5.0/3.1.1，与所有标准 MQTT 开源 SDK 兼容。
+
+[**MQTT 桥接**](./bridges/introduction.md)：内置 MQTT 多云桥接功能，简单配置即可接入各类流行的云服务建立云边通道进行多地数据同步。
+
+[**NNG 桥接**](./config-description/nng_bridges.md)：支持 `bridges.nng.pub` 与 `bridges.nng.sub` 两个方向的数据桥接，打通 MQTT 与 NNG `pub/sub` 消息流。可参考[配置说明](./config-description/nng_bridges.md)与[使用教程](./tutorial/nng-bridges.md)。
+
+[**规则引擎**](./rule/introduction.md)：内置简单规则引擎可以灵活处理边缘数据。也可以与 eKuiper 集成在边缘进行流式数据分析。
+
+[**消息持久化**](./rule/config-rule-engine.md#sqlite-规则)：针对物联网复杂网络环境场景设计数据持久化和数据缓存功能，桥接消息可以本地缓存后断网续传。重要数据可以在边缘持久化滚动更新。
+
+[**丰富的集成 API**](./api/introduction.md)：提供可拓展的事件驱动型 WebHook 接口和运维友好的 HTTP APIs，帮助减少边缘计算应用开发和集成的成本。
+
+[**多协议网关**](./gateway/introduction.md)：通过协议网关支持 nanomsg/ZeroMQ/Websocket 等常用的消息协议，方便在边缘建立灵活的数据路由拓扑。并提供连接加密和安全保障。
+
+[**MQTT STREAM**](./mqtt-stream/introduction.md): 对于同一topic的MQTT消息，可以看做一条数据流，并且这个数据流是可以进行落盘存储以及查询操作的，对于一些网络较差的环境下，为数据的完整性和可靠性提供了解决方案.
+
+## 核心优势
+
+**超轻量**：MQTT 服务可以低至 200Kb 的内存占用启动。
+
+**全异步 I/O**：针对物联网和 MQTT 内建 Actor 编程模型并行化计算负载。
+
+**多线程并行**：优秀的可拓展性，具有良好的多核 SMP（对称多处理）支持和多线程性能。
+
+**高性能**：边缘百万级消息处理能力。
+
+**跨平台**：可无缝移植到任何基于 POSIX 的系统平台。
+
+**互操作性**：数据透明，拓展接口丰富，易于和各类边缘计算框架集成。

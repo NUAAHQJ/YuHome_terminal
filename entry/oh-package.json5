@@ -1,0 +1,13 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Please describe the basic information.",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    "sherpa_onnx": "1.13.3"
+  },
+  "devDependencies": {},
+  "dynamicDependencies": {}
+}

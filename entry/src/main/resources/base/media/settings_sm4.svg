@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
+  <g fill="none" stroke="#26363A" stroke-width="17" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M320 92l184 70v134c0 126-70 208-184 252-114-44-184-126-184-252V162z" fill="#D9F0EA"/>
+    <circle cx="258" cy="286" r="48" fill="#F4D28B"/>
+    <path d="M300 286h142M392 286v48M432 286v34"/>
+    <rect x="214" y="390" width="212" height="82" rx="32" fill="#80CDBA"/>
+  </g>
+  <text x="320" y="446" text-anchor="middle" font-family="Arial,sans-serif" font-size="48" font-weight="700" fill="#26363A">SM4</text>
+</svg>
