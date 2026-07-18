@@ -120,7 +120,6 @@ Every ACK must include the real `deviceId` and echo the command `seq`.
 
 ## Documentation
 
-- [项目介绍](docs/项目介绍.md)
 - [禹家终端详细使用说明](docs/禹家终端详细使用说明.md)
 - [大禹本地网关协议](docs/DAYU_LOCAL_GATEWAY_PROTOCOL.md)
 - [大禹硬件与通信接口说明](docs/大禹智能家居终端硬件与通信接口说明.md)
