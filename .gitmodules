@@ -1,0 +1,6 @@
+[submodule "entry/src/main/cpp/third_party/nanomq"]
+	path = entry/src/main/cpp/third_party/nanomq
+	url = https://github.com/nanomq/nanomq.git
+[submodule "entry/src/main/cpp/third_party/mbedtls"]
+	path = entry/src/main/cpp/third_party/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git

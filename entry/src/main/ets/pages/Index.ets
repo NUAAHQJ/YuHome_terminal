@@ -1377,13 +1377,22 @@ struct Index {
           }
         })
       }
+      const existingDescriptor = this.loadDeviceRegistry()[announcedId]
+      // device_hello reports the device's observation, but must not overwrite
+      // the transport/crypto mode selected and persisted by Dayu.
+      const configuredTransport = existingDescriptor && existingDescriptor.transport.length > 0 ?
+        this.normalizeProtocolMode(existingDescriptor.transport.toUpperCase()) : 'MQTT'
+      const configuredCrypto = existingDescriptor && existingDescriptor.crypto.length > 0 ?
+        this.normalizeCryptoMode(existingDescriptor.crypto.toUpperCase()) : 'SM4'
+      const reportedTransport = typeof data['transport'] === 'string' ? data['transport'] as string : ''
+      const reportedCrypto = typeof data['crypto'] === 'string' ? data['crypto'] as string : ''
       const descriptor: DeviceDescriptor = {
         deviceId: announcedId,
         name: typeof data['name'] === 'string' ? data['name'] as string : announcedId,
         room: typeof data['room'] === 'string' ? data['room'] as string : '',
         capabilities,
-        transport: typeof data['transport'] === 'string' ? data['transport'] as string : '',
-        crypto: typeof data['crypto'] === 'string' ? data['crypto'] as string : '',
+        transport: configuredTransport.toLowerCase(),
+        crypto: configuredCrypto.toLowerCase(),
         lastSeen: Date.now()
       }
       const registry = this.loadDeviceRegistry()
@@ -1412,7 +1421,7 @@ struct Index {
         this.doorDeviceId = announcedId
       }
       this.cryptoDebugText = `设备注册 ${descriptor.name}: ${capabilities.join(',')}`
-      console.info(`[DEVICE][hello] id=${announcedId} caps=${capabilities.join(',')}`)
+      console.info(`[DEVICE][hello] id=${announcedId} caps=${capabilities.join(',')} configured=${descriptor.transport}/${descriptor.crypto} reported=${reportedTransport}/${reportedCrypto}`)
       return true
     } catch (_) {
       return false
@@ -1745,7 +1754,6 @@ struct Index {
       }
     } else {
       console.info(`[PROTO] ignore HTTP_SENSOR while active=${this.commandTransport} pending=${this.protocolPendingMode}`)
-      await this.tryAutoCorrectProtocolFromHttpSensor(packet.payloadBase64, httpTopic)
     }
   }
 
@@ -1754,35 +1762,6 @@ struct Index {
     const topic = packet.topic ?? ''
     const payload = packet.payloadBase64 ?? ''
     return `${packet.deviceId ?? ''}|${timestamp}|${topic}|${payload.length}|${payload.substring(0, 48)}`
-  }
-
-  async tryAutoCorrectProtocolFromHttpSensor(payloadBase64: string, topic: string): Promise<void> {
-    if (this.commandTransport === 'HTTP' || this.keyExchange.isKeyExchangeTopic(topic)) {
-      return
-    }
-    const deviceId = this.deviceIdFromScopedTopic(topic)
-    if (deviceId !== this.activeDeviceId) {
-      return
-    }
-    try {
-      const raw = this.base64ToUint8Array(payloadBase64)
-      const decrypted = await this.decryptIncomingPayload(raw, 'HTTP_SENSOR', deviceId)
-      const data = JSON.parse(decrypted.plaintext) as Record<string, Object>
-      const proto = data['proto'] as string
-      if (typeof proto === 'string' && proto.toLowerCase() === 'http') {
-        this.completeProtocolSwitch('HTTP', JSON.stringify({
-          type: 'ack',
-          cmd: 'proto',
-          ok: true,
-          val: 'http',
-          inferred: true,
-          source: 'HTTP_SENSOR',
-          reason: 'sensor-proto'
-        }))
-      }
-    } catch (err) {
-      console.info(`[PROTO][auto-correct-skip] ${(err as Error).message}`)
-    }
   }
 
   async tryActivateInactiveDeviceKey(raw: Uint8Array, source: string, deviceId: string): Promise<void> {
@@ -3734,10 +3713,13 @@ struct Index {
     const epoch = typeof data['epoch'] === 'number' ? data['epoch'] as number : 0
     const rawKeySource = data['keySource'] as string
     const keySource = typeof rawKeySource === 'string' ? rawKeySource.toLowerCase() : ''
-    const rawCrypto = data['crypto'] as string
-    const rawTransport = data['transport'] as string
-    const bootCrypto = typeof rawCrypto === 'string' ? this.normalizeCryptoMode(rawCrypto.toUpperCase()) : this.cryptoMode
-    const bootTransport = typeof rawTransport === 'string' ? this.normalizeProtocolMode(rawTransport.toUpperCase()) : this.commandTransport
+    const descriptor = this.loadDeviceRegistry()[deviceId]
+    // A boot report describes the device state; it is not permission to
+    // overwrite Dayu's selected transport and crypto mode.
+    const bootCrypto = descriptor && descriptor.crypto.length > 0 ?
+      this.normalizeCryptoMode(descriptor.crypto.toUpperCase()) : 'SM4'
+    const bootTransport = descriptor && descriptor.transport.length > 0 ?
+      this.normalizeProtocolMode(descriptor.transport.toUpperCase()) : 'MQTT'
     if (epoch !== 0 || keySource !== 'static') {
       return false
     }

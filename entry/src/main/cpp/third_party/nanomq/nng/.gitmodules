@@ -1,3 +1,0 @@
-[submodule "extern/msquic"]
-	path = extern/msquic
-	url = https://github.com/microsoft/msquic.git

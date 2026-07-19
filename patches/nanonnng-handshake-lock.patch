@@ -1,0 +1,43 @@
+diff --git a/src/supplemental/tls/mbedtls/tls.c b/src/supplemental/tls/mbedtls/tls.c
+index 13a2221..3b9340b 100644
+--- a/src/supplemental/tls/mbedtls/tls.c
++++ b/src/supplemental/tls/mbedtls/tls.c
+@@ -79,4 +79,10 @@ static mbedtls_ctr_drbg_context rng_ctx;
+ static nni_mtx                  rng_lock;
+ #endif
+ 
++// Server connections share the certificate/private-key objects held by the
++// TLS config. Mbed TLS may mutate private-key working state while advancing a
++// handshake, so protect each handshake step when NanoMQ accepts concurrent
++// clients.
++static nni_mtx handshake_lock;
++
+ struct nng_tls_engine_conn {
+@@ -294,5 +300,7 @@ conn_handshake(nng_tls_engine_conn *ec)
+ {
+ 	int rv;
+ 
++	nni_mtx_lock(&handshake_lock);
+ 	rv = mbedtls_ssl_handshake(&ec->ctx);
++	nni_mtx_unlock(&handshake_lock);
+ 	switch (rv) {
+@@ -781,4 +789,5 @@ nng_tls_engine_init_mbed(void)
+ {
+ 	int rv;
++	nni_mtx_init(&handshake_lock);
+ 
+ #ifdef NNG_TLS_USE_CTR_DRBG
+@@ -811,5 +820,8 @@ nng_tls_engine_init_mbed(void)
+ 		nni_mtx_fini(&rng_lock);
+ 	}
+ #endif
++	if (rv != 0) {
++		nni_mtx_fini(&handshake_lock);
++	}
+ 
+ 	return (rv);
+@@ -818,3 +830,4 @@ void
+ nng_tls_engine_fini_mbed(void)
+ {
++	nni_mtx_fini(&handshake_lock);
+ #ifdef NNG_TLS_USE_CTR_DRBG
