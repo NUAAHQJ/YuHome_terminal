@@ -18,6 +18,12 @@ import { VoiceIntent, VoiceIntentType } from '../voice/VoiceIntentParser'
 import { SpeakerEnrollmentQuality, SpeakerProfile, SpeakerProfileManager } from '../voice/SpeakerProfileManager'
 import { LocalGatewayService } from '../gateway/LocalGatewayService'
 import { LocalGatewayEvent } from 'liblocal_gateway.so'
+import { FederatedDataCollector, FederatedObservation, getFederatedDataCollector } from '../federated/FederatedDataCollector'
+import { BehaviorModelEngine, BehaviorModelStatus, BehaviorSuggestion, ModelComparison } from '../federated/BehaviorModelEngine'
+import { ActionPlanner } from '../planner/ActionPlanner'
+import { buildFederatedPlannerRequest, buildVoicePlannerRequest } from '../planner/PlannerAdapters'
+import { compilePlannerProposal } from '../planner/PlannerSafetyGate'
+import { PlannerContext, PlannerPlan, PlannerRequest, PlannerToolCall } from '../planner/PlannerTypes'
 
 const ECDH_CACHED_PUBLIC_KEY_MAX_AGE_MS: number = 10 * 60 * 1000
 const ECDH_RECOVERY_PUBLIC_KEY_MAX_AGE_MS: number = 24 * 60 * 60 * 1000
@@ -84,6 +90,11 @@ interface LightControlPacket {
   target: string
   power: boolean
   timestamp: number
+}
+
+interface VoicePlannerFeedback {
+  message: string
+  prompt: string
 }
 
 interface LedLockStatus {
@@ -332,6 +343,8 @@ const LIGHT_DEVICE_STORAGE_KEY: string = 'lightDeviceId'
 const AC_DEVICE_STORAGE_KEY: string = 'acDeviceId'
 const CURTAIN_DEVICE_STORAGE_KEY: string = 'curtainDeviceId'
 const DOOR_DEVICE_STORAGE_KEY: string = 'doorDeviceId'
+const MODEL_SUGGESTION_STORAGE_KEY: string = 'modelSuggestionEnabled'
+const FEDERATED_DEMO_EXECUTION_STORAGE_KEY: string = 'federatedDemoExecutionEnabled'
 const LED_CONTROL_PRIORITY: number = 10
 const LED_CONTROL_LOCK_MS: number = 5000
 const LED_OPTIMISTIC_HOLD_MS: number = 20000
@@ -340,6 +353,13 @@ const DOOR_CONTROL_LOCK_MS: number = 5000
 const JIANGNING_LATITUDE: number = 31.953168
 const JIANGNING_LONGITUDE: number = 118.83951
 const OUTDOOR_WEATHER_REFRESH_MS: number = 10 * 60 * 1000
+// 温湿度读数未变化时，"已更新"时间戳的最小刷新间隔。
+// ESP32 每秒上报一次，逐包刷新会让整页每秒重渲染一次。
+const SENSOR_DISPLAY_REFRESH_MS: number = 10 * 1000
+// 云端传感器上报的最小间隔。告警走 queueCloudAlarmReport 独立通道，不受此限制。
+const CLOUD_SENSOR_MIN_INTERVAL_MS: number = 5 * 1000
+// 传感器逐包详细日志（含整包 JSON 序列化）。排查问题时置为 true。
+const SENSOR_VERBOSE_LOG: boolean = false
 const FACE_ENROLL_MIN_QUALITY: number = 0.50
 const FACE_IDENTIFY_MIN_QUALITY: number = 0.40
 const FACE_ENROLL_MAX_ATTEMPTS: number = 10
@@ -358,6 +378,8 @@ PersistentStorage.persistProp(LIGHT_DEVICE_STORAGE_KEY, 'auto')
 PersistentStorage.persistProp(AC_DEVICE_STORAGE_KEY, 'auto')
 PersistentStorage.persistProp(CURTAIN_DEVICE_STORAGE_KEY, 'auto')
 PersistentStorage.persistProp(DOOR_DEVICE_STORAGE_KEY, 'auto')
+PersistentStorage.persistProp(MODEL_SUGGESTION_STORAGE_KEY, false)
+PersistentStorage.persistProp(FEDERATED_DEMO_EXECUTION_STORAGE_KEY, false)
 
 @Entry
 @Component
@@ -378,6 +400,14 @@ struct Index {
   @State indoorHumidity: number = 48
   private indoorTempText: string = '—℃'
   private indoorHumidityText: string = '—%'
+  // 上次重建 sensorDisplay 的时间，用于在读数不变时限制时间戳刷新频率
+  private lastSensorDisplayAt: number = 0
+  // 上次向云端上报传感器数据的时间
+  private lastCloudSensorReportAt: number = 0
+  // 节流窗口内暂存的最新一包传感器数据，窗口结束后补发
+  private pendingCloudSensor: SensorPacket | null = null
+  private pendingCloudSensorSource: string = 'LIVE'
+  private cloudSensorFlushTimerId: number = -1
   private sensorLastUpdateText: string = '等待设备上报'
   @State sensorDisplay: string[] = ['—℃', '—%', '等待设备上报']
   @State outdoorTempText: string = '—℃'
@@ -447,6 +477,43 @@ struct Index {
   private hasLivingLightPendingTarget: boolean = false
   @State bedroomLightOn: boolean = false
   @State curtainPercent: number = 62
+  private federatedLux: number = 0
+  private federatedPresence: number = 0
+  private federatedCollector: FederatedDataCollector = getFederatedDataCollector()
+  private behaviorModel: BehaviorModelEngine = new BehaviorModelEngine()
+  private actionPlanner: ActionPlanner = new ActionPlanner()
+  @StorageLink(MODEL_SUGGESTION_STORAGE_KEY) modelSuggestionEnabled: boolean = false
+  @StorageLink(FEDERATED_DEMO_EXECUTION_STORAGE_KEY) federatedDemoExecutionEnabled: boolean = false
+  @State showModelComparisonPanel: boolean = false
+  @State modelActiveVersion: number = 0
+  @State modelCandidateVersion: number = 0
+  @State modelSource: string = '内置基础模型'
+  @State modelStatusText: string = '模型正在初始化'
+  @State modelSuggestionAction: string = ''
+  @State modelSuggestionReason: string = ''
+  @State modelSuggestionConfidence: number = 0
+  @State federatedPlanText: string = ''
+  @State federatedPlanReady: boolean = false
+  @State modelComparison: ModelComparison = {
+    current_version: 0,
+    candidate_version: 0,
+    sample_count: 0,
+    action_sample_count: 0,
+    minimum_samples: 100,
+    minimum_action_samples: 10,
+    current_metrics: {},
+    candidate_metrics: {},
+    recommend_candidate: false,
+    decision: 'insufficient_data',
+    reason: '真实家庭样本不足，继续使用基础模型',
+    evaluated_at: ''
+  }
+  private lastModelSuggestionAction: string = ''
+  private lastModelSuggestionAt: number = 0
+  private federatedQualificationAction: string = ''
+  private federatedQualificationCount: number = 0
+  private federatedPlan: PlannerPlan | null = null
+  private federatedPlanCreatedAt: number = 0
   private curtainDragStartPercent: number = 62
   private curtainCommandSeq: number = 0
   @State leavingMode: boolean = false
@@ -678,6 +745,28 @@ struct Index {
     this.restoreDynamicCryptoKeys()
     this.refreshProvisioningDefaults()
     this.refreshProvisioningWifiInfo()
+    const federatedContext = getContext(this) as common.UIAbilityContext
+    this.federatedCollector.configure(
+      'https://192.168.3.5:5443',
+      'family_a',
+      '',
+      federatedContext.filesDir
+    )
+    this.behaviorModel.initialize(federatedContext, 'https://192.168.3.5:5443', federatedContext.filesDir)
+      .then((status: BehaviorModelStatus): void => {
+        this.applyBehaviorModelStatus(status)
+        if (this.modelSuggestionEnabled) {
+          this.handleBehaviorObservation(this.buildFederatedObservation())
+        }
+      })
+      .catch((err: Error): void => {
+        this.modelStatusText = `基础模型加载失败：${err.message}`
+      })
+    this.actionPlanner.initialize(federatedContext).then((ready: boolean): void => {
+      console.info(`[Planner][initialize] ready=${ready}`)
+    })
+    this.federatedCollector.start((): FederatedObservation => this.buildFederatedObservation(),
+      (observation: FederatedObservation): void => this.handleBehaviorObservation(observation))
     const gatewayStart = this.localGateway.start(3000, (event: LocalGatewayEvent): void => {
       this.handleLocalGatewayEvent(event)
     })
@@ -720,6 +809,10 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.federatedCollector.flush().catch((err: Error) => {
+      console.info(`[Federated][final-flush-fail] ${err.message}`)
+    })
+    this.federatedCollector.stop()
     if (this.overviewDoorTapTimerId !== -1) {
       clearTimeout(this.overviewDoorTapTimerId)
       this.overviewDoorTapTimerId = -1
@@ -745,6 +838,11 @@ struct Index {
     if (this.cloudAlarmRetryTimerId !== -1) {
       clearTimeout(this.cloudAlarmRetryTimerId)
       this.cloudAlarmRetryTimerId = -1
+    }
+    if (this.cloudSensorFlushTimerId !== -1) {
+      clearTimeout(this.cloudSensorFlushTimerId)
+      this.cloudSensorFlushTimerId = -1
+      this.pendingCloudSensor = null
     }
     if (this.cloudActuatorRetryTimerId !== -1) {
       clearTimeout(this.cloudActuatorRetryTimerId)
@@ -1640,31 +1738,41 @@ struct Index {
     await this.refreshActiveProtocol()
   }
 
+  // 该方法由 3 秒定时器驱动。bridgeConnected 等都是 @State，
+  // 即使写入同样的值也会触发 ArkTS 重渲染，所以统一走变更保护再赋值。
+  applyBridgeLinkState(connected: boolean, linkConnected: boolean, message: string): void {
+    if (this.bridgeConnected !== connected) {
+      this.bridgeConnected = connected
+    }
+    if (this.bridgeLinkConnected !== linkConnected) {
+      this.bridgeLinkConnected = linkConnected
+    }
+    if (this.bridgeLastMessage !== message) {
+      this.bridgeLastMessage = message
+    }
+  }
+
   async refreshActiveProtocol(): Promise<void> {
     if (this.shouldPollHttpBridge()) {
       await this.refreshBridge()
       return
     }
     if (this.mqttConnected) {
-      this.bridgeConnected = true
-      this.bridgeLinkConnected = true
-      this.bridgeLastMessage = 'MQTT 已连接'
+      this.applyBridgeLinkState(true, true, 'MQTT 已连接')
       return
     }
     if (this.bridgeTlsConnected || this.bridgeTls.isConnected()) {
-      this.bridgeConnected = true
-      this.bridgeLinkConnected = true
-      this.bridgeLastMessage = 'BridgeTLS 已连接'
+      this.applyBridgeLinkState(true, true, 'BridgeTLS 已连接')
       return
     }
     await this.refreshBridgeKeyExchangeState()
     if (this.bridgeConnected && Date.now() - this.lastBridgeOkAt < 10000) {
-      this.bridgeLinkConnected = true
+      if (!this.bridgeLinkConnected) {
+        this.bridgeLinkConnected = true
+      }
       return
     }
-    this.bridgeConnected = false
-    this.bridgeLinkConnected = false
-    this.bridgeLastMessage = 'MQTT 待连接'
+    this.applyBridgeLinkState(false, false, 'MQTT 待连接')
   }
 
   shouldPollHttpBridge(): boolean {
@@ -2931,6 +3039,7 @@ struct Index {
         this.acPendingSeq = seq
         this.acAckText = `正在发送 ${this.commandTransportText()}`
         await this.sendACControl(temperature, power, mode, seq)
+        this.federatedCollector.recordAction(power ? 'ac_on' : 'ac_off', 'app_control')
         this.acAckText = `等待设备确认 #${seq}`
         this.startACAckTimer(seq)
         await this.ackCloudCommand(command.id, true, `空调${power ? '开启' : '关闭'} ${temperature}℃ ${mode === 'heat' ? '制热' : '制冷'}指令已由大禹下发`)
@@ -2950,14 +3059,8 @@ struct Index {
         return
       }
       if (command.kind === 'door') {
-        if (!this.isBridgeActuallyConnected()) {
-          console.info(`[Cloud][command-retry] ${command.id} local bridge not ready`)
-          return
-        }
-        const unlock = command.unlock === true || command.locked === false
-        await this.sendDoorControl(unlock)
-        await this.ackCloudCommand(command.id, true, `${unlock ? '解锁' : '上锁'}指令已由大禹下发`)
-        this.addMqttMessage('cloud/app/door', `[SENT:CLOUD] door=${unlock ? 'unlock' : 'lock'} ${command.id}`)
+        await this.ackCloudCommand(command.id, false, 'door control is query-only by local safety policy')
+        this.addMqttMessage('cloud/app/door', `[REJECTED:SAFETY] door write ${command.id}`)
         return
       }
       if (command.kind !== 'light') {
@@ -3078,6 +3181,29 @@ struct Index {
   }
 
   reportCloudSensor(data: SensorPacket, source: string): void {
+    // ESP32 每秒上报一次，逐包同步到云端会持续占用 UI 线程和网络。
+    // 这里按 CLOUD_SENSOR_MIN_INTERVAL_MS 节流，并保留最新一包在窗口结束后补发，
+    // 保证云端始终能收到最新读数，不会因为节流而丢掉最后一次变化。
+    // 告警不走这里，由 reportCloudAlarmState/queueCloudAlarmReport 立即上报。
+    const nowMs = Date.now()
+    const waited = nowMs - this.lastCloudSensorReportAt
+    if (waited < CLOUD_SENSOR_MIN_INTERVAL_MS) {
+      this.pendingCloudSensor = data
+      this.pendingCloudSensorSource = source
+      if (this.cloudSensorFlushTimerId === -1) {
+        this.cloudSensorFlushTimerId = setTimeout(() => {
+          this.cloudSensorFlushTimerId = -1
+          const pending = this.pendingCloudSensor
+          if (pending !== null) {
+            this.pendingCloudSensor = null
+            this.reportCloudSensor(pending, this.pendingCloudSensorSource)
+          }
+        }, CLOUD_SENSOR_MIN_INTERVAL_MS - waited)
+      }
+      return
+    }
+    this.lastCloudSensorReportAt = nowMs
+    this.pendingCloudSensor = null
     const packet: CloudIngestPacket = {
       source: source.indexOf('ESP') >= 0 ? 'esp32' : 'dayu',
       kind: 'sensor',
@@ -3159,23 +3285,40 @@ struct Index {
     ])
 
     if (nextTemp !== null) {
-      this.indoorTemp = nextTemp
       this.indoorTempText = `${nextTemp.toFixed(1)}℃`
+      // 仅在数值真正变化时写 @State，避免每包上报都触发整页重渲染
+      if (this.indoorTemp !== nextTemp) {
+        this.indoorTemp = nextTemp
+      }
     }
     if (nextHumidity !== null) {
-      this.indoorHumidity = nextHumidity
       this.indoorHumidityText = `${nextHumidity.toFixed(1)}%`
+      if (this.indoorHumidity !== nextHumidity) {
+        this.indoorHumidity = nextHumidity
+      }
     }
     if (nextTemp !== null || nextHumidity !== null) {
-      this.sensorLastUpdateText = `已更新 ${new Date().toLocaleTimeString()}`
-      if (source !== 'HTTP_BOOT') {
+      if (source !== 'HTTP_BOOT' && !this.hasLiveSensorData) {
         this.hasLiveSensorData = true
       }
-      // 替换整个数组强制 ArkTS 检测变化
-      this.sensorDisplay = [this.indoorTempText, this.indoorHumidityText, this.sensorLastUpdateText]
-      console.info(`[Sensor] sensorDisplay = [${this.sensorDisplay[0]}, ${this.sensorDisplay[1]}, ${this.sensorDisplay[2]}]`)
+      const nowMs = Date.now()
+      const readingChanged: boolean = this.sensorDisplay[0] !== this.indoorTempText ||
+        this.sensorDisplay[1] !== this.indoorHumidityText
+      // 读数变化时立即刷新；读数不变时按 SENSOR_DISPLAY_REFRESH_MS 刷新时间戳，
+      // 既保留"数据是新鲜的"提示，又不会每秒重建一次数组。
+      if (readingChanged || nowMs - this.lastSensorDisplayAt >= SENSOR_DISPLAY_REFRESH_MS) {
+        this.lastSensorDisplayAt = nowMs
+        this.sensorLastUpdateText = `已更新 ${new Date().toLocaleTimeString()}`
+        // 替换整个数组强制 ArkTS 检测变化
+        this.sensorDisplay = [this.indoorTempText, this.indoorHumidityText, this.sensorLastUpdateText]
+        if (SENSOR_VERBOSE_LOG) {
+          console.info(`[Sensor] sensorDisplay = [${this.sensorDisplay[0]}, ${this.sensorDisplay[1]}, ${this.sensorDisplay[2]}]`)
+        }
+      }
     }
-    console.info(`[Sensor][apply] temp=${this.indoorTemp}, humidity=${this.indoorHumidity}, raw=${JSON.stringify(data)}`)
+    if (SENSOR_VERBOSE_LOG) {
+      console.info(`[Sensor][apply] temp=${this.indoorTemp}, humidity=${this.indoorHumidity}, raw=${JSON.stringify(data)}`)
+    }
 
     let nextLevel: number = typeof data.alertLevel === 'number' ? data.alertLevel : 0
     let msg: string = data.message ?? '传感器数据已更新'
@@ -3956,7 +4099,9 @@ struct Index {
    */
   async handleEncryptedRaw(raw: Uint8Array, topic: string = 'esp32/sensor',
     deviceId: string = this.activeDeviceId): Promise<void> {
-    console.info(`[Crypto] decrypting ${raw.length} bytes raw encrypted payload on ${topic}`)
+    if (SENSOR_VERBOSE_LOG) {
+      console.info(`[Crypto] decrypting ${raw.length} bytes raw encrypted payload on ${topic}`)
+    }
     try {
       if (deviceId === this.activeDeviceId && await this.tryHandleCryptoSwitchAck(raw)) {
         return
@@ -3969,7 +4114,9 @@ struct Index {
       if (deviceId === this.activeDeviceId) {
         this.lastSuccessfulDecryptAt = decryptedAt
       }
-      console.info(`[Crypto] decrypted OK: ${jsonStr.substring(0, 80)}`)
+      if (SENSOR_VERBOSE_LOG) {
+        console.info(`[Crypto] decrypted OK: ${jsonStr.substring(0, 80)}`)
+      }
       if (decrypted.keySource === 'provided' && this.isKeyExchangeAck(jsonStr)) {
         return
       }
@@ -4077,11 +4224,13 @@ struct Index {
       const rawData = data as Object as Record<string, Object>
       if (typeof rawData['lux'] === 'number') {
         // 光照度 — 暂不显示在 UI，仅日志
-        console.info(`[Crypto] lux=${rawData['lux']}`)
+        this.federatedLux = rawData['lux'] as number
+        console.info(`[Crypto] lux=${this.federatedLux}`)
       }
       if (typeof rawData['pir'] === 'number') {
         // PIR 人体检测映射到 alertLevel
         const pirVal = rawData['pir'] as number
+        this.federatedPresence = pirVal === 1 ? 1 : 0
         if (pirVal === 1 && this.alertLevel < 1) {
           this.alertLevel = 1
           this.alertMessage = '检测到人员活动'
@@ -4370,9 +4519,14 @@ struct Index {
 
   handleMqttPacket(topic: string, payload: Uint8Array, fromLocalGateway: boolean): void {
     const time = new Date().toLocaleTimeString()
-    this.mqttLastMsgTime = time
+    // 秒级字符串，同一秒内的多包不必重复写 @State
+    if (this.mqttLastMsgTime !== time) {
+      this.mqttLastMsgTime = time
+    }
     const route = fromLocalGateway ? 'LOCAL' : 'REMOTE'
-    console.info(`[MQTT][${route}] msg on ${topic}: ${payload.length}B`)
+    if (SENSOR_VERBOSE_LOG) {
+      console.info(`[MQTT][${route}] msg on ${topic}: ${payload.length}B`)
+    }
     const packetDeviceId = this.registerDeviceId(this.deviceIdFromScopedTopic(topic))
     if (fromLocalGateway) {
       this.localGatewayDeviceIds.add(packetDeviceId)
@@ -4905,7 +5059,266 @@ struct Index {
   /**
    * Base64 解码 (atob polyfill for ArkTS)
    */
-  async sendLightControl(target: string, power: boolean): Promise<void> {
+  buildFederatedObservation(): FederatedObservation {
+    const observation: FederatedObservation = {
+      timestamp: new Date().toISOString(),
+      indoor_temp: this.indoorTemp,
+      indoor_humidity: this.indoorHumidity,
+      light_level: Math.max(0, this.federatedLux),
+      presence: this.federatedPresence,
+      light_on: this.livingLightOn,
+      curtain_percent: this.curtainPercent,
+      ac_on: this.acPower,
+      away_mode: this.leavingMode,
+      user_action: 'no_action',
+      source: 'dayu',
+      training_eligible: true
+    }
+    return observation
+  }
+
+  applyBehaviorModelStatus(status: BehaviorModelStatus): void {
+    this.modelActiveVersion = status.activeVersion
+    this.modelCandidateVersion = status.candidateVersion
+    this.modelSource = status.source
+    this.modelStatusText = status.message
+    this.modelComparison = status.comparison
+  }
+
+  private buildPlannerContext(): PlannerContext {
+    const transportOnline = this.mqttConnected || this.bridgeTlsConnected || this.bridgeTls.isConnected()
+    return {
+      stateTimestampMs: Date.now(),
+      livingLightOn: this.livingLightOn,
+      bedroomLightOn: this.bedroomLightOn,
+      curtainPercent: this.curtainPercent,
+      acPower: this.acPower,
+      acMode: this.acMode,
+      acTemperature: this.acTemp,
+      indoorTemperature: this.indoorTemp,
+      indoorHumidity: this.indoorHumidity,
+      lightLevel: Math.max(0, this.federatedLux),
+      presence: this.federatedPresence === 1,
+      awayMode: this.leavingMode,
+      preferredTemperature: 26,
+      livingLightOnline: transportOnline,
+      bedroomLightOnline: transportOnline,
+      curtainOnline: transportOnline,
+      acOnline: transportOnline
+    }
+  }
+
+  private planRequest(request: PlannerRequest): PlannerPlan {
+    if (!this.actionPlanner.isReady()) {
+      return { safe: false, message: '规划模型正在加载，请稍后重试', calls: [], confidence: 0, modelVersion: 0 }
+    }
+    const proposal = this.actionPlanner.infer(request)
+    if (proposal === null) {
+      return { safe: false, message: '规划模型无法使用当前设备状态', calls: [], confidence: 0, modelVersion: 0 }
+    }
+    return compilePlannerProposal(request, proposal)
+  }
+
+  private async executePlannerCalls(plan: PlannerPlan, actionSource: string, trainingEligible: boolean): Promise<void> {
+    for (const plannedCall of plan.calls) {
+      if (plannedCall.tool === 'light.set') {
+        await this.sendLightControl(plannedCall.target, plannedCall.power, actionSource, trainingEligible)
+        if (plannedCall.target === 'bedroom') {
+          this.bedroomLightOn = plannedCall.power
+        }
+        continue
+      }
+      if (plannedCall.tool === 'curtain.set') {
+        const previous = this.curtainPercent
+        this.curtainPercent = plannedCall.percentage
+        try {
+          await this.sendCurtainControl(plannedCall.percentage, actionSource, trainingEligible)
+        } catch (err) {
+          this.curtainPercent = previous
+          throw new Error((err as Error).message)
+        }
+        continue
+      }
+      if (plannedCall.tool === 'ac.set') {
+        if (this.acPending || this.acPendingSeq > 0) {
+          throw new Error('空调正在执行其他控制')
+        }
+        const previousPower = this.acPower
+        const previousMode = this.acMode
+        const previousTemperature = this.acTemp
+        this.acPower = plannedCall.power
+        this.acMode = plannedCall.mode === 'heat' ? 'heat' : 'cool'
+        this.acTemp = Math.max(20, Math.min(30, Math.round(plannedCall.temperature)))
+        await this.requestACControl(actionSource)
+        if (this.acAckText.startsWith('发送失败')) {
+          this.acPower = previousPower
+          this.acMode = previousMode
+          this.acTemp = previousTemperature
+          throw new Error(this.acAckText)
+        }
+        this.federatedCollector.recordAction(plannedCall.power ? 'ac_on' : 'ac_off', actionSource, trainingEligible)
+        continue
+      }
+      // The planner output contract has no dispatch path for door or alarm writes.
+      throw new Error(`安全策略拒绝工具: ${plannedCall.tool}`)
+    }
+  }
+
+  private async executeVoicePlannerIntent(intent: VoiceIntent): Promise<VoiceExecutionResult> {
+    const request = buildVoicePlannerRequest(intent, this.buildPlannerContext())
+    if (request === null) {
+      return { success: false, message: '无法构建语音规划请求' }
+    }
+    const plan = this.planRequest(request)
+    if (!plan.safe) {
+      return { success: false, message: plan.message }
+    }
+    try {
+      await this.executePlannerCalls(plan, 'voice_goal_planner', false)
+    } catch (err) {
+      return { success: false, message: `规划执行失败: ${(err as Error).message}` }
+    }
+    const feedback = this.voicePlannerFeedback(intent)
+    return {
+      success: true,
+      message: feedback.message,
+      promptRawFile: this.generatedVoicePrompt(feedback.prompt)
+    }
+  }
+
+  handleBehaviorObservation(observation: FederatedObservation): void {
+    const suggestion = this.behaviorModel.infer(observation)
+    if (!this.modelSuggestionEnabled || suggestion === null) {
+      return
+    }
+    const now = Date.now()
+    if (this.federatedDemoExecutionEnabled) {
+      this.prepareFederatedDemoPlan(suggestion)
+    }
+    if (suggestion.action === this.lastModelSuggestionAction && now - this.lastModelSuggestionAt < 30 * 60 * 1000) {
+      return
+    }
+    if (this.modelSuggestionAction.length > 0 && now - this.lastModelSuggestionAt < 10 * 60 * 1000) {
+      return
+    }
+    this.lastModelSuggestionAction = suggestion.action
+    this.lastModelSuggestionAt = now
+    this.modelSuggestionAction = suggestion.action
+    this.modelSuggestionReason = suggestion.reason
+    this.modelSuggestionConfidence = suggestion.confidence
+    this.modelStatusText = `v${suggestion.modelVersion} 已识别联邦需求，等待资格门`
+  }
+
+  private prepareFederatedDemoPlan(suggestion: BehaviorSuggestion): void {
+    this.federatedPlan = null
+    this.federatedPlanReady = false
+    this.federatedPlanText = ''
+    if (!this.federatedDemoExecutionEnabled) {
+      this.modelStatusText = '联邦需求已识别；演示执行开关关闭，仅展示建议'
+      return
+    }
+    if (suggestion.confidence < 0.75) {
+      this.modelStatusText = '资格门拒绝：联邦需求置信度不足'
+      return
+    }
+    if (suggestion.action === this.federatedQualificationAction) {
+      this.federatedQualificationCount++
+    } else {
+      this.federatedQualificationAction = suggestion.action
+      this.federatedQualificationCount = 1
+    }
+    if (this.federatedQualificationCount < 2) {
+      this.modelStatusText = `资格门：已观察到 ${this.modelActionText(suggestion.action)}，等待第二次同向状态采样`
+      return
+    }
+    const request = buildFederatedPlannerRequest(suggestion.action, suggestion.confidence,
+      this.buildPlannerContext())
+    if (request === null) {
+      this.modelStatusText = '资格门拒绝：不支持的联邦需求'
+      return
+    }
+    const plan = this.planRequest(request)
+    if (!plan.safe || plan.calls.length === 0 || plan.calls.length > 2) {
+      this.modelStatusText = `规划/安全门拒绝：${plan.message}`
+      return
+    }
+    this.federatedPlan = plan
+    this.federatedPlanCreatedAt = Date.now()
+    this.federatedPlanReady = true
+    this.federatedPlanText = plan.calls.map((item: PlannerToolCall): string => this.plannerCallText(item)).join('；')
+    this.modelStatusText = `资格门和规划安全门已通过，等待确认执行 ${plan.calls.length} 项`
+  }
+
+  private plannerCallText(call: PlannerToolCall): string {
+    if (call.tool === 'light.set') return `${call.target === 'bedroom' ? '卧室' : '客厅'}灯${call.power ? '开启' : '关闭'}`
+    if (call.tool === 'curtain.set') return `窗帘调至 ${call.percentage}%`
+    if (call.tool === 'ac.set') return `空调${call.power ? '开启' : '关闭'} ${call.mode} ${call.temperature}℃`
+    return '受限工具'
+  }
+
+  async executeFederatedDemoPlan(): Promise<void> {
+    const plan = this.federatedPlan
+    if (!this.federatedDemoExecutionEnabled || plan === null || !this.federatedPlanReady) {
+      this.modelStatusText = '没有可执行的联邦演示计划'
+      return
+    }
+    if (Date.now() - this.federatedPlanCreatedAt > 30000 || !plan.safe || plan.calls.length === 0 || plan.calls.length > 2) {
+      this.federatedPlanReady = false
+      this.federatedPlan = null
+      this.modelStatusText = '执行安全门拒绝：计划已过期或不符合调用限制'
+      return
+    }
+    for (const call of plan.calls) {
+      if (call.tool !== 'light.set' && call.tool !== 'curtain.set' && call.tool !== 'ac.set') {
+        this.federatedPlanReady = false
+        this.federatedPlan = null
+        this.modelStatusText = '执行安全门拒绝：包含未授权工具'
+        return
+      }
+    }
+    try {
+      await this.executePlannerCalls(plan, 'federated_demo_planner', false)
+      this.modelStatusText = `联邦演示已通过工具链执行 ${plan.calls.length} 项，并写回设备状态`
+    } catch (err) {
+      this.modelStatusText = `联邦演示执行失败：${(err as Error).message}`
+    } finally {
+      this.federatedPlanReady = false
+      this.federatedPlan = null
+      this.federatedPlanText = ''
+    }
+  }
+
+  modelActionText(action: string = this.modelSuggestionAction): string {
+    if (action === 'lighting_brighten_needed') return '增加照明需求'
+    if (action === 'lighting_reduce_needed') return '减弱照明/隐私需求'
+    if (action === 'thermal_cooler_needed') return '制冷需求'
+    if (action === 'thermal_warmer_needed') return '制热需求'
+    if (action === 'away_candidate') return '离家场景候选'
+    return '暂无待处理建议'
+  }
+
+  dismissModelSuggestion(): void {
+    this.modelStatusText = `已忽略：${this.modelActionText()}`
+    this.modelSuggestionAction = ''
+    this.modelSuggestionReason = ''
+    this.modelSuggestionConfidence = 0
+  }
+
+  refreshBehaviorModel(): void {
+    this.modelStatusText = '正在从家庭侧PC检查模型'
+    this.behaviorModel.refreshCandidate()
+      .then((status: BehaviorModelStatus): void => this.applyBehaviorModelStatus(status))
+      .catch((err: Error): void => {
+        this.modelStatusText = `模型检查失败：${err.message}`
+      })
+  }
+
+  modelMetricText(value: number | undefined): string {
+    return value === undefined ? '暂无' : `${(value * 100).toFixed(1)}%`
+  }
+
+  async sendLightControl(target: string, power: boolean, actionSource: string = 'dayu_control',
+    trainingEligible: boolean = true): Promise<void> {
     const payload: LightControlPacket = {
       target: target,
       power: power,
@@ -4953,6 +5366,7 @@ struct Index {
         this.livingLightOn = power
         this.livingLightOptimisticUntil = Date.now() + LED_OPTIMISTIC_HOLD_MS
         this.livingLightAckText = `等待设备确认 #${this.ledPendingSeq}`
+        this.federatedCollector.recordAction(power ? 'light_on' : 'light_off', actionSource, trainingEligible)
       }
     } catch (err) {
       if (target === 'living') {
@@ -5052,13 +5466,216 @@ struct Index {
     }
   }
 
+  private generatedVoicePrompt(relativePath: string): string {
+    return `voice/prompts/generated/${relativePath}`
+  }
+
+  private voicePlannerFeedback(intent: VoiceIntent): VoicePlannerFeedback {
+    if (intent.type === VoiceIntentType.COMFORT_WARMER) {
+      return { message: '已调整为制热模式', prompt: 'fixed/goal_comfort_warmer.wav' }
+    }
+    if (intent.type === VoiceIntentType.COMFORT_COOLER) {
+      return { message: '已调整为制冷模式', prompt: 'fixed/goal_comfort_cooler.wav' }
+    }
+    if (intent.type === VoiceIntentType.SLEEP_SCENE) {
+      return { message: '已为你调整睡眠环境', prompt: 'fixed/goal_sleep_scene.wav' }
+    }
+    if (intent.type === VoiceIntentType.AWAY_SCENE) {
+      return { message: '已为你设置离家场景', prompt: 'fixed/goal_away_scene.wav' }
+    }
+    return { message: '已为你准备回家环境', prompt: 'fixed/goal_home_scene.wav' }
+  }
+
+  private temperatureVoicePrompt(tenths: number): string | null {
+    if (tenths < 200 || tenths > 300) {
+      return null
+    }
+    return this.generatedVoicePrompt(`temperature/temperature_${tenths}.wav`)
+  }
+
+  private temperatureVoiceText(tenths: number): string {
+    return tenths % 10 === 0 ? `${Math.round(tenths / 10)}` : (tenths / 10).toFixed(1)
+  }
+
+  private humidityVoicePrompt(percent: number): string | null {
+    if (percent < 0 || percent > 100) {
+      return null
+    }
+    return this.generatedVoicePrompt(`humidity/humidity_${percent.toString().padStart(3, '0')}.wav`)
+  }
+
+  private curtainVoicePrompt(percent: number, action: string): string {
+    const normalized = Math.max(0, Math.min(100, Math.round(percent)))
+    return this.generatedVoicePrompt(`curtain/${action}_${normalized.toString().padStart(3, '0')}.wav`)
+  }
+
+  private acStatusVoicePrompt(): string | null {
+    if (!this.acPower) {
+      return this.generatedVoicePrompt('fixed/ac_status_off.wav')
+    }
+    const temperature = Math.round(this.acTemp)
+    if (temperature < 20 || temperature > 30) {
+      return null
+    }
+    const mode = this.acMode === 'heat' ? 'heat' : 'cool'
+    return this.generatedVoicePrompt(`ac/status_${mode}_${temperature}.wav`)
+  }
+
+  private acTemperatureVoicePrompt(temperature: number): string | null {
+    const normalized = Math.round(temperature)
+    if (normalized < 20 || normalized > 30) {
+      return null
+    }
+    return this.generatedVoicePrompt(`ac/temperature_set_${normalized}.wav`)
+  }
+
+  private doorStatusVoicePrompt(): string {
+    const lockState = this.doorLocked ? 'locked' : 'unlocked'
+    if (!this.hasDoorOpenStatus) {
+      return this.generatedVoicePrompt(`fixed/door_lock_${lockState}.wav`)
+    }
+    const openState = this.doorOpen ? 'open' : 'closed'
+    return this.generatedVoicePrompt(`fixed/door_${openState}_${lockState}.wav`)
+  }
+
+  private doorStatusVoiceMessage(): string {
+    const lockText = this.doorLocked ? '已上锁' : '已解锁'
+    if (!this.hasDoorOpenStatus) {
+      return `门锁当前${lockText}`
+    }
+    return `门当前${this.doorOpen ? '开着' : '关着'}，门锁${lockText}`
+  }
+
   async executeVoiceIntent(intent: VoiceIntent): Promise<VoiceExecutionResult> {
+    if (intent.type === VoiceIntentType.COMFORT_WARMER ||
+      intent.type === VoiceIntentType.COMFORT_COOLER ||
+      intent.type === VoiceIntentType.SLEEP_SCENE ||
+      intent.type === VoiceIntentType.AWAY_SCENE ||
+      intent.type === VoiceIntentType.HOME_SCENE) {
+      return await this.executeVoicePlannerIntent(intent)
+    }
+
+    if (intent.type === VoiceIntentType.LIGHT_STATUS_QUERY) {
+      return {
+        success: true,
+        message: this.livingLightOn ? '客厅灯当前开着' : '客厅灯当前关着',
+        promptRawFile: this.generatedVoicePrompt(this.livingLightOn
+          ? 'fixed/light_status_on.wav'
+          : 'fixed/light_status_off.wav')
+      }
+    }
+
+    if (intent.type === VoiceIntentType.CURTAIN_STATUS_QUERY) {
+      return {
+        success: true,
+        message: `窗帘当前开合度为${this.curtainPercent}%`,
+        promptRawFile: this.curtainVoicePrompt(this.curtainPercent, 'status')
+      }
+    }
+
+    if (intent.type === VoiceIntentType.AC_STATUS_QUERY) {
+      const acState = this.acPower ? `已开启，${this.acModeText()}模式，设定温度${this.acTemp}度` : '已关闭'
+      const prompt = this.acStatusVoicePrompt()
+      if (prompt === null) {
+        return { success: true, message: `空调当前${acState}`, skipPrompt: true }
+      }
+      return { success: true, message: `空调当前${acState}`, promptRawFile: prompt }
+    }
+
+    if (intent.type === VoiceIntentType.DOOR_STATUS_QUERY) {
+      return {
+        success: true,
+        message: this.doorStatusVoiceMessage(),
+        promptRawFile: this.doorStatusVoicePrompt()
+      }
+    }
+
+    if (intent.type === VoiceIntentType.TEMPERATURE_QUERY ||
+      intent.type === VoiceIntentType.HUMIDITY_QUERY ||
+      intent.type === VoiceIntentType.ENVIRONMENT_QUERY) {
+      if (!this.hasLiveSensorData) {
+        return {
+          success: false,
+          message: '暂未收到温湿度传感器数据',
+          promptRawFile: this.generatedVoicePrompt('fixed/sensor_unavailable.wav')
+        }
+      }
+      const temperatureTenths = Math.round(this.indoorTemp * 10)
+      const humidityPercent = Math.round(this.indoorHumidity)
+      const temperaturePrompt = this.temperatureVoicePrompt(temperatureTenths)
+      const humidityPrompt = this.humidityVoicePrompt(humidityPercent)
+      const temperatureText = this.temperatureVoiceText(temperatureTenths)
+      if (intent.type === VoiceIntentType.TEMPERATURE_QUERY) {
+        if (temperaturePrompt === null) {
+          return { success: true, message: `当前室内温度为${temperatureText}度`, skipPrompt: true }
+        }
+        return {
+          success: true,
+          message: `当前室内温度为${temperatureText}度`,
+          promptRawFile: temperaturePrompt
+        }
+      }
+      if (intent.type === VoiceIntentType.HUMIDITY_QUERY) {
+        if (humidityPrompt === null) {
+          return { success: true, message: `当前室内湿度为${humidityPercent}%`, skipPrompt: true }
+        }
+        return {
+          success: true,
+          message: `当前室内湿度为${humidityPercent}%`,
+          promptRawFile: humidityPrompt
+        }
+      }
+      if (temperaturePrompt === null || humidityPrompt === null) {
+        return {
+          success: true,
+          message: `当前室内温度为${temperatureText}度，湿度为${humidityPercent}%`,
+          skipPrompt: true
+        }
+      }
+      return {
+        success: true,
+        message: `当前室内温度为${temperatureText}度，湿度为${humidityPercent}%`,
+        promptRawFiles: [temperaturePrompt, humidityPrompt]
+      }
+    }
+
+    if (intent.type === VoiceIntentType.ALARM_STATUS_QUERY) {
+      if (this.smokeAlarm && this.waterAlarm) {
+        return {
+          success: true,
+          message: '当前存在烟雾和水浸报警',
+          promptRawFile: this.generatedVoicePrompt('fixed/alarm_smoke_water.wav')
+        }
+      }
+      if (this.smokeAlarm) {
+        return {
+          success: true,
+          message: '当前存在烟雾报警',
+          promptRawFile: this.generatedVoicePrompt('fixed/alarm_smoke.wav')
+        }
+      }
+      if (this.waterAlarm) {
+        return {
+          success: true,
+          message: '当前存在水浸报警',
+          promptRawFile: this.generatedVoicePrompt('fixed/alarm_water.wav')
+        }
+      }
+      return {
+        success: true,
+        message: '当前没有烟雾或水浸报警',
+        promptRawFile: this.generatedVoicePrompt('fixed/alarm_clear.wav')
+      }
+    }
+
     if (intent.type === VoiceIntentType.LIGHT_SET && intent.target === 'living') {
       if (this.livingLightOn === intent.power && !this.livingLightPending) {
         return {
           success: true,
           message: intent.power ? '客厅灯已经打开' : '客厅灯已经关闭',
-          promptRawFile: intent.power ? 'voice/prompts/light_on_ok.wav' : 'voice/prompts/light_off_ok.wav'
+          promptRawFile: this.generatedVoicePrompt(intent.power
+            ? 'fixed/light_status_on.wav'
+            : 'fixed/light_status_off.wav')
         }
       }
       if (this.livingLightControlInFlight || this.livingLightPending) {
@@ -5079,7 +5696,90 @@ struct Index {
       return {
         success: true,
         message: intent.power ? '客厅灯开启指令已发送' : '客厅灯关闭指令已发送',
-        promptRawFile: intent.power ? 'voice/prompts/light_on_ok.wav' : 'voice/prompts/light_off_ok.wav'
+        promptRawFile: this.generatedVoicePrompt(intent.power
+          ? 'fixed/light_set_on.wav'
+          : 'fixed/light_set_off.wav')
+      }
+    }
+
+    if (intent.type === VoiceIntentType.CURTAIN_SET && intent.target === 'curtain') {
+      const target = Math.max(0, Math.min(100, Math.round(intent.percentage)))
+      if (target === this.curtainPercent) {
+        return {
+          success: true,
+          message: `窗帘已经处于${target}%`,
+          promptRawFile: this.curtainVoicePrompt(target, 'status')
+        }
+      }
+      const previous = this.curtainPercent
+      this.curtainPercent = target
+      console.info(`[VoiceAssistant][execute] ${intent.rawText} -> curtain ${target}%`)
+      try {
+        await this.sendCurtainControl(target)
+      } catch (err) {
+        this.curtainPercent = previous
+        return { success: false, message: `窗帘发送失败: ${(err as Error).message}` }
+      }
+      return {
+        success: true,
+        message: `窗帘已调至${target}%`,
+        promptRawFile: this.curtainVoicePrompt(target, 'set')
+      }
+    }
+
+    if (intent.type === VoiceIntentType.AC_TEMPERATURE_SET && intent.target === 'ac') {
+      const target = Math.max(16, Math.min(30, Math.round(intent.temperature)))
+      if (target === this.acTemp) {
+        const prompt = this.acTemperatureVoicePrompt(target)
+        return prompt === null ?
+          { success: true, message: `空调温度已经是${target}度` } :
+          { success: true, message: `空调温度已经是${target}度`, promptRawFile: prompt }
+      }
+      if (this.acPending || this.acPendingSeq > 0) {
+        return { success: false, message: '空调正在执行其他控制' }
+      }
+      const previous = this.acTemp
+      this.acTemp = target
+      console.info(`[VoiceAssistant][execute] ${intent.rawText} -> ac temperature ${target}`)
+      await this.requestACControl('voice_temperature')
+      if (this.acAckText.startsWith('发送失败')) {
+        this.acTemp = previous
+        return { success: false, message: this.acAckText }
+      }
+      const prompt = this.acTemperatureVoicePrompt(target)
+      return prompt === null ?
+        { success: true, message: `空调温度已设置为${target}度` } :
+        { success: true, message: `空调温度已设置为${target}度`, promptRawFile: prompt }
+    }
+
+    if (intent.type === VoiceIntentType.AC_MODE_SET && intent.target === 'ac') {
+      const target = intent.mode === 'heat' ? 'heat' : 'cool'
+      if (target === this.acMode) {
+        return {
+          success: true,
+          message: `空调已经是${target === 'heat' ? '制热' : '制冷'}模式`,
+          promptRawFile: this.generatedVoicePrompt(target === 'heat'
+            ? 'fixed/ac_mode_heat.wav'
+            : 'fixed/ac_mode_cool.wav')
+        }
+      }
+      if (this.acPending || this.acPendingSeq > 0) {
+        return { success: false, message: '空调正在执行其他控制' }
+      }
+      const previous = this.acMode
+      this.acMode = target
+      console.info(`[VoiceAssistant][execute] ${intent.rawText} -> ac mode ${target}`)
+      await this.requestACControl('voice_mode')
+      if (this.acAckText.startsWith('发送失败')) {
+        this.acMode = previous
+        return { success: false, message: this.acAckText }
+      }
+      return {
+        success: true,
+        message: `空调已切换为${target === 'heat' ? '制热' : '制冷'}模式`,
+        promptRawFile: this.generatedVoicePrompt(target === 'heat'
+          ? 'fixed/ac_mode_heat.wav'
+          : 'fixed/ac_mode_cool.wav')
       }
     }
 
@@ -5088,7 +5788,9 @@ struct Index {
         return {
           success: true,
           message: intent.power ? '空调已经打开' : '空调已经关闭',
-          promptRawFile: intent.power ? 'voice/prompts/ac_on_ok.wav' : 'voice/prompts/ac_off_ok.wav'
+          promptRawFile: intent.power ?
+            (this.acStatusVoicePrompt() ?? this.generatedVoicePrompt('fixed/generic_success.wav')) :
+            this.generatedVoicePrompt('fixed/ac_status_off.wav')
         }
       }
       if (this.acPending || this.acPendingSeq > 0) {
@@ -5106,11 +5808,17 @@ struct Index {
       return {
         success: true,
         message: intent.power ? '空调开启指令已发送' : '空调关闭指令已发送',
-        promptRawFile: intent.power ? 'voice/prompts/ac_on_ok.wav' : 'voice/prompts/ac_off_ok.wav'
+        promptRawFile: this.generatedVoicePrompt(intent.power
+          ? 'fixed/ac_set_on.wav'
+          : 'fixed/ac_set_off.wav')
       }
     }
 
-    return { success: false, message: '暂时不支持这个语音指令' }
+    return {
+      success: false,
+      message: '暂时不支持这个语音指令',
+      promptRawFile: this.generatedVoicePrompt('fixed/unsupported.wav')
+    }
   }
 
   requestLivingLightToggle(preserveOptimisticOnFailure: boolean = false): void {
@@ -5228,8 +5936,9 @@ struct Index {
     const targetProtocol = this.normalizeProtocolMode(protocol)
     console.info(`[CMD] start ${mode}/${targetProtocol}: ${shortCmd}`)
     this.cryptoDebugText = `准备发送 ${targetProtocol} ${shortCmd}`
-    if (targetProtocol === 'MQTT' && this.localGatewayDeviceIds.has(targetDeviceId) &&
-      this.localMqtt.isConnected()) {
+    // DAYU owns the local broker. A command is considered dispatched once it is
+    // accepted locally; an ESP32 may reconnect and consume it later.
+    if (targetProtocol === 'MQTT' && this.localMqtt.isConnected()) {
       await this.withTimeout(this.localMqtt.publish(commandTopic, encrypted, 0),
         MQTT_COMMAND_PUBLISH_TIMEOUT_MS, 'local MQTT publish')
       console.info(`[CMD] local MQTT total=${Date.now() - commandStartAt}ms: ${shortCmd}`)
@@ -5502,13 +6211,16 @@ struct Index {
   }
 
   // 窗帘电机控制 — 加密 MQTT 发送
-  async sendCurtainControl(percentage: number): Promise<void> {
+  async sendCurtainControl(percentage: number, actionSource: string = 'dayu_control',
+    trainingEligible: boolean = true): Promise<void> {
     const baseUrl = this.normalizeBridgeUrl(this.bridgeUrl)
     const normalized = Math.max(0, Math.min(100, Math.round(percentage)))
     const seq = this.nextCurtainCommandSeq()
     const cmd = JSON.stringify({ cmd: 'curtain', val: normalized, seq })
     await this.sendEncryptedCommand(baseUrl, cmd, 'dayu/cmd', this.deviceForCapability('curtain'))
     this.reportCloudCurtain(normalized, 'dayu')
+    this.federatedCollector.recordAction(normalized >= 50 ? 'curtain_open' : 'curtain_close',
+      actionSource, trainingEligible)
   }
 
   // 联动 DAYU210 本地预警弹窗。
@@ -7167,7 +7879,7 @@ struct Index {
       this.acControlTimerId = -1
     }
 
-    if (reason !== 'power') {
+    if (reason !== 'power' && !reason.startsWith('voice_')) {
       this.acAckText = `等待合并 ${this.commandTransportText()}`
       this.acControlTimerId = setTimeout(() => {
         this.acControlTimerId = -1
@@ -7202,6 +7914,9 @@ struct Index {
     this.acPendingSeq = seq
     try {
       await this.sendACControl(this.acTemp, this.acPower, this.acMode, seq)
+      if (reason === 'power') {
+        this.federatedCollector.recordAction(this.acPower ? 'ac_on' : 'ac_off', 'dayu_control')
+      }
       this.acLastSentSignature = signature
       this.acLastSentAt = Date.now()
       if (this.acPendingSeq === seq) {
@@ -7292,6 +8007,7 @@ struct Index {
     this.acPower = false
     this.curtainPercent = 0
     console.info('[MOCK][leaveHome] lock door, lights off, AC off, curtain closed')
+    this.federatedCollector.recordAction('away_mode_suggest', 'dayu_scene')
     this.sendLightControl('living', false)
     this.sendLightControl('bedroom', false)
     const acSeq = this.nextACCommandSeq()
@@ -7432,31 +8148,6 @@ struct Index {
     .borderRadius(19)
     .backgroundColor(this.softPanelBg())
     .border({ width: 1, color: this.hairlineColor() })
-  }
-
-  @Builder
-  AlarmStatusPill(label: string, target: string, active: boolean) {
-    Row() {
-      Text(label)
-        .fontSize(13)
-        .fontColor(active ? '#FFE9E6' : this.subTextColor())
-        .maxLines(1)
-      Blank()
-      Text(active ? '异常' : '正常')
-        .fontSize(16)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(active ? '#FFFFFF' : this.accentGreen())
-        .maxLines(1)
-    }
-    .layoutWeight(1)
-    .height(42)
-    .padding({ left: 13, right: 13 })
-    .borderRadius(8)
-    .backgroundColor(active ? '#D06A73' : this.softPanelBg())
-    .border({ width: 1, color: active ? '#E8A8AE' : this.hairlineColor() })
-    .onClick(() => {
-      this.openAlarmClearDialog(target)
-    })
   }
 
   @Builder
@@ -7855,86 +8546,6 @@ struct Index {
   }
 
   @Builder
-  SettingCardHeader(title: string, desc: string, icon: Resource, accent: string) {
-    Row() {
-      Stack({ alignContent: Alignment.Center }) {
-        Image(icon)
-          .width(23)
-          .height(23)
-          .objectFit(ImageFit.Contain)
-      }
-        .width(42)
-        .height(42)
-        .backgroundColor(accent)
-        .borderRadius(16)
-      Column() {
-        Text(title)
-          .fontSize(18)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(this.textColor())
-          .maxLines(1)
-        Text(desc)
-          .fontSize(12)
-          .fontColor(this.subTextColor())
-          .margin({ top: 4 })
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-      .margin({ left: 12 })
-    }
-    .width('100%')
-    .alignItems(VerticalAlign.Center)
-  }
-
-  @Builder
-  OverviewMetricCell(label: string, value: string) {
-    Column() {
-      Text(label)
-        .fontSize(16)
-        .fontColor(this.subTextColor())
-        .maxLines(1)
-      if (value.endsWith('℃')) {
-        Row() {
-          Text(value.slice(0, -1))
-            .fontSize(36)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(this.pageTitleColor())
-            .letterSpacing(0)
-          Text('°')
-            .fontSize(20)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(this.pageTitleColor())
-            .margin({ left: 2, bottom: 15 })
-          Text('C')
-            .fontSize(36)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(this.pageTitleColor())
-            .letterSpacing(0)
-        }
-        .height(48)
-        .alignItems(VerticalAlign.Center)
-        .margin({ top: 7 })
-      } else {
-        Text(value)
-          .fontSize(36)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(this.pageTitleColor())
-          .letterSpacing(0)
-          .margin({ top: 7 })
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-      }
-    }
-    .width('100%')
-    .height('100%')
-    .justifyContent(FlexAlign.Center)
-    .alignItems(HorizontalAlign.Center)
-    .backgroundColor(this.cardBg())
-  }
-
-  @Builder
   TemperatureUnitValue(value: number, fontSize: number, color: string) {
     Row() {
       Text(`${value}`)
@@ -8266,10 +8877,30 @@ struct Index {
         .padding({ left: 28, right: 20 })
 
         Grid() {
-          GridItem() { this.OverviewMetricCell('室内温度', this.sensorDisplay[0]) }
-          GridItem() { this.OverviewMetricCell('室内湿度', this.sensorDisplay[1]) }
-          GridItem() { this.OverviewMetricCell('室外温度', this.outdoorTempText) }
-          GridItem() { this.OverviewMetricCell('室外湿度', this.outdoorHumidityText) }
+          GridItem() {
+            MetricValueCell({
+              label: '室内温度', value: this.sensorDisplay[0],
+              labelColor: this.subTextColor(), valueColor: this.pageTitleColor(), cellBg: this.cardBg()
+            })
+          }
+          GridItem() {
+            MetricValueCell({
+              label: '室内湿度', value: this.sensorDisplay[1],
+              labelColor: this.subTextColor(), valueColor: this.pageTitleColor(), cellBg: this.cardBg()
+            })
+          }
+          GridItem() {
+            MetricValueCell({
+              label: '室外温度', value: this.outdoorTempText,
+              labelColor: this.subTextColor(), valueColor: this.pageTitleColor(), cellBg: this.cardBg()
+            })
+          }
+          GridItem() {
+            MetricValueCell({
+              label: '室外湿度', value: this.outdoorHumidityText,
+              labelColor: this.subTextColor(), valueColor: this.pageTitleColor(), cellBg: this.cardBg()
+            })
+          }
         }
         .columnsTemplate('1fr 1fr')
         .rowsTemplate('1fr 1fr')
@@ -8317,7 +8948,7 @@ struct Index {
   @Builder
   ProtocolSettingCard() {
     Column() {
-      this.SettingCardHeader('控制通道', this.protocolPendingMode.length > 0 ? '正在等待 ACK' : 'MQTT / HTTP 切换', $r('app.media.setting_protocol'), this.accentBlue())
+      SettingHeaderCell({ title: '控制通道', desc: this.protocolPendingMode.length > 0 ? '正在等待 ACK' : 'MQTT / HTTP 切换', icon: $r('app.media.setting_protocol'), accent: this.accentBlue(), titleColor: this.textColor(), descColor: this.subTextColor() })
       Blank()
         .height(26)
       Row() {
@@ -8368,7 +8999,7 @@ struct Index {
   @Builder
   CryptoSettingCard() {
     Column() {
-      this.SettingCardHeader('加密算法', this.cryptoPendingMode.length > 0 ? '正在切换' : `${this.cryptoMode}-GCM`, $r('app.media.setting_crypto'), this.accentGreen())
+      SettingHeaderCell({ title: '加密算法', desc: this.cryptoPendingMode.length > 0 ? '正在切换' : `${this.cryptoMode}-GCM`, icon: $r('app.media.setting_crypto'), accent: this.accentGreen(), titleColor: this.textColor(), descColor: this.subTextColor() })
       Blank()
         .height(26)
       Row() {
@@ -8541,7 +9172,7 @@ struct Index {
   @Builder
   DebugSettingCard() {
     Column() {
-      this.SettingCardHeader('调试信息', `${this.mqttMessages.length} 条 · 三连打开`, $r('app.media.setting_debug'), this.accentOrange())
+      SettingHeaderCell({ title: '调试信息', desc: `${this.mqttMessages.length} 条 · 三连打开`, icon: $r('app.media.setting_debug'), accent: this.accentOrange(), titleColor: this.textColor(), descColor: this.subTextColor() })
       Blank()
         .height(28)
       Text(this.cryptoLastDecrypted)
@@ -8572,7 +9203,7 @@ struct Index {
   @Builder
   ProvisioningSettingCard() {
     Column() {
-      this.SettingCardHeader('设备接入', this.provisioningConnected ? '串口已连接' : '使用串口接入新设备', $r('app.media.setting_provision'), this.accentBlue())
+      SettingHeaderCell({ title: '设备接入', desc: this.provisioningConnected ? '串口已连接' : '使用串口接入新设备', icon: $r('app.media.setting_provision'), accent: this.accentBlue(), titleColor: this.textColor(), descColor: this.subTextColor() })
       Blank()
         .height(12)
       Button('开始接入')
@@ -8611,8 +9242,7 @@ struct Index {
   @Builder
   IrLearningSettingCard() {
     Column() {
-      this.SettingCardHeader('空调万能适配', this.irLearnCompletedCount === IR_LEARN_KEY_LABELS.length ?
-        '已保存遥控器' : '快来试试吧', $r('app.media.setting_ir'), this.accentOrange())
+      SettingHeaderCell({ title: '空调万能适配', desc: this.irLearnCompletedCount === IR_LEARN_KEY_LABELS.length ? '已保存遥控器' : '快来试试吧', icon: $r('app.media.setting_ir'), accent: this.accentOrange(), titleColor: this.textColor(), descColor: this.subTextColor() })
       Blank()
         .height(28)
       Text('只需一个遥控器，就可以学习控制你的任何品牌空调')
@@ -8643,7 +9273,7 @@ struct Index {
   @Builder
   DeviceBindingSettingCard() {
     Column() {
-      this.SettingCardHeader('设备绑定', `${this.registeredDeviceCount()} 台已发现`, $r('app.media.setting_bridge'), this.accentGreen())
+      SettingHeaderCell({ title: '设备绑定', desc: `${this.registeredDeviceCount()} 台已发现`, icon: $r('app.media.setting_bridge'), accent: this.accentGreen(), titleColor: this.textColor(), descColor: this.subTextColor() })
 
       Image($r('app.media.device_binding_illustration_card'))
         .width('100%')
@@ -8676,9 +9306,7 @@ struct Index {
   @Builder
   VoiceprintSettingCard() {
     Column() {
-      this.SettingCardHeader('声纹保护', this.voiceprintUsers.length > 0 ?
-        `${this.voiceprintUsers.length} 位授权用户` : '仅在本地保存特征',
-      $r('app.media.device_mic'), this.accentBlue())
+      SettingHeaderCell({ title: '声纹保护', desc: this.voiceprintUsers.length > 0 ? `${this.voiceprintUsers.length} 位授权用户` : '仅在本地保存特征', icon: $r('app.media.device_mic'), accent: this.accentBlue(), titleColor: this.textColor(), descColor: this.subTextColor() })
       Blank()
         .height(12)
       Column() {
@@ -8733,30 +9361,21 @@ struct Index {
   }
 
   @Builder
-  SettingsFeatureImage(icon: Resource, dimmed: boolean) {
-    Image(icon)
-      .width(124)
-      .height(104)
-      .objectFit(ImageFit.Contain)
-      .opacity(dimmed ? 0.55 : 1)
-  }
-
-  @Builder
   SettingsFeatureIcon(icon: Resource, action: string) {
     if (action === 'protocol') {
       if (this.transportForDevice(this.activeDeviceId) === 'HTTP') {
-        this.SettingsFeatureImage($r('app.media.settings_http_comic'), this.protocolPendingMode.length > 0)
+        SettingsFeatureImageCell({ icon: $r('app.media.settings_http_comic'), dimmed: this.protocolPendingMode.length > 0 })
       } else {
-        this.SettingsFeatureImage($r('app.media.settings_mqtt_comic'), this.protocolPendingMode.length > 0)
+        SettingsFeatureImageCell({ icon: $r('app.media.settings_mqtt_comic'), dimmed: this.protocolPendingMode.length > 0 })
       }
     } else if (action === 'crypto') {
       if (this.cryptoModeForDevice(this.activeDeviceId) === 'AES') {
-        this.SettingsFeatureImage($r('app.media.settings_aes_comic'), this.cryptoPendingMode.length > 0)
+        SettingsFeatureImageCell({ icon: $r('app.media.settings_aes_comic'), dimmed: this.cryptoPendingMode.length > 0 })
       } else {
-        this.SettingsFeatureImage($r('app.media.settings_sm4_comic'), this.cryptoPendingMode.length > 0)
+        SettingsFeatureImageCell({ icon: $r('app.media.settings_sm4_comic'), dimmed: this.cryptoPendingMode.length > 0 })
       }
     } else {
-      this.SettingsFeatureImage(icon, false)
+      SettingsFeatureImageCell({ icon: icon, dimmed: false })
     }
   }
 
@@ -9238,10 +9857,20 @@ struct Index {
         .height(4)
 
       Row() {
-        this.AlarmStatusPill('烟雾', 'smoke', this.smokeAlarm)
+        AlarmStatusCell({
+          label: '烟雾', active: this.smokeAlarm,
+          idleLabelColor: this.subTextColor(), idleValueColor: this.accentGreen(),
+          idleBg: this.softPanelBg(), idleBorder: this.hairlineColor(),
+          onTap: () => { this.openAlarmClearDialog('smoke') }
+        })
         Blank()
           .width(8)
-        this.AlarmStatusPill('水浸', 'water', this.waterAlarm)
+        AlarmStatusCell({
+          label: '水浸', active: this.waterAlarm,
+          idleLabelColor: this.subTextColor(), idleValueColor: this.accentGreen(),
+          idleBg: this.softPanelBg(), idleBorder: this.hairlineColor(),
+          onTap: () => { this.openAlarmClearDialog('water') }
+        })
         Button('模拟演练')
           .width(106)
           .height(42)
@@ -9822,28 +10451,6 @@ struct Index {
   }
 
   @Builder
-  DebugInfoRow(label: string, value: string, color: string) {
-    Column() {
-      Text(label)
-        .fontSize(12)
-        .fontColor(this.subTextColor())
-        .maxLines(1)
-      Text(value)
-        .fontSize(12)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(color)
-        .margin({ top: 4 })
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-    }
-    .width('100%')
-    .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-    .backgroundColor(this.softPanelBg())
-    .border({ width: 1, color: this.hairlineColor() })
-    .borderRadius(8)
-  }
-
-  @Builder
   DebugInfoPanel() {
     Column() {
       Row() {
@@ -9876,16 +10483,16 @@ struct Index {
 
       Scroll() {
         Column() {
-          this.DebugInfoRow('当前目标', `${this.activeDeviceName()} · ${this.deviceIdDisplayText(this.activeDeviceId)}`, this.accentBlue())
-          this.DebugInfoRow('设备能力', this.activeDeviceCapabilitiesText(), this.textColor())
-          this.DebugInfoRow('控制卡片绑定', this.activeDeviceBindingsText(), this.accentGreen())
-          this.DebugInfoRow('设备配置', `${this.transportForDevice(this.activeDeviceId)} / ${this.cryptoModeForDevice(this.activeDeviceId)}-GCM`, this.accentGreen())
-          this.DebugInfoRow('密钥状态', this.activeDeviceKeyText(), this.activeDeviceKeyText().startsWith('ECDH') ? this.accentGreen() : this.accentOrange())
-          this.DebugInfoRow('最近注册', this.activeDeviceLastSeenText(), this.subTextColor())
-          this.DebugInfoRow('最近解密', this.cryptoLastDecrypted, this.cryptoEnabled ? this.accentGreen() : this.subTextColor())
-          this.DebugInfoRow('当前调试行', this.cryptoDebugText, this.accentBlue())
-          this.DebugInfoRow('MQTT 地址 / 端口', this.mqttStatus, this.mqttConnected ? this.accentGreen() : this.accentOrange())
-          this.DebugInfoRow('Beacon 自动发现', this.beaconLastReceived, this.beaconAutoDiscovered ? this.accentGreen() : this.subTextColor())
+          DebugInfoCell({ label: '当前目标', value: `${this.activeDeviceName()} · ${this.deviceIdDisplayText(this.activeDeviceId)}`, valueColor: this.accentBlue(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
+          DebugInfoCell({ label: '设备能力', value: this.activeDeviceCapabilitiesText(), valueColor: this.textColor(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
+          DebugInfoCell({ label: '控制卡片绑定', value: this.activeDeviceBindingsText(), valueColor: this.accentGreen(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
+          DebugInfoCell({ label: '设备配置', value: `${this.transportForDevice(this.activeDeviceId)} / ${this.cryptoModeForDevice(this.activeDeviceId)}-GCM`, valueColor: this.accentGreen(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
+          DebugInfoCell({ label: '密钥状态', value: this.activeDeviceKeyText(), valueColor: this.activeDeviceKeyText().startsWith('ECDH') ? this.accentGreen() : this.accentOrange(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
+          DebugInfoCell({ label: '最近注册', value: this.activeDeviceLastSeenText(), valueColor: this.subTextColor(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
+          DebugInfoCell({ label: '最近解密', value: this.cryptoLastDecrypted, valueColor: this.cryptoEnabled ? this.accentGreen() : this.subTextColor(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
+          DebugInfoCell({ label: '当前调试行', value: this.cryptoDebugText, valueColor: this.accentBlue(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
+          DebugInfoCell({ label: 'MQTT 地址 / 端口', value: this.mqttStatus, valueColor: this.mqttConnected ? this.accentGreen() : this.accentOrange(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
+          DebugInfoCell({ label: 'Beacon 自动发现', value: this.beaconLastReceived, valueColor: this.beaconAutoDiscovered ? this.accentGreen() : this.subTextColor(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
 
           Row() {
             Text(this.debugShowAllDevices ? '全部通信消息' : '当前设备消息')
@@ -10032,9 +10639,13 @@ struct Index {
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
+      .padding({ left: 22, right: 22, top: 18, bottom: 12 })
+      .backgroundColor(this.cardBg())
 
-      Row() {
+      Scroll() {
         Column() {
+        Row() {
+          Column() {
           Text(this.activeDeviceName())
             .width('100%')
             .fontSize(18)
@@ -10073,6 +10684,189 @@ struct Index {
       .backgroundColor(this.softPanelBg())
       .border({ width: 1.5, color: this.accentBlue() })
       .borderRadius(12)
+
+      Column() {
+        Row() {
+          Column() {
+            Text('家庭行为模型')
+              .fontSize(16)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(this.textColor())
+            Text(`${this.modelSource} v${this.modelActiveVersion} · ${this.modelStatusText}`)
+              .fontSize(11)
+              .fontColor(this.subTextColor())
+              .margin({ top: 3 })
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+
+          Button('模型对比')
+            .height(32)
+            .fontSize(12)
+            .fontColor('#FFFFFF')
+            .backgroundColor('#2E3033')
+            .borderRadius(8)
+            .onClick(() => {
+              this.showModelComparisonPanel = true
+            })
+          Button('检查更新')
+            .height(32)
+            .fontSize(12)
+            .fontColor('#FFFFFF')
+            .backgroundColor(this.accentBlue())
+            .borderRadius(8)
+            .margin({ left: 8 })
+            .onClick(() => {
+              this.refreshBehaviorModel()
+            })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+
+        Row() {
+          Text('启用模型建议')
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.textColor())
+            .layoutWeight(1)
+          Toggle({ type: ToggleType.Switch, isOn: this.modelSuggestionEnabled })
+            .width(44)
+            .height(24)
+            .selectedColor(this.accentGreen())
+            .onChange((enabled: boolean) => {
+              this.modelSuggestionEnabled = enabled
+              if (!enabled) {
+                this.dismissModelSuggestion()
+              } else {
+                this.handleBehaviorObservation(this.buildFederatedObservation())
+              }
+            })
+        }
+        .width('100%')
+        .height(34)
+        .margin({ top: 8 })
+
+        if (this.modelSuggestionEnabled) {
+          Row() {
+            Column() {
+              Text('联邦需求链路')
+                .fontSize(13)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(this.textColor())
+              Text('状态 → 需求模型 → 资格门 → 规划 → 安全门 → 工具调用')
+                .fontSize(10)
+                .fontColor(this.subTextColor())
+                .margin({ top: 2 })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+          }
+          .width('100%')
+          .height(40)
+
+          Row() {
+            Text('联邦演示执行')
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.textColor())
+              .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.federatedDemoExecutionEnabled })
+              .width(44)
+              .height(24)
+              .selectedColor(this.accentGreen())
+              .onChange((enabled: boolean) => {
+                this.federatedDemoExecutionEnabled = enabled
+                this.federatedPlan = null
+                this.federatedPlanReady = false
+                this.federatedPlanText = ''
+                this.federatedQualificationAction = ''
+                this.federatedQualificationCount = 0
+                this.modelStatusText = enabled ? '联邦演示已开启：需要两次同向状态采样并由用户确认' :
+                  '联邦演示已关闭：仅展示模型建议'
+                if (enabled) this.handleBehaviorObservation(this.buildFederatedObservation())
+              })
+          }
+          .width('100%')
+          .height(34)
+          .margin({ top: 4 })
+
+          if (this.modelSuggestionAction.length > 0) {
+            Row() {
+              Column() {
+                Text(this.modelActionText())
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.accentGreen())
+                Text(`${this.modelSuggestionReason} · 置信度 ${(this.modelSuggestionConfidence * 100).toFixed(1)}%`)
+                  .fontSize(10)
+                  .fontColor(this.subTextColor())
+                  .margin({ top: 3 })
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+              Button('忽略')
+                .height(30)
+                .fontSize(11)
+                .fontColor(this.subTextColor())
+                .backgroundColor(this.cardBg())
+                .border({ width: 1, color: this.hairlineColor() })
+                .borderRadius(8)
+                .onClick(() => this.dismissModelSuggestion())
+            }
+            .width('100%')
+            .height(48)
+            .padding({ left: 10, right: 8 })
+            .backgroundColor(this.cardBg())
+            .border({ width: 1, color: this.accentGreen() })
+            .borderRadius(8)
+
+            if (this.federatedPlanReady) {
+              Row() {
+                Column() {
+                  Text('待确认演示计划')
+                    .fontSize(12)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(this.textColor())
+                  Text(this.federatedPlanText)
+                    .fontSize(10)
+                    .fontColor(this.subTextColor())
+                    .margin({ top: 2 })
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+                Button('执行计划')
+                  .height(30)
+                  .fontSize(11)
+                  .fontColor('#FFFFFF')
+                  .backgroundColor(this.accentBlue())
+                  .borderRadius(8)
+                  .onClick(() => {
+                    this.executeFederatedDemoPlan()
+                  })
+              }
+              .width('100%')
+              .height(48)
+              .padding({ left: 10, right: 8 })
+              .margin({ top: 6 })
+              .backgroundColor(this.cardBg())
+              .border({ width: 1, color: this.accentBlue() })
+              .borderRadius(8)
+            }
+          }
+        }
+      }
+      .width('100%')
+      .padding({ left: 14, right: 14, top: 12, bottom: 10 })
+      .margin({ top: 10 })
+      .backgroundColor(this.softPanelBg())
+      .border({ width: 1, color: this.hairlineColor() })
+      .borderRadius(10)
 
       Row() {
         Text('已发现设备')
@@ -10131,7 +10925,7 @@ struct Index {
         }, (deviceId: string) => deviceId)
       }
       .width('100%')
-      .layoutWeight(1)
+      .height(Math.max(70, this.deviceBindingIds().length * 70))
       .scrollBar(BarState.Auto)
       .edgeEffect(EdgeEffect.None)
 
@@ -10142,13 +10936,134 @@ struct Index {
         .margin({ top: 10 })
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .width('100%')
+      .padding({ left: 22, right: 22, bottom: 22 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .scrollable(ScrollDirection.Vertical)
+    .scrollBar(BarState.Auto)
+    .edgeEffect(EdgeEffect.Spring)
     }
     .width(780)
-    .height(520)
-    .padding(22)
+    .height(500)
     .backgroundColor(this.cardBg())
     .border({ width: 1.5, color: this.hairlineColor() })
     .borderRadius(18)
+  }
+
+  @Builder
+  ModelComparisonPanel() {
+    Column() {
+      Row() {
+        Column() {
+          Text('新旧模型对比')
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.textColor())
+          Text('比较依据来自家庭A近期真实行为数据，不上传原始生活记录')
+            .fontSize(12)
+            .fontColor(this.subTextColor())
+            .margin({ top: 4 })
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        Button('关闭')
+          .width(70)
+          .height(36)
+          .fontSize(13)
+          .fontColor('#FFFFFF')
+          .backgroundColor('#2E3033')
+          .borderRadius(18)
+          .onClick(() => {
+            this.showModelComparisonPanel = false
+          })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        Column() {
+          Text(`当前模型 v${this.modelComparison.current_version}`)
+            .fontSize(16)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.textColor())
+          Text(`准确率  ${this.modelMetricText(this.modelComparison.current_metrics.accuracy)}`)
+            .fontSize(12).fontColor(this.subTextColor()).margin({ top: 12 })
+          Text(`宏平均F1  ${this.modelMetricText(this.modelComparison.current_metrics.macro_f1)}`)
+            .fontSize(12).fontColor(this.subTextColor()).margin({ top: 7 })
+          Text(`动作召回率  ${this.modelMetricText(this.modelComparison.current_metrics.action_recall)}`)
+            .fontSize(12).fontColor(this.subTextColor()).margin({ top: 7 })
+          Text(`误触发率  ${this.modelMetricText(this.modelComparison.current_metrics.false_trigger_rate)}`)
+            .fontSize(12).fontColor(this.subTextColor()).margin({ top: 7 })
+        }
+        .width(250)
+        .height(170)
+        .padding(16)
+        .alignItems(HorizontalAlign.Start)
+        .backgroundColor(this.softPanelBg())
+        .border({ width: 1, color: this.hairlineColor() })
+        .borderRadius(10)
+
+        Column() {
+          Text(`候选模型 v${this.modelComparison.candidate_version}`)
+            .fontSize(16)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.textColor())
+          Text(`准确率  ${this.modelMetricText(this.modelComparison.candidate_metrics.accuracy)}`)
+            .fontSize(12).fontColor(this.subTextColor()).margin({ top: 12 })
+          Text(`宏平均F1  ${this.modelMetricText(this.modelComparison.candidate_metrics.macro_f1)}`)
+            .fontSize(12).fontColor(this.subTextColor()).margin({ top: 7 })
+          Text(`动作召回率  ${this.modelMetricText(this.modelComparison.candidate_metrics.action_recall)}`)
+            .fontSize(12).fontColor(this.subTextColor()).margin({ top: 7 })
+          Text(`误触发率  ${this.modelMetricText(this.modelComparison.candidate_metrics.false_trigger_rate)}`)
+            .fontSize(12).fontColor(this.subTextColor()).margin({ top: 7 })
+        }
+        .width(250)
+        .height(170)
+        .padding(16)
+        .alignItems(HorizontalAlign.Start)
+        .backgroundColor(this.softPanelBg())
+        .border({ width: 1.5, color: this.modelComparison.recommend_candidate ? this.accentGreen() : this.hairlineColor() })
+        .borderRadius(10)
+        .margin({ left: 14 })
+      }
+      .width('100%')
+      .margin({ top: 20 })
+
+      Column() {
+        Text(this.modelComparison.reason)
+          .width('100%')
+          .fontSize(15)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(this.modelComparison.recommend_candidate ? this.accentGreen() : this.textColor())
+        Text(`已采集 ${this.modelComparison.sample_count} 条近期样本，其中有效操作 ${this.modelComparison.action_sample_count} 条。` +
+          `至少需要 ${this.modelComparison.minimum_samples} 条样本和 ${this.modelComparison.minimum_action_samples} 条操作记录后才会判断新模型是否更适合本家庭。`)
+          .width('100%')
+          .fontSize(12)
+          .fontColor(this.subTextColor())
+          .lineHeight(20)
+          .margin({ top: 8 })
+        Text('系统同时关注动作识别能力和误触发率。只有候选模型在本地数据上有明确提升，且误触发率处于安全范围内，才会替换当前模型；否则自动保留旧版本。')
+          .width('100%')
+          .fontSize(12)
+          .fontColor(this.subTextColor())
+          .lineHeight(20)
+          .margin({ top: 8 })
+      }
+      .width('100%')
+      .padding(16)
+      .margin({ top: 16 })
+      .alignItems(HorizontalAlign.Start)
+      .backgroundColor(this.softPanelBg())
+      .borderRadius(10)
+    }
+    .width(590)
+    .padding(24)
+    .backgroundColor(this.cardBg())
+    .border({ width: 1.5, color: this.hairlineColor() })
+    .borderRadius(16)
   }
 
   @Builder
@@ -11584,6 +12499,15 @@ struct Index {
         .backgroundColor('rgba(32, 36, 42, 0.58)')
       }
 
+      if (this.showModelComparisonPanel) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.ModelComparisonPanel()
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.64)')
+      }
+
       if (this.showProvisioningPanel) {
         Stack({ alignContent: Alignment.Center }) {
           this.ProvisioningPanel()
@@ -11628,9 +12552,223 @@ struct Index {
         .height('100%')
         .backgroundColor('rgba(94, 34, 42, 0.34)')
       }
+
     }
     .width('100%')
     .height('100%')
     .backgroundColor(this.pageBg())
+  }
+}
+
+/**
+ * 总览页温湿度指标单元格。
+ *
+ * 这里必须是独立 @Component 而不是 @Builder：ArkUI 中 @Builder 按值传参时，
+ * 状态变量变化不会触发 Builder 内部刷新，会导致室内外温湿度必须切换页面
+ * 才更新。改为 @Component + @Prop 后，父组件状态变化能正常驱动局部刷新，
+ * 同时把重渲染范围限制在单个单元格内。
+ *
+ * 颜色由父组件传入，暗色模式与告警配色行为保持不变。
+ */
+@Component
+struct MetricValueCell {
+  @Prop label: string = ''
+  @Prop value: string = ''
+  @Prop labelColor: string = ''
+  @Prop valueColor: string = ''
+  @Prop cellBg: string = ''
+
+  build() {
+    Column() {
+      Text(this.label)
+        .fontSize(16)
+        .fontColor(this.labelColor)
+        .maxLines(1)
+      if (this.value.endsWith('℃')) {
+        Row() {
+          Text(this.value.slice(0, -1))
+            .fontSize(36)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.valueColor)
+            .letterSpacing(0)
+          Text('°')
+            .fontSize(20)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.valueColor)
+            .margin({ left: 2, bottom: 15 })
+          Text('C')
+            .fontSize(36)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.valueColor)
+            .letterSpacing(0)
+        }
+        .height(48)
+        .alignItems(VerticalAlign.Center)
+        .margin({ top: 7 })
+      } else {
+        Text(this.value)
+          .fontSize(36)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(this.valueColor)
+          .letterSpacing(0)
+          .margin({ top: 7 })
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
+    .backgroundColor(this.cellBg)
+  }
+}
+
+/**
+ * 烟雾 / 水浸报警状态指示。
+ *
+ * 与 MetricValueCell 同理：原先是按值传参的 @Builder，active 变化不会触发
+ * 内部刷新，报警状态必须切换页面才更新。报警属于安全相关显示，这里改为
+ * 独立 @Component，确保 smokeAlarm / waterAlarm 变化立即反映到界面。
+ *
+ * 点击消警仍由父组件处理，通过 onTap 回调传回，行为与原实现一致。
+ */
+@Component
+struct AlarmStatusCell {
+  @Prop label: string = ''
+  @Prop active: boolean = false
+  @Prop idleLabelColor: string = ''
+  @Prop idleValueColor: string = ''
+  @Prop idleBg: string = ''
+  @Prop idleBorder: string = ''
+  onTap: () => void = () => {}
+
+  build() {
+    Row() {
+      Text(this.label)
+        .fontSize(13)
+        .fontColor(this.active ? '#FFE9E6' : this.idleLabelColor)
+        .maxLines(1)
+      Blank()
+      Text(this.active ? '异常' : '正常')
+        .fontSize(16)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(this.active ? '#FFFFFF' : this.idleValueColor)
+        .maxLines(1)
+    }
+    .layoutWeight(1)
+    .height(42)
+    .padding({ left: 13, right: 13 })
+    .borderRadius(8)
+    .backgroundColor(this.active ? '#D06A73' : this.idleBg)
+    .border({ width: 1, color: this.active ? '#E8A8AE' : this.idleBorder })
+    .onClick(() => {
+      this.onTap()
+    })
+  }
+}
+
+/**
+ * 调试信息行。
+ *
+ * 与 MetricValueCell 同因：原 @Builder 按值传参，调试面板打开期间
+ * 密钥状态、最近解密、MQTT 状态等都不会自动刷新。
+ */
+@Component
+struct DebugInfoCell {
+  @Prop label: string = ''
+  @Prop value: string = ''
+  @Prop valueColor: string = ''
+  @Prop labelColor: string = ''
+  @Prop rowBg: string = ''
+  @Prop rowBorder: string = ''
+
+  build() {
+    Column() {
+      Text(this.label)
+        .fontSize(12)
+        .fontColor(this.labelColor)
+        .maxLines(1)
+      Text(this.value)
+        .fontSize(12)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(this.valueColor)
+        .margin({ top: 4 })
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width('100%')
+    .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+    .backgroundColor(this.rowBg)
+    .border({ width: 1, color: this.rowBorder })
+    .borderRadius(8)
+  }
+}
+
+/**
+ * 设置页卡片标题。
+ *
+ * 原 @Builder 按值传参，导致「正在等待 ACK」「正在切换」「串口已连接」
+ * 等副标题状态变化后不会立即反映到界面。
+ */
+@Component
+struct SettingHeaderCell {
+  @Prop title: string = ''
+  @Prop desc: string = ''
+  @Prop icon: Resource
+  @Prop accent: string = ''
+  @Prop titleColor: string = ''
+  @Prop descColor: string = ''
+
+  build() {
+    Row() {
+      Stack({ alignContent: Alignment.Center }) {
+        Image(this.icon)
+          .width(23)
+          .height(23)
+          .objectFit(ImageFit.Contain)
+      }
+        .width(42)
+        .height(42)
+        .backgroundColor(this.accent)
+        .borderRadius(16)
+      Column() {
+        Text(this.title)
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(this.titleColor)
+          .maxLines(1)
+        Text(this.desc)
+          .fontSize(12)
+          .fontColor(this.descColor)
+          .margin({ top: 4 })
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .margin({ left: 12 })
+    }
+    .width('100%')
+    .alignItems(VerticalAlign.Center)
+  }
+}
+
+/**
+ * 设置页功能图标。
+ *
+ * 原 @Builder 按值传参，协议 / 加密切换过程中的半透明提示不会刷新。
+ */
+@Component
+struct SettingsFeatureImageCell {
+  @Prop icon: Resource
+  @Prop dimmed: boolean = false
+
+  build() {
+    Image(this.icon)
+      .width(124)
+      .height(104)
+      .objectFit(ImageFit.Contain)
+      .opacity(this.dimmed ? 0.55 : 1)
   }
 }

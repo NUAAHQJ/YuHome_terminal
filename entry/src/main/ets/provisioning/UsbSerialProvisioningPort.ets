@@ -17,7 +17,12 @@ const WCH_VENDOR_ID: number = 0x1A86
 const CP210X_VENDOR_ID: number = 0x10C4
 const READ_TIMEOUT_MS: number = 50
 const READ_ACTIVE_DELAY_MS: number = 0
-const READ_IDLE_DELAY_MS: number = 5
+// 分级空闲退避：刚空闲时保持较快轮询以压低首字节延迟，
+// 持续空闲超过 READ_IDLE_SLOW_AFTER_MS 后放慢，避免空载占满 UI 线程。
+// 配网帧重发周期为 1s、整体超时 15s，最大 120ms 的检测延迟不影响配网流程。
+const READ_IDLE_DELAY_MS: number = 20
+const READ_IDLE_SLOW_DELAY_MS: number = 120
+const READ_IDLE_SLOW_AFTER_MS: number = 1000
 
 type UsbSerialBackend = 'none' | 'serial' | 'usb'
 
@@ -185,6 +190,8 @@ export class UsbSerialProvisioningPort {
   private nextAsciiHexHintAt: number = 0
   private lastRxAt: number = 0
   private rxByteCount: number = 0
+  // 连续空读的起始时间戳，0 表示当前不处于空闲状态
+  private idleReadSince: number = 0
   private frameHandler: ((frame: ProvisioningFrame) => void) | null = null
   private logHandler: ((message: string) => void) | null = null
 
@@ -237,6 +244,7 @@ export class UsbSerialProvisioningPort {
 
   async close(): Promise<void> {
     this.reading = false
+    this.idleReadSince = 0
     if (this.backend === 'serial' && this.serialPortId !== SERIAL_NONE) {
       try {
         serialManager.close(this.serialPortId)
@@ -950,6 +958,7 @@ export class UsbSerialProvisioningPort {
       return
     }
     this.reading = true
+    this.idleReadSince = 0
     this.readOnce()
   }
 
@@ -1024,11 +1033,30 @@ export class UsbSerialProvisioningPort {
   }
 
   private scheduleNextRead(lastReadCount: number): void {
-    if (this.reading) {
-      setTimeout(() => {
-        this.readOnce()
-      }, lastReadCount > 0 ? READ_ACTIVE_DELAY_MS : READ_IDLE_DELAY_MS)
+    if (!this.reading) {
+      return
     }
+    setTimeout(() => {
+      this.readOnce()
+    }, this.nextReadDelay(lastReadCount))
+  }
+
+  // 有数据时立即继续读，保证连续帧的接收速度不受影响。
+  // 空闲时先以 READ_IDLE_DELAY_MS 轮询，持续空闲超过
+  // READ_IDLE_SLOW_AFTER_MS 后退避到 READ_IDLE_SLOW_DELAY_MS，
+  // 避免没有设备或设备静默时空转占用 UI 线程。
+  private nextReadDelay(lastReadCount: number): number {
+    if (lastReadCount > 0) {
+      this.idleReadSince = 0
+      return READ_ACTIVE_DELAY_MS
+    }
+    const now = Date.now()
+    if (this.idleReadSince === 0) {
+      this.idleReadSince = now
+      return READ_IDLE_DELAY_MS
+    }
+    return now - this.idleReadSince >= READ_IDLE_SLOW_AFTER_MS ?
+      READ_IDLE_SLOW_DELAY_MS : READ_IDLE_DELAY_MS
   }
 
   private logRxError(err: UsbErrorInput): void {

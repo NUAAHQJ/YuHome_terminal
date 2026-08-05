@@ -4,6 +4,8 @@ import { DAYU_CLIENT_CERT, DAYU_CLIENT_KEY } from './TlsClientIdentity'
 
 const MQTT_PROTO_LEVEL = 4
 const MQTT_PROTO_NAME = 'MQTT'
+// 逐包收包日志。ESP32 每秒上报会持续刷屏并占用 UI 线程，排查问题时置为 true。
+const MQTT_VERBOSE_RX_LOG: boolean = false
 const MQTT_KEEP_ALIVE_SECONDS: number = 60
 const MQTT_PING_INTERVAL_MS: number = 15000
 const MQTT_RECONNECT_DELAY_MS: number = 5000
@@ -651,7 +653,9 @@ export class MqttClient {
 
     const payload = packet.slice(pos)
 
-    console.info(`[MQTT] rx ${topic}: ${payload.length}B`)
+    if (MQTT_VERBOSE_RX_LOG) {
+      console.info(`[MQTT] rx ${topic}: ${payload.length}B`)
+    }
     if (this.onMessage) {
       this.onMessage(topic, payload)
     }
