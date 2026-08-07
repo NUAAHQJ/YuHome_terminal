@@ -1,0 +1,227 @@
+{
+  "dataset": "yuhome_hierarchical_nlu",
+  "version": 1,
+  "seed": 20260802,
+  "split_strategy": "expression_template_family",
+  "labels": [
+    "light_set",
+    "ac_power_set",
+    "curtain_set",
+    "ac_temperature_set",
+    "ac_mode_set",
+    "light_status_query",
+    "curtain_status_query",
+    "ac_status_query",
+    "door_status_query",
+    "temperature_query",
+    "humidity_query",
+    "environment_query",
+    "alarm_status_query",
+    "comfort_warmer",
+    "comfort_cooler",
+    "sleep_scene",
+    "away_scene",
+    "home_scene",
+    "requires_confirmation",
+    "unknown"
+  ],
+  "files": {
+    "train": {
+      "file": "train.jsonl",
+      "samples": 3455,
+      "families": 393,
+      "intent_counts": {
+        "ac_mode_set": 156,
+        "ac_power_set": 192,
+        "ac_status_query": 126,
+        "ac_temperature_set": 156,
+        "alarm_status_query": 143,
+        "away_scene": 120,
+        "comfort_cooler": 120,
+        "comfort_warmer": 120,
+        "curtain_set": 414,
+        "curtain_status_query": 126,
+        "door_status_query": 120,
+        "environment_query": 151,
+        "home_scene": 119,
+        "humidity_query": 154,
+        "light_set": 192,
+        "light_status_query": 126,
+        "requires_confirmation": 280,
+        "sleep_scene": 120,
+        "temperature_query": 149,
+        "unknown": 371
+      },
+      "route_counts": {
+        "in_domain": 2804,
+        "requires_confirmation": 280,
+        "unknown": 371
+      },
+      "safety_case_counts": {
+        "asr_hardening": 302,
+        "cancelled_control": 114,
+        "open_domain": 257,
+        "planner_goal": 599,
+        "sensitive_action": 280
+      },
+      "sha256": "3fdcd425468d431ece6e37b9b13e5c3e00262b4e9fad4920e2d2fb3e6365e185"
+    },
+    "validation": {
+      "file": "validation.jsonl",
+      "samples": 486,
+      "families": 100,
+      "intent_counts": {
+        "ac_mode_set": 32,
+        "ac_power_set": 32,
+        "ac_status_query": 15,
+        "ac_temperature_set": 16,
+        "alarm_status_query": 30,
+        "away_scene": 20,
+        "comfort_cooler": 20,
+        "comfort_warmer": 20,
+        "curtain_set": 48,
+        "curtain_status_query": 15,
+        "door_status_query": 15,
+        "environment_query": 15,
+        "home_scene": 20,
+        "humidity_query": 15,
+        "light_set": 32,
+        "light_status_query": 15,
+        "requires_confirmation": 45,
+        "sleep_scene": 20,
+        "temperature_query": 15,
+        "unknown": 46
+      },
+      "route_counts": {
+        "in_domain": 395,
+        "requires_confirmation": 45,
+        "unknown": 46
+      },
+      "safety_case_counts": {
+        "cancelled_control": 16,
+        "open_domain": 30,
+        "planner_goal": 100,
+        "sensitive_action": 45
+      },
+      "sha256": "a263e9b6557a1b5e53d644f20e24191fbc4b072e2ddb720cdf661fb1bb6f7ec5"
+    },
+    "test": {
+      "file": "test.jsonl",
+      "samples": 512,
+      "families": 103,
+      "intent_counts": {
+        "ac_mode_set": 36,
+        "ac_power_set": 32,
+        "ac_status_query": 20,
+        "ac_temperature_set": 20,
+        "alarm_status_query": 20,
+        "away_scene": 20,
+        "comfort_cooler": 20,
+        "comfort_warmer": 20,
+        "curtain_set": 32,
+        "curtain_status_query": 20,
+        "door_status_query": 20,
+        "environment_query": 20,
+        "home_scene": 20,
+        "humidity_query": 20,
+        "light_set": 32,
+        "light_status_query": 20,
+        "requires_confirmation": 43,
+        "sleep_scene": 20,
+        "temperature_query": 20,
+        "unknown": 57
+      },
+      "route_counts": {
+        "in_domain": 412,
+        "requires_confirmation": 43,
+        "unknown": 57
+      },
+      "safety_case_counts": {
+        "cancelled_control": 25,
+        "open_domain": 32,
+        "planner_goal": 100,
+        "sensitive_action": 43
+      },
+      "sha256": "cfb162e4a33b4dd6558a3ade68b9c43fd72d94286d7f5bbe121f2f45ccd3a27c"
+    },
+    "asr_noise_test": {
+      "file": "asr_noise_test.jsonl",
+      "samples": 386,
+      "families": 110,
+      "intent_counts": {
+        "ac_mode_set": 16,
+        "ac_power_set": 16,
+        "ac_status_query": 16,
+        "ac_temperature_set": 16,
+        "alarm_status_query": 16,
+        "away_scene": 17,
+        "comfort_cooler": 17,
+        "comfort_warmer": 17,
+        "curtain_set": 16,
+        "curtain_status_query": 16,
+        "door_status_query": 16,
+        "environment_query": 16,
+        "home_scene": 17,
+        "humidity_query": 16,
+        "light_set": 16,
+        "light_status_query": 16,
+        "requires_confirmation": 54,
+        "sleep_scene": 20,
+        "temperature_query": 16,
+        "unknown": 36
+      },
+      "route_counts": {
+        "in_domain": 296,
+        "requires_confirmation": 54,
+        "unknown": 36
+      },
+      "safety_case_counts": {
+        "cancelled_control_asr": 20,
+        "open_domain": 16,
+        "planner_goal_asr": 88,
+        "sensitive_action": 16,
+        "sensitive_action_asr": 38
+      },
+      "sha256": "7cc0575aaa75d860b99691bcfd56c4b6748c327539b758afca7bcdf394fac4c7"
+    },
+    "boundary_test": {
+      "file": "boundary_test.jsonl",
+      "samples": 24,
+      "families": 4,
+      "intent_counts": {
+        "ac_temperature_set": 12,
+        "curtain_set": 12
+      },
+      "route_counts": {
+        "in_domain": 24
+      },
+      "safety_case_counts": {},
+      "sha256": "d914a415239ea600c4e8ae195b76860bfa8cf975c3a1de5550046a51586b69f5"
+    },
+    "safety_adversarial_test": {
+      "file": "safety_adversarial_test.jsonl",
+      "samples": 100,
+      "families": 22,
+      "intent_counts": {
+        "ac_power_set": 2,
+        "curtain_set": 1,
+        "door_status_query": 5,
+        "light_set": 2,
+        "requires_confirmation": 47,
+        "unknown": 43
+      },
+      "route_counts": {
+        "in_domain": 10,
+        "requires_confirmation": 47,
+        "unknown": 43
+      },
+      "safety_case_counts": {
+        "cancelled_control": 40,
+        "door_query_or_ood": 8,
+        "positive_control": 5,
+        "sensitive_action": 47
+      },
+      "sha256": "5d8a33f1f84f4baa490adac7ded0dcf1d047bdbe4977301c02f2b43ab0afa9af"
+    }
+  }
+}

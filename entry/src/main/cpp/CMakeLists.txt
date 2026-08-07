@@ -39,6 +39,8 @@ add_library(face_inference SHARED
 
 add_library(voice_inference SHARED
     voice_inference.cpp
+    nlu_runtime.cpp
+    nlu_tokenizer.cpp
 )
 
 add_library(local_gateway SHARED

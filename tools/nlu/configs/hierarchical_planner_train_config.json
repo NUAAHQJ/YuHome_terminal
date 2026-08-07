@@ -1,0 +1,20 @@
+{
+  "run_name": "rbt3_yuhome_hierarchical_v5_planner",
+  "base_model": "hfl/rbt3",
+  "seed": 20260802,
+  "max_length": 48,
+  "batch_size": 32,
+  "eval_batch_size": 64,
+  "epochs": 16,
+  "learning_rate": 0.000015,
+  "weight_decay": 0.01,
+  "warmup_ratio": 0.1,
+  "gradient_clip_norm": 1.0,
+  "route_loss_weight": 1.5,
+  "label_smoothing": 0.02,
+  "early_stopping_patience": 5,
+  "early_stopping_min_delta": 0.0005,
+  "dropout": 0.1,
+  "num_workers": 0,
+  "max_validation_unknown_false_accept_rate": 0.05
+}

@@ -11,7 +11,7 @@ import { KeyExchangeLayer, KeyExchangeResult } from '../crypto/KeyExchangeLayer'
 import { CloudSecureClient } from '../cloud/CloudSecureClient'
 import { CloudMqttClient } from '../cloud/CloudMqttClient'
 import { FaceAccessManager, FaceAccessProbeResult, FaceCaptureResult, FaceMatchResult, FaceUser } from '../face/FaceAccessManager'
-import { ProvisioningConfig, ProvisioningFrame, ProvisioningFrameType, buildProvisioningConfigPayload, provisioningTypeName, toHex, utf8Decode } from '../provisioning/SerialProvisioningProtocol'
+import { ProvisioningConfig, ProvisioningFrame, ProvisioningFrameType, buildProvisioningConfigPayload, provisioningTypeName, toHex, utf8Decode, utf8Encode } from '../provisioning/SerialProvisioningProtocol'
 import { UsbSerialDeviceInfo, UsbSerialProvisioningPort } from '../provisioning/UsbSerialProvisioningPort'
 import { VoiceAssistant, VoiceAssistantState, VoiceExecutionResult } from '../voice/VoiceAssistant'
 import { VoiceIntent, VoiceIntentType } from '../voice/VoiceIntentParser'
@@ -38,6 +38,10 @@ const PROVISIONING_STAGE_SAVED: number = 6
 const PROVISIONING_CONFIG_MODE_CONFIRM_ATTEMPTS: number = 3
 const PROVISIONING_CONFIG_MODE_CONFIRM_TIMEOUT_MS: number = 800
 const PROVISIONING_CONFIG_ACK_TIMEOUT_MS: number = 3000
+const GATEWAY_USB_TEST_TIMEOUT_MS: number = 5000
+const GATEWAY_BLE_SCAN_DURATION_MS: number = 25000
+const GATEWAY_BLE_SCAN_TIMEOUT_MS: number = 60000
+const GATEWAY_BLE_RECONNECT_TIMEOUT_MS: number = 95000
 const IR_COMMAND_ACK_TIMEOUT_MS: number = 8000
 const IR_LEARN_STEP_ACK_TIMEOUT_MS: number = 90000
 const IR_LEARN_KEY_LABELS: string[] = ['开机', '关机', '温度+', '温度-', '制冷', '制热']
@@ -185,6 +189,20 @@ interface DeviceDescriptor {
   capabilities: string[]
   transport: string
   crypto: string
+  lastSeen: number
+}
+
+interface GatewayBleDeviceInfo {
+  deviceId: string
+  name: string
+  room: string
+  address: string
+  rssi: number
+  capabilities: string[]
+  connected: boolean
+  transport: string
+  crypto: string
+  epoch: number
   lastSeen: number
 }
 
@@ -337,6 +355,8 @@ const CRYPTO_MODE_STORAGE_KEY: string = 'cryptoMode'
 const DYNAMIC_AES_STORAGE_KEY: string = 'dynamicAesKey'
 const DYNAMIC_SM4_STORAGE_KEY: string = 'dynamicSm4Key'
 const ACTIVE_DEVICE_STORAGE_KEY: string = 'activeEsp32DeviceId'
+const GATEWAY_USB_DEVICE_STORAGE_KEY: string = 'gatewayUsbDeviceKey'
+const GATEWAY_BLE_DEVICES_STORAGE_KEY: string = 'gatewayBleDevices'
 const DEVICE_KEYS_STORAGE_KEY: string = 'deviceCryptoKeys'
 const DEVICE_REGISTRY_STORAGE_KEY: string = 'esp32DeviceRegistry'
 const LIGHT_DEVICE_STORAGE_KEY: string = 'lightDeviceId'
@@ -372,6 +392,8 @@ PersistentStorage.persistProp(CRYPTO_MODE_STORAGE_KEY, 'SM4')
 PersistentStorage.persistProp(DYNAMIC_AES_STORAGE_KEY, '')
 PersistentStorage.persistProp(DYNAMIC_SM4_STORAGE_KEY, '')
 PersistentStorage.persistProp(ACTIVE_DEVICE_STORAGE_KEY, 'esp32')
+PersistentStorage.persistProp(GATEWAY_USB_DEVICE_STORAGE_KEY, '')
+PersistentStorage.persistProp(GATEWAY_BLE_DEVICES_STORAGE_KEY, '')
 PersistentStorage.persistProp(DEVICE_KEYS_STORAGE_KEY, '')
 PersistentStorage.persistProp(DEVICE_REGISTRY_STORAGE_KEY, '')
 PersistentStorage.persistProp(LIGHT_DEVICE_STORAGE_KEY, 'auto')
@@ -525,6 +547,8 @@ struct Index {
   @State bridgeUrl: string = DEFAULT_BRIDGE_URL
   @State commandTransport: string = 'MQTT'
   @StorageLink(ACTIVE_DEVICE_STORAGE_KEY) activeDeviceId: string = 'esp32'
+  @StorageLink(GATEWAY_USB_DEVICE_STORAGE_KEY) gatewayUsbDeviceKey: string = ''
+  @StorageLink(GATEWAY_BLE_DEVICES_STORAGE_KEY) gatewayBleDevicesJson: string = ''
   @State knownDeviceIds: string[] = ['esp32']
   @State protocolPendingMode: string = ''
   // ── 加密通信状态 ──
@@ -710,6 +734,29 @@ struct Index {
   @State provisioningCrypto: string = 'sm4'
   @State provisioningTransport: string = 'mqtt'
   @State provisioningFrameLog: string[] = []
+  @State gatewayUsbTestStatus: string = '等待检测 USB 网关'
+  @State gatewayUsbTestBusy: boolean = false
+  @State gatewayUsbTestLastAck: string = '尚未测试'
+  private gatewayUsbTestSeq: number = 0
+  private gatewayUsbTestPendingSeq: number = -1
+  private gatewayUsbTestTimerId: number = -1
+  private gatewayUsbTestStartedAt: number = 0
+  private gatewayReconnectAfterUsbTest: boolean = false
+  @State gatewayBleStatus: string = '等待开始蓝牙设备扫描'
+  @State gatewayBleScanning: boolean = false
+  @State gatewayBleReconnecting: boolean = false
+  @State gatewayBleDevices: GatewayBleDeviceInfo[] = []
+  @State gatewayBleCandidateCount: number = 0
+  private gatewayBleScanSeq: number = 0
+  private gatewayBleScanTimerId: number = -1
+  private gatewayBleReconnectSeq: number = 0
+  private gatewayBleReconnectTimerId: number = -1
+  private gatewayBleCandidateAddresses: string[] = []
+  private gatewayAutoConnectTimerId: number = -1
+  private gatewayAutoConnectAttempt: number = 0
+  private debugInfoScroller: Scroller = new Scroller()
+  private debugInfoScrollOffset: number = 0
+  private debugInfoScrollRestoreTimerId: number = -1
   private irLearnTimerId: number = -1
   private irCommandSeq: number = 0
   private irLearnExpectedSeq: number = -1
@@ -743,8 +790,10 @@ struct Index {
     this.resetCommunicationModesOnStartup()
     this.restoreActiveDeviceFromRegistry()
     this.restoreDynamicCryptoKeys()
+    this.restoreGatewayBleDevices()
     this.refreshProvisioningDefaults()
     this.refreshProvisioningWifiInfo()
+    this.scheduleGatewayAutoConnect()
     const federatedContext = getContext(this) as common.UIAbilityContext
     this.federatedCollector.configure(
       'https://192.168.3.5:5443',
@@ -852,6 +901,15 @@ struct Index {
       console.info(`[CloudMQTT][disconnect-fail] ${err.message}`)
     })
     this.stopProvisioningEnterLoop()
+    this.clearGatewayUsbTestTimer()
+    this.gatewayUsbTestPendingSeq = -1
+    this.gatewayUsbTestBusy = false
+    this.gatewayReconnectAfterUsbTest = false
+    this.clearGatewayBleScanTimer()
+    this.gatewayBleScanning = false
+    this.clearGatewayBleReconnectTimer()
+    this.gatewayBleReconnecting = false
+    this.clearGatewayAutoConnectTimer()
     this.clearIrLearnTimer()
     this.provisioningPort.close().catch((err: Error) => {
       console.info(`[Provisioning][close-fail] ${err.message}`)
@@ -4968,7 +5026,10 @@ struct Index {
       text: text,
       deviceId: this.debugDeviceIdFromTopic(topic)
     }
-    this.mqttMessages = [item, ...this.mqttMessages].slice(0, MAX_MQTT_MESSAGES)
+    this.mqttMessages = [...this.mqttMessages, item].slice(-MAX_MQTT_MESSAGES)
+    if (this.showDebugPanel) {
+      this.restoreDebugInfoScrollPosition()
+    }
     if (CLOUD_SYNC_ENABLED) {
       this.reportCloudMessage(topic, text)
     }
@@ -6595,9 +6656,33 @@ struct Index {
   provisioningDeviceKey(device: UsbSerialDeviceInfo): string {
     return `${device.kind}|${device.vendorId}|${device.productId}|${device.name}|` +
       `${device.serialPortId !== undefined ? device.serialPortId : '-'}|` +
-      `${device.usbIndex !== undefined ? device.usbIndex : '-'}|` +
       `${device.usbInterfaceId !== undefined ? device.usbInterfaceId : '-'}|` +
       `${device.usbControlInterfaceId !== undefined ? device.usbControlInterfaceId : '-'}`
+  }
+
+  // 网关设备匹配用 key：只用 VID/PID + interface，不绑定 USB 总线地址。
+  // 总线地址在重插后会变（如 2-67 → 2-106），但设备是同一个。
+  gatewayDeviceMatcherKey(device: UsbSerialDeviceInfo): string {
+    return `gw|${device.vendorId}|${device.productId}|` +
+      `${device.usbInterfaceId !== undefined ? device.usbInterfaceId : '-'}|` +
+      `${device.usbControlInterfaceId !== undefined ? device.usbControlInterfaceId : '-'}`
+  }
+
+  storedGatewayMatcherKey(): string {
+    if (this.gatewayUsbDeviceKey.length === 0) {
+      return ''
+    }
+    const parts = this.gatewayUsbDeviceKey.split('|')
+    if (parts.length < 4) {
+      return this.gatewayUsbDeviceKey
+    }
+    const vid = parts[1] || ''
+    const pid = parts[2] || ''
+    const name = parts[3] || ''
+    if (name.startsWith('2-') && parts.length >= 7) {
+      return `gw|${vid}|${pid}|${parts[5] || '-'}|${parts[6] || '-'}`
+    }
+    return `gw|${vid}|${pid}|-|-`
   }
 
   selectedProvisioningDeviceText(): string {
@@ -6721,6 +6806,621 @@ struct Index {
       this.addProvisioningDiagnosticLog(this.provisioningStatus)
       return false
     }
+  }
+
+  clearGatewayUsbTestTimer(): void {
+    if (this.gatewayUsbTestTimerId !== -1) {
+      clearTimeout(this.gatewayUsbTestTimerId)
+      this.gatewayUsbTestTimerId = -1
+    }
+  }
+
+  refreshGatewayUsbDevices(): void {
+    this.refreshProvisioningUsbDevices()
+    if (this.provisioningUsbDevices.length === 0) {
+      this.gatewayUsbTestStatus = '未发现 USB 设备，请连接 ESP32-S3 网关'
+    } else {
+      this.gatewayUsbTestStatus = `已发现 ${this.provisioningUsbDevices.length} 个候选 USB 设备`
+    }
+  }
+
+  async connectGatewayUsb(): Promise<void> {
+    if (this.gatewayUsbTestBusy) {
+      return
+    }
+    if (this.provisioningUsbDevices.length === 0) {
+      this.refreshGatewayUsbDevices()
+    }
+    if (this.provisioningUsbDevices.length === 0) {
+      return
+    }
+    await this.connectProvisioningUsb()
+    if (this.provisioningConnected) {
+      const selectedIndex = Math.max(0, Math.min(this.provisioningUsbDevices.length - 1,
+        this.provisioningSelectedDeviceIndex))
+      const selectedDevice = this.provisioningUsbDevices[selectedIndex]
+      if (selectedDevice !== undefined) {
+        this.gatewayUsbDeviceKey = this.provisioningDeviceKey(selectedDevice)
+        this.gatewayAutoConnectAttempt = 0
+        this.addProvisioningDiagnosticLog(`已记住 USB 网关：${this.gatewayUsbDeviceKey}`)
+      }
+    }
+    this.gatewayUsbTestStatus = this.provisioningConnected ?
+      'USB 网关已连接，可以发送测试帧' : this.provisioningStatus
+    if (this.provisioningConnected) {
+      await this.beginGatewayRecoveryHandshake()
+    }
+  }
+
+  clearGatewayAutoConnectTimer(): void {
+    if (this.gatewayAutoConnectTimerId !== -1) {
+      clearTimeout(this.gatewayAutoConnectTimerId)
+      this.gatewayAutoConnectTimerId = -1
+    }
+  }
+
+  scheduleGatewayAutoConnect(): void {
+    this.clearGatewayAutoConnectTimer()
+    // @StorageLink 可能在 aboutToAppear 时尚未解析完成，延迟 3s 再读
+    this.gatewayAutoConnectTimerId = setTimeout(() => {
+      this.gatewayAutoConnectTimerId = -1
+      if (this.gatewayUsbDeviceKey.length === 0) {
+        console.info('[BLE][auto] skip — no stored gateway key after 3s wait')
+        return
+      }
+      console.info(`[BLE][auto] starting auto-connect key=${this.gatewayUsbDeviceKey}`)
+      this.gatewayAutoConnectAttempt = 0
+      this.autoConnectKnownGatewayUsb()
+    }, 3000)
+  }
+
+  async autoConnectKnownGatewayUsb(): Promise<void> {
+    console.info(`[BLE][auto] attempt=${this.gatewayAutoConnectAttempt} connected=${this.provisioningConnected} busy=${this.provisioningBusy} key=${this.gatewayUsbDeviceKey}`)
+    if (this.gatewayUsbDeviceKey.length === 0 || this.provisioningConnected || this.provisioningBusy) {
+      console.info(`[BLE][auto] bail — keyLen=${this.gatewayUsbDeviceKey.length} connected=${this.provisioningConnected} busy=${this.provisioningBusy}`)
+      return
+    }
+
+    let devices: UsbSerialDeviceInfo[] = []
+    try {
+      devices = this.provisioningPort.listDevices()
+      console.info(`[BLE][auto] listDevices returned ${devices.length} devices`)
+    } catch (err) {
+      console.info(`[BLE][auto] listDevices failed: ${this.describeProvisioningError(err)}`)
+      this.addProvisioningDiagnosticLog(`自动连接网关扫描失败：${this.describeProvisioningError(err)}`)
+      return
+    }
+
+    // 网关设备 key 含 USB 总线地址（如 2-67），重插后地址可能变化（如 2-106）。
+    // 自动重连时改用 VID/PID + interfaceId 匹配，避免因总线地址变化反复失败。
+    const targetIndex = devices.findIndex((device: UsbSerialDeviceInfo) =>
+      this.provisioningDeviceKey(device) === this.gatewayUsbDeviceKey ||
+      this.gatewayDeviceMatcherKey(device) === this.storedGatewayMatcherKey())
+    console.info(`[BLE][auto] targetIndex=${targetIndex} storedKey=${this.gatewayUsbDeviceKey} devices=${devices.map(d => this.provisioningDeviceKey(d)).join(',')}`)
+    if (targetIndex < 0) {
+      this.gatewayAutoConnectAttempt += 1
+      if (this.gatewayAutoConnectAttempt < 4) {
+        this.gatewayAutoConnectTimerId = setTimeout(() => {
+          this.gatewayAutoConnectTimerId = -1
+          this.autoConnectKnownGatewayUsb()
+        }, 1500)
+      }
+      return
+    }
+
+    this.provisioningUsbDevices = devices
+    this.provisioningSelectedDeviceIndex = targetIndex
+    this.addProvisioningDiagnosticLog(`自动连接已找到已记住的 USB 网关：${devices[targetIndex].title}`)
+    if (!this.provisioningPort.hasDeviceAccessRight(devices[targetIndex])) {
+      this.gatewayUsbTestStatus = '检测到 USB 网关，请点击“连接网关”完成授权'
+      this.provisioningStatus = 'USB 网关需要重新授权'
+      this.addProvisioningDiagnosticLog('USB 地址已变化，等待用户点击“连接网关”完成系统授权')
+      return
+    }
+    await this.connectProvisioningUsb()
+    if (!this.provisioningConnected) {
+      this.gatewayAutoConnectAttempt += 1
+      if (this.gatewayAutoConnectAttempt < 4) {
+        this.gatewayAutoConnectTimerId = setTimeout(() => {
+          this.gatewayAutoConnectTimerId = -1
+          this.autoConnectKnownGatewayUsb()
+        }, 2000)
+      }
+      return
+    }
+
+    this.gatewayUsbTestStatus = 'USB 网关已自动连接'
+    await this.beginGatewayRecoveryHandshake()
+  }
+
+  async beginGatewayRecoveryHandshake(): Promise<void> {
+    if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+      return
+    }
+    this.gatewayReconnectAfterUsbTest = true
+    this.gatewayBleStatus = '正在确认 USB 网关是否就绪'
+    await this.sendGatewayUsbTest()
+  }
+
+  async requestGatewayBleReconnect(): Promise<void> {
+    if (!this.provisioningConnected || !this.provisioningPort.isOpen() || this.gatewayBleReconnecting) {
+      return
+    }
+    const seq = this.nextProvisioningSeq()
+    const payload = utf8Encode(JSON.stringify({
+      type: 'gateway_ble_command',
+      cmd: 'ble',
+      action: 'connect-known',
+      seq
+    }))
+    this.provisioningPort.boostReceive(GATEWAY_BLE_RECONNECT_TIMEOUT_MS)
+    const sent = await this.sendProvisioningFrameWithSeq(
+      ProvisioningFrameType.GATEWAY_BLE_COMMAND,
+      seq,
+      payload
+    )
+    if (sent) {
+      this.gatewayBleReconnectSeq = seq
+      this.gatewayBleReconnecting = true
+      this.clearGatewayBleReconnectTimer()
+      this.gatewayBleReconnectTimerId = setTimeout(() => {
+        this.gatewayBleReconnectTimerId = -1
+        if (!this.gatewayBleReconnecting || this.gatewayBleReconnectSeq !== seq) {
+          return
+        }
+        this.gatewayBleReconnecting = false
+        this.provisioningPort.endReceiveBoost()
+        this.gatewayBleStatus = `自动恢复等待超时 #${seq}，正在转为蓝牙扫描`
+        setTimeout(() => {
+          if (this.provisioningConnected && this.provisioningPort.isOpen() && !this.gatewayBleScanning) {
+            this.startGatewayBleScan().catch((err: Error) => {
+              this.addProvisioningDiagnosticLog(`自动转入蓝牙扫描失败：${err.message}`)
+            })
+          }
+        }, 300)
+      }, GATEWAY_BLE_RECONNECT_TIMEOUT_MS)
+      this.gatewayBleStatus = '正在自动连接已记住的家居设备'
+      this.addProvisioningDiagnosticLog(`已请求网关按已知地址重连家居设备 #${seq}`)
+    } else {
+      this.provisioningPort.endReceiveBoost()
+    }
+  }
+
+  clearGatewayBleReconnectTimer(): void {
+    if (this.gatewayBleReconnectTimerId !== -1) {
+      clearTimeout(this.gatewayBleReconnectTimerId)
+      this.gatewayBleReconnectTimerId = -1
+    }
+  }
+
+  async disconnectGatewayUsb(): Promise<void> {
+    this.clearGatewayUsbTestTimer()
+    this.clearGatewayBleScanTimer()
+    this.clearGatewayBleReconnectTimer()
+    this.gatewayUsbTestPendingSeq = -1
+    this.gatewayUsbTestBusy = false
+    this.gatewayReconnectAfterUsbTest = false
+    this.gatewayBleScanning = false
+    this.gatewayBleReconnecting = false
+    await this.disconnectProvisioningUsb()
+    this.gatewayUsbTestStatus = 'USB 网关已断开'
+    this.gatewayBleStatus = 'USB 网关已断开'
+  }
+
+  async sendGatewayUsbTest(): Promise<void> {
+    if (this.gatewayUsbTestBusy) {
+      return
+    }
+    if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+      this.gatewayUsbTestStatus = '请先连接 USB 网关'
+      return
+    }
+
+    this.gatewayUsbTestBusy = true
+    this.gatewayUsbTestSeq = this.nextProvisioningSeq()
+    this.gatewayUsbTestPendingSeq = this.gatewayUsbTestSeq
+    this.gatewayUsbTestStartedAt = Date.now()
+    this.gatewayUsbTestLastAck = '等待网关 ACK'
+    this.gatewayUsbTestStatus = `正在发送测试帧 #${this.gatewayUsbTestSeq}`
+    const payload = utf8Encode(JSON.stringify({
+      type: 'gateway_test',
+      message: 'dayu-usb-test',
+      timestamp: this.gatewayUsbTestStartedAt
+    }))
+
+    const expectedSeq = this.gatewayUsbTestSeq
+    this.clearGatewayUsbTestTimer()
+    this.gatewayUsbTestTimerId = setTimeout(() => {
+      this.gatewayUsbTestTimerId = -1
+      if (this.gatewayUsbTestPendingSeq !== expectedSeq) {
+        return
+      }
+      this.gatewayUsbTestPendingSeq = -1
+      this.gatewayUsbTestBusy = false
+      this.gatewayReconnectAfterUsbTest = false
+      this.gatewayUsbTestStatus = `等待 ACK 超时 #${expectedSeq}`
+      this.gatewayUsbTestLastAck = '未收到匹配的 GATEWAY_TEST_ACK'
+      this.gatewayBleStatus = 'USB 网关就绪确认超时，未开始自动恢复'
+    }, GATEWAY_USB_TEST_TIMEOUT_MS)
+
+    const sent = await this.sendProvisioningFrameWithSeq(
+      ProvisioningFrameType.GATEWAY_TEST,
+      this.gatewayUsbTestSeq,
+      payload
+    )
+    if (!sent) {
+      this.clearGatewayUsbTestTimer()
+      this.gatewayUsbTestBusy = false
+      this.gatewayUsbTestPendingSeq = -1
+      this.gatewayReconnectAfterUsbTest = false
+      this.gatewayUsbTestStatus = this.provisioningStatus
+      return
+    }
+  }
+
+  handleGatewayUsbTestAck(frame: ProvisioningFrame, payloadText: string): void {
+    let payloadAck: Record<string, Object> | null = null
+    let payloadSeq = -1
+    try {
+      payloadAck = JSON.parse(payloadText) as Record<string, Object>
+      if (typeof payloadAck['seq'] === 'number') {
+        payloadSeq = payloadAck['seq'] as number
+      }
+    } catch (_) {
+      // The status below will report malformed ACK JSON after the frame is matched.
+    }
+
+    const expectedSeq = this.gatewayUsbTestPendingSeq
+    const outerSeqMatches = frame.seq === expectedSeq
+    const payloadSeqMatches = payloadSeq >= 0 && payloadSeq === expectedSeq
+    if (!outerSeqMatches && !payloadSeqMatches) {
+      this.gatewayUsbTestStatus = `收到网关 ACK #${frame.seq}，当前等待 #${expectedSeq}`
+      this.gatewayUsbTestLastAck = payloadText.length > 0 ? payloadText : '空 ACK'
+      return
+    }
+
+    if (!outerSeqMatches && payloadSeqMatches) {
+      this.addProvisioningDiagnosticLog(`网关 ACK 外层 seq=${frame.seq}，JSON seq=${payloadSeq}，按 JSON seq=${expectedSeq} 匹配`)
+    }
+
+    this.clearGatewayUsbTestTimer()
+    this.gatewayUsbTestPendingSeq = -1
+    this.gatewayUsbTestBusy = false
+    this.gatewayUsbTestLastAck = payloadText.length > 0 ? payloadText : '空 ACK'
+    const elapsed = Math.max(0, Date.now() - this.gatewayUsbTestStartedAt)
+    let ok = false
+    let message = ''
+    if (payloadAck !== null) {
+      ok = (payloadAck['ok'] as boolean) === true
+      message = typeof payloadAck['message'] === 'string' ? payloadAck['message'] as string : ''
+    } else {
+      message = 'ACK 不是合法 JSON'
+    }
+    this.gatewayUsbTestStatus = ok ?
+      `测试成功：收到网关 ACK，往返 ${elapsed} ms${message.length > 0 ? ` · ${message}` : ''}` :
+      `网关返回失败 ACK #${frame.seq}`
+    if (this.gatewayReconnectAfterUsbTest) {
+      this.gatewayReconnectAfterUsbTest = false
+      if (ok) {
+        if (this.gatewayBleDevices.length === 0) {
+          this.gatewayBleStatus = 'USB 网关已就绪，请开始扫描家居设备'
+          return
+        }
+        this.gatewayBleStatus = 'USB 网关已就绪，准备恢复家居设备'
+        setTimeout(() => {
+          if (this.provisioningConnected && this.provisioningPort.isOpen() && !this.gatewayBleReconnecting) {
+            this.requestGatewayBleReconnect()
+          }
+        }, 300)
+      } else {
+        this.gatewayBleStatus = 'USB 网关就绪确认失败，未开始自动恢复'
+      }
+    }
+  }
+
+  clearGatewayBleScanTimer(): void {
+    if (this.gatewayBleScanTimerId !== -1) {
+      clearTimeout(this.gatewayBleScanTimerId)
+      this.gatewayBleScanTimerId = -1
+    }
+  }
+
+  async startGatewayBleScan(): Promise<void> {
+    if (this.gatewayBleScanning) {
+      return
+    }
+    if (this.gatewayBleReconnecting) {
+      this.gatewayBleStatus = '正在恢复已知设备，请等待自动连接完成'
+      return
+    }
+    if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+      this.gatewayBleStatus = '请先连接 USB 网关'
+      return
+    }
+
+    this.gatewayBleScanSeq = this.nextProvisioningSeq()
+    this.gatewayBleScanning = true
+    // Keep verified devices across scans. BLE and Wi-Fi share the ESP32-S3
+    // radio, so one scan may only rediscover one of the household boards.
+    this.gatewayBleCandidateCount = 0
+    this.gatewayBleCandidateAddresses = []
+    this.gatewayBleStatus = `正在请求扫描 #${this.gatewayBleScanSeq}，已保存 ${this.gatewayBleDevices.length} 台家居设备`
+    const payload = utf8Encode(JSON.stringify({
+      type: 'gateway_ble_command',
+      cmd: 'ble',
+      action: 'scan-start',
+      seq: this.gatewayBleScanSeq,
+      durationMs: GATEWAY_BLE_SCAN_DURATION_MS,
+      maxDevices: 8,
+      autoConnect: true
+    }))
+    this.provisioningPort.boostReceive(GATEWAY_BLE_SCAN_TIMEOUT_MS)
+    const expectedSeq = this.gatewayBleScanSeq
+    this.clearGatewayBleScanTimer()
+    this.gatewayBleScanTimerId = setTimeout(() => {
+      this.gatewayBleScanTimerId = -1
+      if (this.gatewayBleScanSeq !== expectedSeq || !this.gatewayBleScanning) {
+        return
+      }
+      this.gatewayBleScanning = false
+      this.provisioningPort.endReceiveBoost()
+      this.gatewayBleStatus = `蓝牙扫描等待超时 #${expectedSeq}，仍保留 ${this.gatewayBleDevices.length} 台家居设备`
+    }, GATEWAY_BLE_SCAN_TIMEOUT_MS)
+
+    const sent = await this.sendProvisioningFrameWithSeq(
+      ProvisioningFrameType.GATEWAY_BLE_COMMAND,
+      this.gatewayBleScanSeq,
+      payload
+    )
+    if (!sent) {
+      this.clearGatewayBleScanTimer()
+      this.gatewayBleScanning = false
+      this.provisioningPort.endReceiveBoost()
+      this.gatewayBleStatus = this.provisioningStatus
+    }
+  }
+
+  async stopGatewayBleScan(): Promise<void> {
+    if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+      this.clearGatewayBleScanTimer()
+      this.gatewayBleScanning = false
+      this.gatewayBleStatus = 'USB 网关未连接'
+      return
+    }
+    const seq = this.nextProvisioningSeq()
+    const payload = utf8Encode(JSON.stringify({
+      type: 'gateway_ble_command',
+      cmd: 'ble',
+      action: 'scan-stop',
+      seq,
+      scanSeq: this.gatewayBleScanSeq
+    }))
+    const sent = await this.sendProvisioningFrameWithSeq(
+      ProvisioningFrameType.GATEWAY_BLE_COMMAND,
+      seq,
+      payload
+    )
+    if (sent) {
+      this.clearGatewayBleScanTimer()
+      this.gatewayBleScanning = false
+      this.provisioningPort.endReceiveBoost()
+      this.gatewayBleStatus = `已请求停止扫描，当前发现 ${this.gatewayBleDevices.length} 台设备`
+    } else {
+      this.gatewayBleStatus = this.provisioningStatus
+    }
+  }
+
+  parseGatewayBleCapabilities(data: Record<string, Object>): string[] {
+    const capabilities: string[] = []
+    const rawCapabilities = data['capabilities'] as Object[]
+    if (!Array.isArray(rawCapabilities)) {
+      return capabilities
+    }
+    rawCapabilities.forEach((item: Object) => {
+      if (typeof item === 'string') {
+        const capability = (item as string).trim().toLowerCase()
+        if (capability.length > 0 && capabilities.indexOf(capability) < 0) {
+          capabilities.push(capability)
+        }
+      }
+    })
+    return capabilities
+  }
+
+  isGatewayBlePlaceholder(value: string): boolean {
+    const normalized = value.trim().toLowerCase()
+    return normalized.length === 0 || normalized === 'unknown' || normalized === 'auto' ||
+      normalized === 'null' || normalized === 'undefined'
+  }
+
+  restoreGatewayBleDevices(): void {
+    if (this.gatewayBleDevicesJson.length === 0) {
+      return
+    }
+    try {
+      const stored = JSON.parse(this.gatewayBleDevicesJson) as GatewayBleDeviceInfo[]
+      if (!Array.isArray(stored)) {
+        this.gatewayBleDevicesJson = ''
+        return
+      }
+      const restored: GatewayBleDeviceInfo[] = []
+      stored.forEach((device: GatewayBleDeviceInfo) => {
+        if (device.address && device.address.length > 0) {
+          restored.push({
+            deviceId: device.deviceId,
+            name: device.name,
+            room: device.room,
+            address: device.address.toUpperCase(),
+            rssi: device.rssi,
+            capabilities: Array.isArray(device.capabilities) ? device.capabilities : [],
+            connected: false,
+            transport: device.transport || 'ble',
+            crypto: device.crypto || '',
+            epoch: device.epoch || 0,
+            lastSeen: device.lastSeen || 0
+          })
+        }
+      })
+      this.gatewayBleDevices = restored
+      if (restored.length > 0) {
+        this.gatewayBleStatus = `已恢复 ${restored.length} 台设备记录，等待网关确认连接状态`
+      }
+    } catch (err) {
+      this.gatewayBleDevicesJson = ''
+      console.info(`[BLE][restore-fail] ${(err as Error).message}`)
+    }
+  }
+
+  persistGatewayBleDevices(): void {
+    const stored = this.gatewayBleDevices.map((device: GatewayBleDeviceInfo): GatewayBleDeviceInfo => ({
+      deviceId: device.deviceId,
+      name: device.name,
+      room: device.room,
+      address: device.address,
+      rssi: device.rssi,
+      capabilities: device.capabilities,
+      connected: false,
+      transport: device.transport,
+      crypto: device.crypto,
+      epoch: device.epoch,
+      lastSeen: device.lastSeen
+    }))
+    this.gatewayBleDevicesJson = JSON.stringify(stored)
+  }
+
+  upsertGatewayBleDevice(data: Record<string, Object>, eventType: string): void {
+    const rawAddress = typeof data['address'] === 'string' ? data['address'] as string : ''
+    const address = rawAddress.trim().toUpperCase()
+    const rawAnnouncedId = typeof data['deviceId'] === 'string' ? data['deviceId'] as string : ''
+    const announcedId = this.isGatewayBlePlaceholder(rawAnnouncedId) ? '' : rawAnnouncedId.trim()
+    const candidateId = announcedId.length > 0 ? announcedId : address
+    if (candidateId.length === 0) {
+      this.addProvisioningDiagnosticLog(`忽略缺少 deviceId/address 的蓝牙事件 ${eventType}`)
+      return
+    }
+
+    const existingIndex = this.gatewayBleDevices.findIndex((item: GatewayBleDeviceInfo) =>
+      (address.length > 0 && item.address.toUpperCase() === address) || item.deviceId === candidateId)
+    const existing = existingIndex >= 0 ? this.gatewayBleDevices[existingIndex] : null
+    const candidateIsAddress = address.length > 0 && candidateId.toUpperCase() === address
+    const existingHasStableId = existing !== null && !this.isGatewayBlePlaceholder(existing.deviceId) &&
+      (existing.address.length === 0 || existing.deviceId.toUpperCase() !== existing.address.toUpperCase())
+    const deviceId = candidateIsAddress && existingHasStableId && existing !== null ?
+      existing.deviceId : candidateId
+    const capabilities = this.parseGatewayBleCapabilities(data)
+    const connectedFromEvent = typeof data['connected'] === 'boolean' ? data['connected'] as boolean :
+      eventType === 'device_hello'
+    const rawName = typeof data['name'] === 'string' ? data['name'] as string : ''
+    const name = !this.isGatewayBlePlaceholder(rawName) ? rawName.trim() :
+      (existing !== null ? existing.name : '蓝牙家居设备')
+    const rawRoom = typeof data['room'] === 'string' ? (data['room'] as string).trim() : ''
+    const device: GatewayBleDeviceInfo = {
+      deviceId,
+      name,
+      room: rawRoom.length > 0 ? rawRoom : (existing !== null ? existing.room : ''),
+      address: address.length > 0 ? address : (existing !== null ? existing.address : ''),
+      rssi: typeof data['rssi'] === 'number' ? data['rssi'] as number :
+        (existing !== null ? existing.rssi : 0),
+      capabilities: capabilities.length > 0 ? capabilities :
+        (existing !== null ? existing.capabilities : []),
+      connected: typeof data['connected'] === 'boolean' || eventType === 'device_hello' ?
+        connectedFromEvent : (existing !== null ? existing.connected : false),
+      transport: typeof data['transport'] === 'string' ? data['transport'] as string :
+        (existing !== null ? existing.transport : 'ble'),
+      crypto: typeof data['crypto'] === 'string' ? data['crypto'] as string :
+        (existing !== null ? existing.crypto : ''),
+      epoch: typeof data['epoch'] === 'number' ? data['epoch'] as number :
+        (existing !== null ? existing.epoch : 0),
+      lastSeen: Date.now()
+    }
+
+    if (existingIndex >= 0) {
+      const next = [...this.gatewayBleDevices]
+      next[existingIndex] = device
+      this.gatewayBleDevices = next
+    } else {
+      this.gatewayBleDevices = [...this.gatewayBleDevices, device]
+    }
+    this.persistGatewayBleDevices()
+  }
+
+  recordGatewayBleCandidate(address: string): void {
+    const normalized = address.trim().toUpperCase()
+    if (normalized.length === 0 || this.gatewayBleCandidateAddresses.indexOf(normalized) >= 0) {
+      return
+    }
+    this.gatewayBleCandidateAddresses.push(normalized)
+    this.gatewayBleCandidateCount = this.gatewayBleCandidateAddresses.length
+  }
+
+  handleGatewayBleEvent(frame: ProvisioningFrame, payloadText: string): void {
+    try {
+      const data = JSON.parse(payloadText) as Record<string, Object>
+      const eventType = typeof data['type'] === 'string' ? (data['type'] as string).toLowerCase() : ''
+      const payloadSeq = typeof data['seq'] === 'number' ? data['seq'] as number : frame.seq
+      if (this.gatewayBleScanSeq > 0 && payloadSeq !== this.gatewayBleScanSeq) {
+        this.addProvisioningDiagnosticLog(
+          `蓝牙事件 seq=${payloadSeq}，当前扫描 seq=${this.gatewayBleScanSeq}，继续按事件内容处理`)
+      }
+
+      if (eventType === 'ble_scan_started') {
+        this.gatewayBleScanSeq = payloadSeq
+        this.gatewayBleScanning = true
+        this.gatewayBleStatus = `蓝牙扫描已开始 #${payloadSeq}，已保存 ${this.gatewayBleDevices.length} 台家居设备`
+        return
+      }
+      if (eventType === 'ble_device') {
+        const address = typeof data['address'] === 'string' ? data['address'] as string : ''
+        this.recordGatewayBleCandidate(address)
+        // 扫描阶段也入库，让界面立即显示发现的设备（没有 device_hello 时用 BLE 地址作为临时 id）
+        this.upsertGatewayBleDevice(data, eventType)
+        this.gatewayBleStatus = `本轮扫描到 ${this.gatewayBleCandidateCount} 个广播，已保存 ${this.gatewayBleDevices.length} 台家居设备`
+        return
+      }
+      if (eventType === 'device_hello' || eventType === 'ble_device_state') {
+        this.upsertGatewayBleDevice(data, eventType)
+        const eventName = eventType === 'device_hello' ? '已读取设备能力' :
+          eventType === 'ble_device_state' ? '设备连接状态已更新' : '发现蓝牙设备'
+        this.gatewayBleStatus = `${eventName}，共 ${this.gatewayBleDevices.length} 台`
+        return
+      }
+      if (eventType === 'ble_scan_finished') {
+        this.clearGatewayBleScanTimer()
+        this.gatewayBleScanning = false
+        this.provisioningPort.endReceiveBoost()
+        this.gatewayBleStatus = `蓝牙扫描完成，本轮发现 ${this.gatewayBleCandidateCount} 个广播，已保存 ${this.gatewayBleDevices.length} 台家居设备`
+        return
+      }
+      if (eventType === 'ble_reconnect_finished') {
+        this.clearGatewayBleReconnectTimer()
+        this.gatewayBleReconnecting = false
+        this.provisioningPort.endReceiveBoost()
+        const reconnectCount = typeof data['count'] === 'number' ? data['count'] as number : this.gatewayBleDevices.length
+        const detailCount = this.gatewayBleDevices.filter((device: GatewayBleDeviceInfo) => device.connected).length
+        this.gatewayBleStatus = reconnectCount === detailCount ?
+          `自动恢复完成，已连接 ${detailCount} 台家居设备` :
+          `自动恢复完成：网关报告 ${reconnectCount} 台，大禹收到 ${detailCount} 台设备详情`
+        return
+      }
+      if (eventType === 'ble_error') {
+        this.clearGatewayBleScanTimer()
+        this.clearGatewayBleReconnectTimer()
+        this.gatewayBleScanning = false
+        this.gatewayBleReconnecting = false
+        this.provisioningPort.endReceiveBoost()
+        const message = typeof data['message'] === 'string' ? data['message'] as string : 'unknown_error'
+        this.gatewayBleStatus = `蓝牙网关错误：${message}`
+        return
+      }
+      this.gatewayBleStatus = `收到未知蓝牙事件：${eventType.length > 0 ? eventType : 'invalid_json_type'}`
+    } catch (err) {
+      this.gatewayBleStatus = `蓝牙事件 JSON 解析失败：${(err as Error).message}`
+      this.addProvisioningDiagnosticLog(this.gatewayBleStatus)
+    }
+  }
+
+  gatewayBleCapabilitiesText(device: GatewayBleDeviceInfo): string {
+    return device.capabilities.length > 0 ? device.capabilities.join(' / ') : '等待读取设备能力'
   }
 
   describeProvisioningError(err: Object | string | number | boolean | null | undefined): string {
@@ -7356,6 +8056,14 @@ struct Index {
   handleProvisioningFrame(frame: ProvisioningFrame): void {
     const payloadText = frame.payload.length > 0 ? utf8Decode(frame.payload) : ''
     this.addProvisioningEsp32Log(this.describeProvisioningFrame(frame, payloadText))
+    if (frame.type === ProvisioningFrameType.GATEWAY_TEST_ACK) {
+      this.handleGatewayUsbTestAck(frame, payloadText)
+      return
+    }
+    if (frame.type === ProvisioningFrameType.GATEWAY_BLE_EVENT) {
+      this.handleGatewayBleEvent(frame, payloadText)
+      return
+    }
     const pendingSeqMatches = frame.seq === this.provisioningPendingFrameSeq ||
       this.provisioningPendingFrameAllowAnySeq
     if (frame.type === ProvisioningFrameType.ERROR && this.provisioningPendingFrameResolve !== null &&
@@ -7421,6 +8129,7 @@ struct Index {
       message.startsWith('[RX][drop]') ||
       message.startsWith('[RX][ascii-hex]') ||
       message.startsWith('[TX]') ||
+      message.startsWith('[USB]') ||
       message.startsWith('[OPEN]') ||
       (message.startsWith('[RX]') && message.indexOf('idle, no data') < 0)) {
       this.addProvisioningEsp32Log(message)
@@ -7436,7 +8145,9 @@ struct Index {
     const time = new Date().toLocaleTimeString()
     this.provisioningLogSeq = (this.provisioningLogSeq + 1) % 10000
     const seqText = this.provisioningLogSeq.toString().padStart(4, '0')
-    this.pendingProvisioningFrameLogs.unshift(`${time} #${seqText} ${message}`)
+    // Keep the log in chronological order. Inserting at the head rebuilt the
+    // scroll content on every message and visibly jumped the panel to the top.
+    this.pendingProvisioningFrameLogs.push(`${time} #${seqText} ${message}`)
     if (this.provisioningLogFlushTimerId === -1) {
       this.provisioningLogFlushTimerId = setTimeout(() => {
         this.flushProvisioningEsp32Log()
@@ -7449,9 +8160,34 @@ struct Index {
     if (this.pendingProvisioningFrameLogs.length === 0) {
       return
     }
-    const next = [...this.pendingProvisioningFrameLogs, ...this.provisioningFrameLog]
+    const next = [...this.provisioningFrameLog, ...this.pendingProvisioningFrameLogs]
     this.pendingProvisioningFrameLogs = []
-    this.provisioningFrameLog = next.slice(0, 200)
+    this.provisioningFrameLog = next.slice(-200)
+    this.restoreDebugInfoScrollPosition()
+  }
+
+  private restoreDebugInfoScrollPosition(): void {
+    if (this.debugInfoScrollRestoreTimerId !== -1) {
+      clearTimeout(this.debugInfoScrollRestoreTimerId)
+    }
+    // ArkUI 4.1 may overwrite scrollTo during the same layout pass that
+    // rebuilds the message list. scrollEdge is applied after the list exists.
+    this.debugInfoScrollRestoreTimerId = setTimeout(() => {
+      this.debugInfoScrollRestoreTimerId = -1
+      if (this.showDebugPanel) {
+        // On ArkUI 4.1 scrollEdge can run before the rebuilt Column has a
+        // measured content height. A large explicit offset is clamped to the
+        // actual bottom and is reliable after the list has been laid out.
+        this.debugInfoScroller.scrollTo({ xOffset: 0, yOffset: 1000000, animation: false })
+        this.debugInfoScroller.scrollEdge(Edge.Bottom)
+        setTimeout(() => {
+          if (this.showDebugPanel) {
+            this.debugInfoScroller.scrollTo({ xOffset: 0, yOffset: 1000000, animation: false })
+            this.debugInfoScroller.scrollEdge(Edge.Bottom)
+          }
+        }, 260)
+      }
+    }, 120)
   }
 
   clearProvisioningEsp32Log(): void {
@@ -7490,6 +8226,11 @@ struct Index {
       this.debugPanelTapCount = 0
       this.debugShowAllDevices = false
       this.showDebugPanel = true
+      setTimeout(() => {
+        if (this.showDebugPanel) {
+          this.refreshGatewayUsbDevices()
+        }
+      }, 0)
     }
   }
 
@@ -10481,7 +11222,7 @@ struct Index {
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      Scroll() {
+      Scroll(this.debugInfoScroller) {
         Column() {
           DebugInfoCell({ label: '当前目标', value: `${this.activeDeviceName()} · ${this.deviceIdDisplayText(this.activeDeviceId)}`, valueColor: this.accentBlue(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
           DebugInfoCell({ label: '设备能力', value: this.activeDeviceCapabilitiesText(), valueColor: this.textColor(), labelColor: this.subTextColor(), rowBg: this.softPanelBg(), rowBorder: this.hairlineColor() })
@@ -10577,6 +11318,211 @@ struct Index {
               .margin({ bottom: 6 })
             }, (item: MessageItem) => item.id)
           }
+
+          Column() {
+            Row() {
+              Column() {
+                Text('蓝牙网关 USB 测试')
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.textColor())
+                Text(this.gatewayUsbTestStatus)
+                  .fontSize(11)
+                  .fontColor(this.gatewayUsbTestStatus.indexOf('成功') >= 0 ? this.accentGreen() : this.subTextColor())
+                  .margin({ top: 3 })
+                  .maxLines(2)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+              Text(this.provisioningConnected ? '已连接' : '未连接')
+                .fontSize(11)
+                .fontColor(this.provisioningConnected ? this.accentGreen() : this.subTextColor())
+            }
+            .width('100%')
+
+            Text(this.selectedProvisioningDeviceText())
+              .width('100%')
+              .fontSize(10)
+              .fontColor(this.subTextColor())
+              .margin({ top: 8 })
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+            Row() {
+              Button('刷新设备')
+                .layoutWeight(1)
+                .height(32)
+                .fontSize(11)
+                .fontColor(this.textColor())
+                .backgroundColor(this.cardBg())
+                .border({ width: 1, color: this.hairlineColor() })
+                .borderRadius(8)
+                .enabled(!this.gatewayUsbTestBusy)
+                .onClick(() => {
+                  this.refreshGatewayUsbDevices()
+                })
+              Button(this.provisioningConnected ? '断开网关' : '连接网关')
+                .layoutWeight(1)
+                .height(32)
+                .fontSize(11)
+                .fontColor('#FFFFFF')
+                .backgroundColor(this.provisioningConnected ? '#2E3033' : this.accentBlue())
+                .borderRadius(8)
+                .margin({ left: 6 })
+                .enabled(!this.gatewayUsbTestBusy)
+                .onClick(() => {
+                  if (this.provisioningConnected) {
+                    this.disconnectGatewayUsb()
+                  } else {
+                    this.connectGatewayUsb()
+                  }
+                })
+              Button(this.gatewayUsbTestBusy ? '等待 ACK' : '发送测试帧')
+                .layoutWeight(1.2)
+                .height(32)
+                .fontSize(11)
+                .fontColor('#FFFFFF')
+                .backgroundColor(this.accentGreen())
+                .borderRadius(8)
+                .margin({ left: 6 })
+                .enabled(this.provisioningConnected && !this.gatewayUsbTestBusy)
+                .onClick(() => {
+                  this.sendGatewayUsbTest()
+                })
+            }
+            .width('100%')
+            .margin({ top: 10 })
+
+            Text(`最近 ACK：${this.gatewayUsbTestLastAck}`)
+              .width('100%')
+              .fontSize(10)
+              .fontColor(this.subTextColor())
+              .margin({ top: 8 })
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          .width('100%')
+          .padding(12)
+          .margin({ top: 12 })
+          .backgroundColor(this.softPanelBg())
+          .border({ width: 1, color: this.hairlineColor() })
+          .borderRadius(8)
+
+          Column() {
+            Row() {
+              Column() {
+                Text('蓝牙家居设备联调')
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.textColor())
+                Text(this.gatewayBleStatus)
+                  .fontSize(11)
+                  .fontColor(this.gatewayBleStatus.indexOf('错误') >= 0 ||
+                    this.gatewayBleStatus.indexOf('失败') >= 0 ||
+                    this.gatewayBleStatus.indexOf('超时') >= 0 ? this.warningRed() : this.subTextColor())
+                  .margin({ top: 3 })
+                  .maxLines(2)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+              Text(`${this.gatewayBleDevices.length} 台家居设备`)
+                .fontSize(12)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(this.gatewayBleDevices.length > 0 ? this.accentGreen() : this.subTextColor())
+            }
+            .width('100%')
+
+            Row() {
+              Button(this.gatewayBleReconnecting ? '恢复中' :
+                (this.gatewayBleScanning ? '扫描中' : '开始扫描'))
+                .layoutWeight(1)
+                .height(32)
+                .fontSize(11)
+                .fontColor('#FFFFFF')
+                .backgroundColor(this.accentGreen())
+                .borderRadius(8)
+                .enabled(this.provisioningConnected && !this.gatewayBleScanning && !this.gatewayBleReconnecting)
+                .onClick(() => {
+                  this.startGatewayBleScan()
+                })
+              Button('停止扫描')
+                .layoutWeight(1)
+                .height(32)
+                .fontSize(11)
+                .fontColor(this.textColor())
+                .backgroundColor(this.cardBg())
+                .border({ width: 1, color: this.hairlineColor() })
+                .borderRadius(8)
+                .margin({ left: 8 })
+                .enabled(this.provisioningConnected && this.gatewayBleScanning)
+                .onClick(() => {
+                  this.stopGatewayBleScan()
+                })
+            }
+            .width('100%')
+            .margin({ top: 10 })
+
+            if (this.gatewayBleDevices.length === 0) {
+              Text('尚未发现蓝牙家居设备')
+                .width('100%')
+                .height(50)
+                .fontSize(11)
+                .fontColor(this.subTextColor())
+                .textAlign(TextAlign.Center)
+            } else {
+              ForEach(this.gatewayBleDevices, (device: GatewayBleDeviceInfo) => {
+                Column() {
+                  Row() {
+                    Text(device.name)
+                      .fontSize(12)
+                      .fontWeight(FontWeight.Bold)
+                      .fontColor(this.textColor())
+                      .layoutWeight(1)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Text(device.connected ? '已连接' : '已发现')
+                      .fontSize(10)
+                      .fontColor(device.connected ? this.accentGreen() : this.accentOrange())
+                  }
+                  .width('100%')
+                  Text(this.deviceIdDisplayText(device.deviceId))
+                    .width('100%')
+                    .fontSize(10)
+                    .fontColor(this.subTextColor())
+                    .margin({ top: 3 })
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  Row() {
+                    Text(this.gatewayBleCapabilitiesText(device))
+                      .fontSize(10)
+                      .fontColor(this.accentBlue())
+                      .layoutWeight(1)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Text(device.rssi !== 0 ? `RSSI ${device.rssi} dBm` : 'RSSI --')
+                      .fontSize(10)
+                      .fontColor(this.subTextColor())
+                  }
+                  .width('100%')
+                  .margin({ top: 4 })
+                }
+                .width('100%')
+                .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+                .margin({ top: 6 })
+                .backgroundColor(this.cardBg())
+                .border({ width: 1, color: device.connected ? this.accentGreen() : this.hairlineColor() })
+                .borderRadius(8)
+              }, (device: GatewayBleDeviceInfo) => device.deviceId)
+            }
+          }
+          .width('100%')
+          .padding(12)
+          .margin({ top: 10 })
+          .backgroundColor(this.softPanelBg())
+          .border({ width: 1, color: this.hairlineColor() })
+          .borderRadius(8)
         }
         .width('100%')
       }
@@ -10584,6 +11530,9 @@ struct Index {
       .layoutWeight(1)
       .scrollBar(BarState.Auto)
       .margin({ top: 12 })
+      .onScroll((xOffset: number, yOffset: number) => {
+        this.debugInfoScrollOffset = yOffset
+      })
     }
     .width(520)
     .height(430)
@@ -11186,89 +12135,6 @@ struct Index {
     .padding(20)
     .backgroundColor(this.cardBg())
     .border({ width: 1.5, color: this.hairlineColor() })
-    .borderRadius(20)
-  }
-
-  @Builder
-  ProvisioningOutputPanel() {
-    Column() {
-      Row() {
-        Column() {
-          Text('设备输出')
-            .fontSize(22)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(this.textColor())
-          Text(`${this.provisioningFrameLog.length} 条`)
-            .fontSize(12)
-            .fontColor(this.subTextColor())
-            .margin({ top: 4 })
-        }
-        .layoutWeight(1)
-        .alignItems(HorizontalAlign.Start)
-
-        Button('清空')
-          .width(70)
-          .height(34)
-          .fontSize(13)
-          .fontColor(this.textColor())
-          .backgroundColor(this.softPanelBg())
-          .border({ width: 1, color: this.hairlineColor() })
-          .borderRadius(8)
-          .margin({ right: 8 })
-          .onClick(() => {
-            this.clearProvisioningEsp32Log()
-          })
-
-        Button('关闭')
-          .width(70)
-          .height(34)
-          .fontSize(13)
-          .fontColor('#FFFFFF')
-          .backgroundColor('#2E3033')
-          .borderRadius(8)
-          .onClick(() => {
-            this.showProvisioningOutputPanel = false
-          })
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-
-      Scroll() {
-        Column() {
-          if (this.provisioningFrameLog.length === 0) {
-            Text('暂无设备输出')
-              .width('100%')
-              .fontSize(13)
-              .fontColor(this.subTextColor())
-              .textAlign(TextAlign.Center)
-              .margin({ top: 180 })
-          }
-          ForEach(this.provisioningFrameLog, (line: string) => {
-            Text(line)
-              .width('100%')
-              .fontSize(12)
-              .fontColor(this.textColor())
-              .maxLines(10)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .margin({ bottom: 8 })
-          }, (line: string) => line)
-        }
-        .width('100%')
-      }
-      .width('100%')
-      .height(450)
-      .scrollBar(BarState.Auto)
-      .padding(14)
-      .margin({ top: 16 })
-      .backgroundColor(this.pageBg())
-      .border({ width: 1, color: this.hairlineColor() })
-      .borderRadius(8)
-    }
-    .width(820)
-    .height(540)
-    .padding(22)
-    .backgroundColor(this.cardBg())
-    .border({ width: 1, color: this.hairlineColor() })
     .borderRadius(20)
   }
 
@@ -12385,67 +13251,6 @@ struct Index {
     .borderRadius(22)
   }
 
-  @Builder
-  CriticalDialog() {
-    Column() {
-      Text('关闭报警？')
-        .fontSize(28)
-        .fontWeight(FontWeight.Bold)
-        .fontColor('#762D36')
-      Text(`${this.alarmDialogTarget === 'water' ? '水浸' : '烟雾'}异常仍在报警，确认后将通知设备关闭蜂鸣器。`)
-        .fontSize(16)
-        .fontColor('#865158')
-        .textAlign(TextAlign.Center)
-        .margin({ top: 14 })
-        .maxLines(3)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-
-      Text(this.alarmAckText)
-        .width('100%')
-        .fontSize(13)
-        .fontColor('#A25760')
-        .textAlign(TextAlign.Center)
-        .maxLines(2)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .margin({ top: 12, bottom: 24 })
-
-      Row() {
-        Button('取消')
-          .layoutWeight(1)
-          .height(44)
-          .fontSize(15)
-          .fontColor('#762D36')
-          .backgroundColor('#E9B7BB')
-          .borderRadius(8)
-          .enabled(!this.alarmClearPending)
-          .onClick(() => {
-            this.showCriticalDialog = false
-          })
-        Button(this.alarmClearPending ? '等待设备确认' : '关闭报警')
-          .layoutWeight(1)
-          .height(44)
-          .fontSize(15)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#FFFFFF')
-          .backgroundColor('#BE5963')
-          .borderRadius(8)
-          .margin({ left: 12 })
-          .enabled(!this.alarmClearPending)
-          .onClick(() => {
-            this.requestAlarmClear().catch((err: Error) => {
-              console.info(`[ALARM][off-ui-fail] ${err.message}`)
-            })
-          })
-      }
-      .width('100%')
-    }
-    .width(480)
-    .padding(28)
-    .borderRadius(8)
-    .backgroundColor('#F7DCDD')
-    .border({ width: 1, color: '#DFA5AA' })
-  }
-
   build() {
     Stack() {
       this.MainShell()
@@ -12519,7 +13324,17 @@ struct Index {
 
       if (this.showProvisioningOutputPanel) {
         Stack({ alignContent: Alignment.Center }) {
-          this.ProvisioningOutputPanel()
+          ProvisioningOutputView({
+            frameLog: this.provisioningFrameLog,
+            textColor: this.textColor(),
+            subTextColor: this.subTextColor(),
+            softPanelBg: this.softPanelBg(),
+            hairlineColor: this.hairlineColor(),
+            pageBg: this.pageBg(),
+            cardBg: this.cardBg(),
+            onClear: () => { this.clearProvisioningEsp32Log() },
+            onClose: () => { this.showProvisioningOutputPanel = false }
+          })
         }
         .width('100%')
         .height('100%')
@@ -12546,7 +13361,13 @@ struct Index {
 
       if (this.showCriticalDialog) {
         Stack({ alignContent: Alignment.Center }) {
-          this.CriticalDialog()
+          CriticalDialogPanel({
+            alarmDialogTarget: this.alarmDialogTarget,
+            alarmAckText: this.alarmAckText,
+            alarmClearPending: this.alarmClearPending,
+            onCancel: () => { this.showCriticalDialog = false },
+            onConfirm: () => { this.requestAlarmClear().catch((err: Error) => { console.info(`[ALARM][off-ui-fail] ${err.message}`) }) }
+          })
         }
         .width('100%')
         .height('100%')
@@ -12770,5 +13591,173 @@ struct SettingsFeatureImageCell {
       .height(104)
       .objectFit(ImageFit.Contain)
       .opacity(this.dimmed ? 0.55 : 1)
+  }
+}
+
+
+/**
+ * 告警关闭确认对话框。
+ * 完全使用硬编码颜色，无需父组件传入主题色。
+ */
+@Component
+export struct CriticalDialogPanel {
+  @Prop alarmDialogTarget: string = ''
+  @Prop alarmAckText: string = ''
+  @Prop alarmClearPending: boolean = false
+  onCancel: () => void = () => {}
+  onConfirm: () => void = () => {}
+
+  build() {
+    Column() {
+      Text('关闭报警？')
+        .fontSize(28)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#762D36')
+      Text(`${this.alarmDialogTarget === 'water' ? '水浸' : '烟雾'}异常仍在报警，确认后将通知设备关闭蜂鸣器。`)
+        .fontSize(16)
+        .fontColor('#865158')
+        .textAlign(TextAlign.Center)
+        .margin({ top: 14 })
+        .maxLines(3)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+      Text(this.alarmAckText)
+        .width('100%')
+        .fontSize(13)
+        .fontColor('#A25760')
+        .textAlign(TextAlign.Center)
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .margin({ top: 12, bottom: 24 })
+
+      Row() {
+        Button('取消')
+          .layoutWeight(1)
+          .height(44)
+          .fontSize(15)
+          .fontColor('#762D36')
+          .backgroundColor('#E9B7BB')
+          .borderRadius(8)
+          .enabled(!this.alarmClearPending)
+          .onClick(() => {
+            this.onCancel()
+          })
+        Button(this.alarmClearPending ? '等待设备确认' : '关闭报警')
+          .layoutWeight(1)
+          .height(44)
+          .fontSize(15)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#FFFFFF')
+          .backgroundColor('#BE5963')
+          .borderRadius(8)
+          .margin({ left: 12 })
+          .enabled(!this.alarmClearPending)
+          .onClick(() => {
+            this.onConfirm()
+          })
+      }
+      .width('100%')
+    }
+    .width(480)
+    .padding(28)
+    .borderRadius(8)
+    .backgroundColor('#F7DCDD')
+    .border({ width: 1, color: '#DFA5AA' })
+  }
+}
+
+
+@Component
+export struct ProvisioningOutputView {
+  @Prop frameLog: string[] = []
+  @Prop textColor: string = ''
+  @Prop subTextColor: string = ''
+  @Prop softPanelBg: string = ''
+  @Prop hairlineColor: string = ''
+  @Prop pageBg: string = ''
+  @Prop cardBg: string = ''
+  onClear: () => void = () => {}
+  onClose: () => void = () => {}
+
+  build() {
+    Column() {
+      Row() {
+        Column() {
+          Text('设备输出')
+            .fontSize(22)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.textColor)
+          Text(`${this.frameLog.length} 条`)
+            .fontSize(12)
+            .fontColor(this.subTextColor)
+            .margin({ top: 4 })
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+
+        Button('清空')
+          .width(70)
+          .height(34)
+          .fontSize(13)
+          .fontColor(this.textColor)
+          .backgroundColor(this.softPanelBg)
+          .border({ width: 1, color: this.hairlineColor })
+          .borderRadius(8)
+          .margin({ right: 8 })
+          .onClick(() => {
+            this.onClear()
+          })
+
+        Button('关闭')
+          .width(70)
+          .height(34)
+          .fontSize(13)
+          .fontColor('#FFFFFF')
+          .backgroundColor('#2E3033')
+          .borderRadius(8)
+          .onClick(() => {
+            this.onClose()
+          })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      Scroll() {
+        Column() {
+          if (this.frameLog.length === 0) {
+            Text('暂无设备输出')
+              .width('100%')
+              .fontSize(13)
+              .fontColor(this.subTextColor)
+              .textAlign(TextAlign.Center)
+              .margin({ top: 180 })
+          }
+          ForEach(this.frameLog, (line: string) => {
+            Text(line)
+              .width('100%')
+              .fontSize(12)
+              .fontColor(this.textColor)
+              .maxLines(10)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .margin({ bottom: 8 })
+          }, (line: string) => line)
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .height(450)
+      .scrollBar(BarState.Auto)
+      .padding(14)
+      .margin({ top: 16 })
+      .backgroundColor(this.pageBg)
+      .border({ width: 1, color: this.hairlineColor })
+      .borderRadius(8)
+    }
+    .width(820)
+    .height(540)
+    .padding(22)
+    .backgroundColor(this.cardBg)
+    .border({ width: 1, color: this.hairlineColor })
+    .borderRadius(20)
   }
 }

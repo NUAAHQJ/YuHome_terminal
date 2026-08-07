@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "labels": [
+    "light_set",
+    "ac_power_set",
+    "curtain_set",
+    "ac_temperature_set",
+    "ac_mode_set",
+    "light_status_query",
+    "curtain_status_query",
+    "ac_status_query",
+    "door_status_query",
+    "temperature_query",
+    "humidity_query",
+    "environment_query",
+    "alarm_status_query",
+    "requires_confirmation",
+    "unknown"
+  ]
+}

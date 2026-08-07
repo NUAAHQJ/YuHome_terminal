@@ -12,6 +12,10 @@ export enum ProvisioningFrameType {
   CONFIG_TEST = 0x40,
   CONFIG_TEST_RESULT = 0x41,
   REBOOT = 0x50,
+  GATEWAY_TEST = 0x60,
+  GATEWAY_TEST_ACK = 0x61,
+  GATEWAY_BLE_COMMAND = 0x62,
+  GATEWAY_BLE_EVENT = 0x63,
   ERROR = 0x7F
 }
 
@@ -65,6 +69,10 @@ function isKnownProvisioningType(type: number): boolean {
     case ProvisioningFrameType.CONFIG_TEST:
     case ProvisioningFrameType.CONFIG_TEST_RESULT:
     case ProvisioningFrameType.REBOOT:
+    case ProvisioningFrameType.GATEWAY_TEST:
+    case ProvisioningFrameType.GATEWAY_TEST_ACK:
+    case ProvisioningFrameType.GATEWAY_BLE_COMMAND:
+    case ProvisioningFrameType.GATEWAY_BLE_EVENT:
     case ProvisioningFrameType.ERROR:
       return true
     default:
@@ -227,6 +235,14 @@ export function provisioningTypeName(type: number): string {
       return 'CONFIG_TEST_RESULT'
     case ProvisioningFrameType.REBOOT:
       return 'REBOOT'
+    case ProvisioningFrameType.GATEWAY_TEST:
+      return 'GATEWAY_TEST'
+    case ProvisioningFrameType.GATEWAY_TEST_ACK:
+      return 'GATEWAY_TEST_ACK'
+    case ProvisioningFrameType.GATEWAY_BLE_COMMAND:
+      return 'GATEWAY_BLE_COMMAND'
+    case ProvisioningFrameType.GATEWAY_BLE_EVENT:
+      return 'GATEWAY_BLE_EVENT'
     case ProvisioningFrameType.ERROR:
       return 'ERROR'
     default:

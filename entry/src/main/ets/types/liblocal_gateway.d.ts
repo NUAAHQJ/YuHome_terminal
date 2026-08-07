@@ -28,6 +28,7 @@ declare module 'liblocal_gateway.so' {
     getStatus(): LocalGatewayStatus
     enqueueCommand(deviceId: string, topic: string, payloadBase64: string, bytes: number): boolean
     pollEvents(): LocalGatewayEvent[]
+    usbControlLineState(fileDescriptor: number, interfaceId: number, asserted: boolean): number
   }
 
   const localGateway: LocalGatewayNative

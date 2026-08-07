@@ -1,0 +1,21 @@
+{
+  "run_name": "rbt3_yuhome_nlu_v2_repro",
+  "base_model": "hfl/rbt3",
+  "seed": 20260802,
+  "max_length": 48,
+  "batch_size": 32,
+  "eval_batch_size": 64,
+  "epochs": 8,
+  "learning_rate": 0.00003,
+  "weight_decay": 0.01,
+  "warmup_ratio": 0.1,
+  "gradient_clip_norm": 1.0,
+  "class_weighting": "sqrt_inverse_frequency",
+  "label_smoothing": 0.02,
+  "early_stopping_patience": 2,
+  "early_stopping_min_delta": 0.0005,
+  "num_workers": 0,
+  "threshold_min": 0.35,
+  "threshold_max": 0.9,
+  "threshold_step": 0.01
+}

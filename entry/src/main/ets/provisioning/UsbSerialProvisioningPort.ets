@@ -1,5 +1,6 @@
 import usbManager from '@ohos.usbManager'
 import serialManager from '@ohos.usbManager.serial'
+import localGateway from 'liblocal_gateway.so'
 import {
   ProvisioningFrame,
   encodeProvisioningFrame,
@@ -15,7 +16,7 @@ const USB_CLASS_CDC_DATA: number = 0x0A
 const SERIAL_NONE: number = -1
 const WCH_VENDOR_ID: number = 0x1A86
 const CP210X_VENDOR_ID: number = 0x10C4
-const READ_TIMEOUT_MS: number = 50
+const READ_TIMEOUT_MS: number = 250
 const READ_ACTIVE_DELAY_MS: number = 0
 // 分级空闲退避：刚空闲时保持较快轮询以压低首字节延迟，
 // 持续空闲超过 READ_IDLE_SLOW_AFTER_MS 后放慢，避免空载占满 UI 线程。
@@ -51,6 +52,11 @@ interface UsbSerialEndpointSet {
   inEndpoint: usbManager.USBEndpoint
   outEndpoint: usbManager.USBEndpoint
   cdcControlInterfaceId: number
+}
+
+interface UsbBulkReadEndpoint {
+  iface: usbManager.USBInterface
+  endpoint: usbManager.USBEndpoint
 }
 
 interface UsbBulkInterfaceCandidate {
@@ -181,15 +187,18 @@ export class UsbSerialProvisioningPort {
   private pipe: usbManager.USBDevicePipe | null = null
   private endpointSet: UsbSerialEndpointSet | null = null
   private claimedInterfaces: usbManager.USBInterface[] = []
+  private usbReadEndpoints: UsbBulkReadEndpoint[] = []
+  private usbReadInFlightByEndpoint: boolean[] = []
+  private readGeneration: number = 0
   private readBuffer: Uint8Array = new Uint8Array(0)
   private reading: boolean = false
-  private usbReadInFlight: boolean = false
   private usbWriteInProgress: boolean = false
   private nextRxErrorLogAt: number = 0
   private nextEnterConfigTxLogAt: number = 0
   private nextAsciiHexHintAt: number = 0
   private lastRxAt: number = 0
   private rxByteCount: number = 0
+  private burstReadUntil: number = 0
   // 连续空读的起始时间戳，0 表示当前不处于空闲状态
   private idleReadSince: number = 0
   private frameHandler: ((frame: ProvisioningFrame) => void) | null = null
@@ -221,6 +230,28 @@ export class UsbSerialProvisioningPort {
     return this.rxByteCount
   }
 
+  boostReceive(durationMs: number): void {
+    this.burstReadUntil = Math.max(this.burstReadUntil, Date.now() + Math.max(0, durationMs))
+  }
+
+  endReceiveBoost(): void {
+    this.burstReadUntil = 0
+  }
+
+  hasDeviceAccessRight(device: UsbSerialDeviceInfo): boolean {
+    try {
+      if (device.kind === 'serial' && device.serialPortId !== undefined) {
+        return serialManager.hasSerialRight(device.serialPortId)
+      }
+      if (device.kind === 'usb') {
+        return usbManager.hasRight(device.name)
+      }
+    } catch (_) {
+      return false
+    }
+    return false
+  }
+
   async open(index: number, onFrame: (frame: ProvisioningFrame) => void, onLog: (message: string) => void): Promise<UsbSerialOpenResult> {
     await this.close()
     this.frameHandler = onFrame
@@ -244,7 +275,9 @@ export class UsbSerialProvisioningPort {
 
   async close(): Promise<void> {
     this.reading = false
+    this.readGeneration += 1
     this.idleReadSince = 0
+    this.burstReadUntil = 0
     if (this.backend === 'serial' && this.serialPortId !== SERIAL_NONE) {
       try {
         serialManager.close(this.serialPortId)
@@ -274,6 +307,8 @@ export class UsbSerialProvisioningPort {
     this.endpointSet = null
     this.device = null
     this.claimedInterfaces = []
+    this.usbReadEndpoints = []
+    this.usbReadInFlightByEndpoint = []
     this.readBuffer = new Uint8Array(0)
     this.nextRxErrorLogAt = 0
     this.nextEnterConfigTxLogAt = 0
@@ -476,6 +511,24 @@ export class UsbSerialProvisioningPort {
     if (candidate.clazz === 0xFF) {
       score += 10
     }
+    // ESP32-S3's native USB Serial/JTAG is a composite device. The JTAG
+    // function can also expose bulk endpoints, but the application protocol
+    // is carried by the CDC data interface. Prefer CDC data explicitly and,
+    // when descriptors are vendor-specific, prefer the second endpoint pair
+    // conventionally used by the CDC serial function (0x02/0x82).
+    if ((device.vendorId || 0) === 0x303A) {
+      if (candidate.clazz === USB_CLASS_CDC_DATA) {
+        score += 160
+      }
+      if (candidate.inAddress === 0x82 && candidate.outAddress === 0x02) {
+        score += 100
+      } else if ((candidate.inAddress & 0x7F) >= 2 || (candidate.outAddress & 0x7F) >= 2) {
+        score += 20
+      }
+      if (candidate.clazz === 0xFF && candidate.inAddress === 0x81 && candidate.outAddress === 0x01) {
+        score -= 80
+      }
+    }
     score -= Math.abs(candidate.ifaceId - Math.max(0, candidate.controlInterfaceId))
     return score
   }
@@ -535,6 +588,8 @@ export class UsbSerialProvisioningPort {
       return { ok: false, message: '未找到 USB bulk IN/OUT 端点' }
     }
 
+    this.log(`[USB] selected dataIface=${endpointSet.iface.id} ctrlIface=${endpointSet.cdcControlInterfaceId} ` +
+      `in=0x${(endpointSet.inEndpoint.address || 0).toString(16)} out=0x${(endpointSet.outEndpoint.address || 0).toString(16)}`)
     const pipe = usbManager.connectDevice(selected) as usbManager.USBDevicePipe
     const claimResult = usbManager.claimInterface(pipe, endpointSet.iface, true)
     if (claimResult !== 0) {
@@ -543,7 +598,17 @@ export class UsbSerialProvisioningPort {
     }
 
     this.claimedInterfaces = [endpointSet.iface]
-    this.claimRelatedInterfaces(pipe, selected, endpointSet.iface.id)
+    this.claimRelatedInterfaces(pipe, selected, endpointSet.iface.id, endpointSet.cdcControlInterfaceId)
+    // ESP32-S3 exposes two independent bulk functions: CDC Serial and JTAG.
+    // The application protocol is carried only by the selected CDC data
+    // interface. Reading the JTAG IN endpoint concurrently makes the SDK
+    // issue competing reads on one USB pipe and can prevent CDC data from
+    // being delivered at all (the device then appears to ACK, while the host
+    // receives zero bytes).
+    this.usbReadEndpoints = [{ iface: endpointSet.iface, endpoint: endpointSet.inEndpoint }]
+    this.usbReadInFlightByEndpoint = this.usbReadEndpoints.map(() => false)
+    this.log(`[USB] RX endpoints=${this.usbReadEndpoints.map((item: UsbBulkReadEndpoint) =>
+      `iface${item.iface.id}:0x${(item.endpoint.address || 0).toString(16)}`).join(', ')}`)
 
     this.device = selected
     this.pipe = pipe
@@ -645,17 +710,36 @@ export class UsbSerialProvisioningPort {
     return null
   }
 
-  private claimRelatedInterfaces(pipe: usbManager.USBDevicePipe, device: usbManager.USBDevice, dataInterfaceId: number): void {
+  private hasClaimedInterface(interfaceId: number): boolean {
+    for (let i = 0; i < this.claimedInterfaces.length; i += 1) {
+      if (this.claimedInterfaces[i].id === interfaceId) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private claimRelatedInterfaces(
+    pipe: usbManager.USBDevicePipe,
+    device: usbManager.USBDevice,
+    dataInterfaceId: number,
+    controlInterfaceId: number
+  ): void {
+    // ESP32-S3 may expose Serial and JTAG as a composite USB device. Claim only
+    // the selected data interface and its paired CDC control interface.
+    if (controlInterfaceId < 0 || controlInterfaceId === dataInterfaceId) {
+      return
+    }
     const configs = device.configs ? device.configs : []
     for (const config of configs) {
       const interfaces = config.interfaces ? config.interfaces : []
       for (const iface of interfaces) {
-        if (iface.id === dataInterfaceId) {
+        if (iface.id !== controlInterfaceId) {
           continue
         }
         try {
           const result = usbManager.claimInterface(pipe, iface, true)
-          this.log(`[USB] claim related iface id=${iface.id} class=${iface.clazz} result=${result}`)
+          this.log(`[USB] claim paired control iface id=${iface.id} dataIface=${dataInterfaceId} class=${iface.clazz} result=${result}`)
           if (result === 0) {
             this.claimedInterfaces.push(iface)
           }
@@ -787,13 +871,13 @@ export class UsbSerialProvisioningPort {
         await this.configureCdcAcmLineCoding(interfaceId)
         return
       }
-      await this.configureCdcAcmLineCoding(interfaceId)
+      await this.configureCdcAcmLineCoding(interfaceId, (device.vendorId || 0) === 0x303A)
     } catch (err) {
       this.log(`[USB] raw init failed, continuing anyway: ${describeUsbError(err as UsbErrorLike)}`)
     }
   }
 
-  private async configureCdcAcmLineCoding(interfaceId: number): Promise<void> {
+  private async configureCdcAcmLineCoding(interfaceId: number, assertDtr: boolean = false): Promise<void> {
     const lineCoding = new Uint8Array(7)
     const baud = 115200
     lineCoding[0] = baud & 0xFF
@@ -806,8 +890,22 @@ export class UsbSerialProvisioningPort {
 
     try {
       await this.controlOut(0x21, 0x20, 0, interfaceId, lineCoding, 'CDC SET_LINE_CODING')
-      await this.controlOut(0x21, 0x22, 0x0000, interfaceId, emptyBytes(), 'CDC SET_CONTROL_LINE_STATE')
-      this.log(`[USB] CDC ACM line coding set: iface=${interfaceId} 115200/8N1 DTR/RTS released`)
+      // Native ESP32-S3 USB CDC needs DTR asserted before it reliably sends
+      // bytes back to the host. Keep RTS low so this does not resemble the
+      // DTR/RTS auto-reset sequence used by external USB-UART bridges.
+      const controlLineState = assertDtr ? 0x0001 : 0x0000
+      let nativeControlResult = 0
+      if (assertDtr && this.pipe !== null) {
+        const fd = usbManager.getFileDescriptor(this.pipe)
+        nativeControlResult = localGateway.usbControlLineState(fd, interfaceId, true)
+        this.log(`[USB] native CDC DTR iface=${interfaceId} fd=${fd} result=${nativeControlResult}`)
+      }
+      if (!assertDtr || nativeControlResult < 0) {
+        await this.controlOut(0x21, 0x22, controlLineState, interfaceId, emptyBytes(),
+          'CDC SET_CONTROL_LINE_STATE')
+      }
+      this.log(`[USB] CDC ACM line coding set: iface=${interfaceId} 115200/8N1 ` +
+        `DTR=${assertDtr ? 'asserted' : 'released'} RTS=released`)
     } catch (err) {
       this.log(`[USB] CDC line coding skipped: ${describeUsbError(err as UsbErrorLike)}`)
     }
@@ -937,7 +1035,9 @@ export class UsbSerialProvisioningPort {
     }
 
     if (data.length === 0) {
-      this.log(`[USB] legacy controlTransfer skips zero-length request bRequest=0x${bRequest.toString(16)} value=0x${wValue.toString(16)} index=${wIndex}`)
+      // SDK 11 rejects zero-length legacy control buffers. This is an
+      // optional CDC line-state request for the raw bulk data path.
+      this.log(`[USB] legacy controlTransfer cannot send zero-length request bRequest=0x${bRequest.toString(16)} value=0x${wValue.toString(16)} index=${wIndex}`)
       return 0
     }
 
@@ -958,7 +1058,12 @@ export class UsbSerialProvisioningPort {
       return
     }
     this.reading = true
+    this.readGeneration += 1
     this.idleReadSince = 0
+    if (this.backend === 'usb') {
+      this.startUsbReadLoops(this.readGeneration)
+      return
+    }
     this.readOnce()
   }
 
@@ -971,7 +1076,7 @@ export class UsbSerialProvisioningPort {
       return
     }
     if (this.backend === 'usb') {
-      this.readUsbOnce()
+      this.startUsbReadLoops(this.readGeneration)
     }
   }
 
@@ -991,24 +1096,55 @@ export class UsbSerialProvisioningPort {
       })
   }
 
-  private readUsbOnce(): void {
-    if (!this.reading || this.pipe === null || this.endpointSet === null ||
-      this.usbReadInFlight) {
+  private startUsbReadLoops(generation: number): void {
+    if (!this.reading || this.backend !== 'usb' || this.pipe === null) {
       return
     }
+    if (this.usbReadEndpoints.length === 0 && this.endpointSet !== null) {
+      this.usbReadEndpoints = [{ iface: this.endpointSet.iface, endpoint: this.endpointSet.inEndpoint }]
+      this.usbReadInFlightByEndpoint = [false]
+    }
+    for (let index = 0; index < this.usbReadEndpoints.length; index += 1) {
+      this.readUsbEndpointOnce(index, generation)
+    }
+  }
+
+  private readUsbEndpointOnce(index: number, generation: number): void {
+    if (!this.reading || this.backend !== 'usb' || this.pipe === null ||
+      generation !== this.readGeneration || index < 0 || index >= this.usbReadEndpoints.length ||
+      this.usbReadInFlightByEndpoint[index]) {
+      return
+    }
+    const pipe = this.pipe
+    const readEndpoint = this.usbReadEndpoints[index]
     const buffer = new Uint8Array(256)
-    this.usbReadInFlight = true
-    usbManager.bulkTransfer(this.pipe, this.endpointSet.inEndpoint, buffer, READ_TIMEOUT_MS)
+    this.usbReadInFlightByEndpoint[index] = true
+    usbManager.bulkTransfer(pipe, readEndpoint.endpoint, buffer, READ_TIMEOUT_MS)
       .then((count: number) => {
-        this.usbReadInFlight = false
+        if (generation !== this.readGeneration || pipe !== this.pipe) {
+          return
+        }
+        this.usbReadInFlightByEndpoint[index] = false
         this.consumeReadBuffer(buffer, count)
-        this.scheduleNextRead(count)
+        this.scheduleUsbEndpointRead(index, generation, count)
       })
       .catch((err: Error) => {
-        this.usbReadInFlight = false
+        if (generation !== this.readGeneration || pipe !== this.pipe) {
+          return
+        }
+        this.usbReadInFlightByEndpoint[index] = false
         this.logRxError(err as UsbErrorLike)
-        this.scheduleNextRead(0)
+        this.scheduleUsbEndpointRead(index, generation, 0)
       })
+  }
+
+  private scheduleUsbEndpointRead(index: number, generation: number, lastReadCount: number): void {
+    if (!this.reading || generation !== this.readGeneration) {
+      return
+    }
+    setTimeout(() => {
+      this.readUsbEndpointOnce(index, generation)
+    }, this.nextReadDelay(lastReadCount))
   }
 
   private consumeReadBuffer(buffer: Uint8Array, count: number): void {
@@ -1051,6 +1187,9 @@ export class UsbSerialProvisioningPort {
       return READ_ACTIVE_DELAY_MS
     }
     const now = Date.now()
+    if (now < this.burstReadUntil) {
+      return READ_ACTIVE_DELAY_MS
+    }
     if (this.idleReadSince === 0) {
       this.idleReadSince = now
       return READ_IDLE_DELAY_MS

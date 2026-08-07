@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "nlu_runtime.h"
 #include "sherpa-onnx/c-api/c-api.h"
 
 namespace {
@@ -45,7 +46,10 @@ const SherpaOnnxOnlineStream *g_speakerStream = nullptr;
 int32_t g_modelGeneration = 0;
 bool g_speakerLoading = false;
 bool g_voiceModelsLoading = false;
+bool g_nluLoading = false;
 std::mutex g_inferenceMutex;
+std::mutex g_nluMutex;
+yuhome::nlu::Runtime g_nluRuntime;
 
 struct VoiceModelLoadWork {
     napi_async_work asyncWork = nullptr;
@@ -75,6 +79,26 @@ struct WakeDecodeWork {
     std::string json = R"({"keyword":"","tokens":[],"timestamps":[]})";
 };
 
+struct NluLoadWork {
+    napi_async_work asyncWork = nullptr;
+    napi_deferred deferred = nullptr;
+    NativeResourceManager *manager = nullptr;
+    std::string modelPath;
+    std::string vocabularyPath;
+    std::string modelVariant;
+    std::string message;
+    bool success = false;
+    int32_t generation = 0;
+};
+
+struct NluClassifyWork {
+    napi_async_work asyncWork = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string text;
+    yuhome::nlu::ClassificationResult result;
+    int32_t generation = 0;
+};
+
 napi_value MakeString(napi_env env, const std::string &value)
 {
     napi_value result = nullptr;
@@ -94,6 +118,54 @@ napi_value MakeInt(napi_env env, int32_t value)
     napi_value result = nullptr;
     napi_create_int32(env, value, &result);
     return result;
+}
+
+napi_value MakeDouble(napi_env env, double value)
+{
+    napi_value result = nullptr;
+    napi_create_double(env, value, &result);
+    return result;
+}
+
+std::string ReadString(napi_env env, napi_value value)
+{
+    size_t length = 0;
+    if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok) {
+        return "";
+    }
+    std::vector<char> buffer(length + 1, '\0');
+    size_t copied = 0;
+    if (napi_get_value_string_utf8(env, value, buffer.data(), buffer.size(), &copied) != napi_ok) {
+        return "";
+    }
+    return std::string(buffer.data(), copied);
+}
+
+bool ReadRawFile(NativeResourceManager *manager, const std::string &fileName, std::vector<uint8_t> &output)
+{
+    if (manager == nullptr || fileName.empty()) {
+        return false;
+    }
+    RawFile *file = OH_ResourceManager_OpenRawFile(manager, fileName.c_str());
+    if (file == nullptr) {
+        return false;
+    }
+    const long size = OH_ResourceManager_GetRawFileSize(file);
+    if (size <= 0) {
+        OH_ResourceManager_CloseRawFile(file);
+        return false;
+    }
+    output.resize(static_cast<size_t>(size));
+    size_t total = 0;
+    while (total < output.size()) {
+        const int read = OH_ResourceManager_ReadRawFile(file, output.data() + total, output.size() - total);
+        if (read <= 0) {
+            break;
+        }
+        total += static_cast<size_t>(read);
+    }
+    OH_ResourceManager_CloseRawFile(file);
+    return total == output.size();
 }
 
 napi_value MakeFloat32Array(napi_env env, const float *values, int32_t count)
@@ -144,6 +216,34 @@ napi_value MakeSpeakerResult(napi_env env, bool success, bool ready, const std::
     return result;
 }
 
+napi_value MakeNluInitResult(napi_env env, bool success, bool ready, const std::string &message,
+    const std::string &modelVariant, const std::string &runtimeVersion)
+{
+    napi_value result = nullptr;
+    napi_create_object(env, &result);
+    napi_set_named_property(env, result, "success", MakeBool(env, success));
+    napi_set_named_property(env, result, "ready", MakeBool(env, ready));
+    napi_set_named_property(env, result, "message", MakeString(env, message));
+    napi_set_named_property(env, result, "modelVariant", MakeString(env, modelVariant));
+    napi_set_named_property(env, result, "runtimeVersion", MakeString(env, runtimeVersion));
+    return result;
+}
+
+napi_value MakeNluClassificationResult(napi_env env, const yuhome::nlu::ClassificationResult &classification)
+{
+    napi_value result = nullptr;
+    napi_create_object(env, &result);
+    napi_set_named_property(env, result, "success", MakeBool(env, classification.success));
+    napi_set_named_property(env, result, "label", MakeString(env, classification.finalLabel));
+    napi_set_named_property(env, result, "route", MakeString(env, classification.routeLabel));
+    napi_set_named_property(env, result, "routeConfidence", MakeDouble(env, classification.routeConfidence));
+    napi_set_named_property(env, result, "intentConfidence", MakeDouble(env, classification.intentConfidence));
+    napi_set_named_property(env, result, "latencyMs", MakeDouble(env, classification.latencyMs));
+    napi_set_named_property(env, result, "modelVariant", MakeString(env, classification.modelVariant));
+    napi_set_named_property(env, result, "message", MakeString(env, classification.message));
+    return result;
+}
+
 void DestroyCommandStream()
 {
     if (g_commandStream != nullptr) {
@@ -186,6 +286,8 @@ void DestroyAll()
         SherpaOnnxDestroySpeakerEmbeddingExtractor(g_speakerExtractor);
         g_speakerExtractor = nullptr;
     }
+    std::lock_guard<std::mutex> nluLock(g_nluMutex);
+    g_nluRuntime.Release();
 }
 
 bool ReadAudioArgs(napi_env env, napi_callback_info info, float **samples, int32_t *sampleCount,
@@ -477,6 +579,170 @@ napi_value InitializeSpeaker(napi_env env, napi_callback_info info)
     }
     g_speakerLoading = true;
     napi_queue_async_work(env, work->asyncWork);
+    return promise;
+}
+
+void ExecuteNluLoad(napi_env env, void *data)
+{
+    (void)env;
+    auto *work = static_cast<NluLoadWork *>(data);
+    std::vector<uint8_t> modelData;
+    std::vector<uint8_t> vocabularyData;
+    if (!ReadRawFile(work->manager, work->modelPath, modelData)) {
+        work->message = "Failed to read NLU model rawfile: " + work->modelPath;
+        return;
+    }
+    if (!ReadRawFile(work->manager, work->vocabularyPath, vocabularyData)) {
+        work->message = "Failed to read NLU vocabulary rawfile: " + work->vocabularyPath;
+        return;
+    }
+    const std::string vocabulary(reinterpret_cast<const char *>(vocabularyData.data()), vocabularyData.size());
+    std::lock_guard<std::mutex> lock(g_nluMutex);
+    if (work->generation != g_modelGeneration) {
+        work->message = "NLU model load was cancelled";
+        return;
+    }
+    work->success = g_nluRuntime.Initialize(modelData, vocabulary, work->modelVariant, work->message);
+}
+
+void CompleteNluLoad(napi_env env, napi_status status, void *data)
+{
+    auto *work = static_cast<NluLoadWork *>(data);
+    g_nluLoading = false;
+    const bool ready = status == napi_ok && work->success && work->generation == g_modelGeneration;
+    if (!ready && work->generation == g_modelGeneration) {
+        std::lock_guard<std::mutex> lock(g_nluMutex);
+        g_nluRuntime.Release();
+    }
+    const std::string message = status == napi_ok ? work->message : "NLU model load task failed";
+    std::string runtimeVersion;
+    if (ready) {
+        std::lock_guard<std::mutex> lock(g_nluMutex);
+        runtimeVersion = g_nluRuntime.RuntimeVersion();
+    }
+    napi_resolve_deferred(env, work->deferred, MakeNluInitResult(env, ready, ready, message,
+        ready ? work->modelVariant : "", runtimeVersion));
+    if (work->manager != nullptr) {
+        OH_ResourceManager_ReleaseNativeResourceManager(work->manager);
+    }
+    napi_delete_async_work(env, work->asyncWork);
+    delete work;
+}
+
+napi_value InitializeNlu(napi_env env, napi_callback_info info)
+{
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    napi_value promise = nullptr;
+    napi_deferred deferred = nullptr;
+    napi_create_promise(env, &deferred, &promise);
+    if (argc != 4) {
+        napi_resolve_deferred(env, deferred, MakeNluInitResult(env, false, false,
+            "Expected resourceManager, modelPath, vocabularyPath and modelVariant", "", ""));
+        return promise;
+    }
+    const std::string modelPath = ReadString(env, argv[1]);
+    const std::string vocabularyPath = ReadString(env, argv[2]);
+    const std::string modelVariant = ReadString(env, argv[3]);
+    if (modelPath.empty() || vocabularyPath.empty() || modelVariant.empty()) {
+        napi_resolve_deferred(env, deferred, MakeNluInitResult(env, false, false,
+            "NLU model, vocabulary and variant must be non-empty", "", ""));
+        return promise;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_nluMutex);
+        if (g_nluRuntime.IsReady() && g_nluRuntime.ModelVariant() == modelVariant) {
+            napi_resolve_deferred(env, deferred, MakeNluInitResult(env, true, true,
+                "NLU model already loaded", modelVariant, g_nluRuntime.RuntimeVersion()));
+            return promise;
+        }
+    }
+    if (g_nluLoading) {
+        napi_resolve_deferred(env, deferred, MakeNluInitResult(env, false, false,
+            "NLU model is already loading", "", ""));
+        return promise;
+    }
+    NativeResourceManager *manager = OH_ResourceManager_InitNativeResourceManager(env, argv[0]);
+    if (manager == nullptr) {
+        napi_resolve_deferred(env, deferred, MakeNluInitResult(env, false, false,
+            "Failed to create NativeResourceManager for NLU", "", ""));
+        return promise;
+    }
+
+    auto *work = new NluLoadWork();
+    work->deferred = deferred;
+    work->manager = manager;
+    work->modelPath = modelPath;
+    work->vocabularyPath = vocabularyPath;
+    work->modelVariant = modelVariant;
+    work->generation = g_modelGeneration;
+    napi_value resourceName = MakeString(env, "voice-nlu-model-load");
+    const napi_status createStatus = napi_create_async_work(env, nullptr, resourceName,
+        ExecuteNluLoad, CompleteNluLoad, work, &work->asyncWork);
+    if (createStatus != napi_ok) {
+        OH_ResourceManager_ReleaseNativeResourceManager(manager);
+        delete work;
+        napi_resolve_deferred(env, deferred, MakeNluInitResult(env, false, false,
+            "Failed to create NLU model load task", "", ""));
+        return promise;
+    }
+    g_nluLoading = true;
+    napi_queue_async_work(env, work->asyncWork);
+    return promise;
+}
+
+napi_value ClassifyNlu(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    napi_value promise = nullptr;
+    napi_deferred deferred = nullptr;
+    napi_create_promise(env, &deferred, &promise);
+    const std::string text = argc == 1 ? ReadString(env, argv[0]) : "";
+    if (text.empty()) {
+        yuhome::nlu::ClassificationResult result;
+        result.message = "NLU text must be non-empty";
+        napi_resolve_deferred(env, deferred, MakeNluClassificationResult(env, result));
+        return promise;
+    }
+
+    auto *work = new NluClassifyWork();
+    work->deferred = deferred;
+    work->text = text;
+    work->generation = g_modelGeneration;
+    napi_value resourceName = MakeString(env, "voice-nlu-classify");
+    const napi_status createStatus = napi_create_async_work(env, nullptr, resourceName,
+        [](napi_env executeEnv, void *workData) {
+            (void)executeEnv;
+            auto *classification = static_cast<NluClassifyWork *>(workData);
+            std::lock_guard<std::mutex> lock(g_nluMutex);
+            if (classification->generation != g_modelGeneration) {
+                classification->result.message = "NLU inference was cancelled";
+                return;
+            }
+            classification->result = g_nluRuntime.Classify(classification->text);
+        },
+        [](napi_env completeEnv, napi_status completeStatus, void *workData) {
+            auto *classification = static_cast<NluClassifyWork *>(workData);
+            if (completeStatus != napi_ok) {
+                classification->result.success = false;
+                classification->result.message = "NLU inference task failed";
+            }
+            napi_resolve_deferred(completeEnv, classification->deferred,
+                MakeNluClassificationResult(completeEnv, classification->result));
+            napi_delete_async_work(completeEnv, classification->asyncWork);
+            delete classification;
+        }, work, &work->asyncWork);
+    if (createStatus != napi_ok || napi_queue_async_work(env, work->asyncWork) != napi_ok) {
+        work->result.message = "Failed to queue NLU inference task";
+        napi_resolve_deferred(env, deferred, MakeNluClassificationResult(env, work->result));
+        if (work->asyncWork != nullptr) {
+            napi_delete_async_work(env, work->asyncWork);
+        }
+        delete work;
+    }
     return promise;
 }
 
@@ -773,6 +1039,8 @@ napi_value Init(napi_env env, napi_value exports)
     napi_property_descriptor descriptors[] = {
         {"initialize", nullptr, Initialize, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"initializeSpeaker", nullptr, InitializeSpeaker, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"initializeNlu", nullptr, InitializeNlu, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"classifyNlu", nullptr, ClassifyNlu, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"resetWake", nullptr, ResetWake, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"acceptWake", nullptr, AcceptWake, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"acceptWakePcm16", nullptr, AcceptWakePcm16, nullptr, nullptr, nullptr, napi_default, nullptr},

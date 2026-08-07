@@ -1,0 +1,30 @@
+{
+  "voiceId": "yuhome_current_female_v1",
+  "reference": {
+    "audio": "reference/voice_reference_16k.wav",
+    "text": "声纹验证未通过，指令已拒绝。",
+    "consentConfirmed": true
+  },
+  "outputs": [
+    {
+      "id": "light_status_on",
+      "text": "客厅灯当前开着。",
+      "file": "light_status_on.wav"
+    },
+    {
+      "id": "light_status_off",
+      "text": "客厅灯当前关着。",
+      "file": "light_status_off.wav"
+    },
+    {
+      "id": "temperature_sample",
+      "text": "当前室内温度为二十六度。",
+      "file": "temperature_sample.wav"
+    },
+    {
+      "id": "dynamic_sentence_sample",
+      "text": "现在客厅灯关着，空调设定温度是二十六度。",
+      "file": "dynamic_sentence_sample.wav"
+    }
+  ]
+}

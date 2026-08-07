@@ -1,17 +1,38 @@
 import { Context } from '@ohos.abilityAccessCtrl'
-import voiceInference, { VoiceNativeDecodeResult, VoiceNativeInitResult, VoiceNativeSpeakerResult } from 'libvoice_inference.so'
+import voiceInference, { VoiceNativeDecodeResult, VoiceNativeInitResult, VoiceNativeNluInitResult,
+  VoiceNativeNluResult, VoiceNativeSpeakerResult } from 'libvoice_inference.so'
 import { VoiceAudioBridge } from './VoiceAudioBridge'
 import { VoiceIntent, VoiceIntentParser, VoiceIntentType } from './VoiceIntentParser'
 import { SpeakerMatchResult, SpeakerProfileManager } from './SpeakerProfileManager'
+import { createPerformanceTrace, emitPerformanceEvent } from '../performance/PerformanceTrace'
 
 const COMMAND_TIMEOUT_MS: number = 7000
 const EARLY_INTENT_STABLE_MS: number = 700
 const WAKE_AUDIO_SECONDS: number = 2
 const ENROLLMENT_MIN_SPEECH_SECONDS: number = 0.7
-const PROMPT_AWAKE: string = 'voice/prompts/awake.wav'
-const PROMPT_SUCCESS: string = 'voice/prompts/light_on_ok.wav'
-const PROMPT_FAILED: string = 'voice/prompts/failed.wav'
-const PROMPT_VOICEPRINT_DENIED: string = 'voice/prompts/voiceprint_denied.wav'
+const PROMPT_AWAKE: string = 'voice/prompts/generated/fixed/awake.wav'
+const PROMPT_SUCCESS: string = 'voice/prompts/generated/fixed/generic_success.wav'
+const PROMPT_FAILED: string = 'voice/prompts/generated/fixed/generic_failed.wav'
+const PROMPT_NOT_HEARD: string = 'voice/prompts/generated/fixed/not_heard.wav'
+const PROMPT_UNSUPPORTED: string = 'voice/prompts/generated/fixed/unsupported.wav'
+const PROMPT_VOICEPRINT_DENIED: string = 'voice/prompts/generated/fixed/voiceprint_denied.wav'
+const NLU_VOCABULARY_PATH: string = 'voice/nlu/vocab.txt'
+const NLU_PREFER_HYBRID: boolean = true
+
+interface NluModelCandidate {
+  path: string
+  variant: string
+}
+
+const NLU_HYBRID: NluModelCandidate = {
+  path: 'voice/nlu/hierarchical_nlu.hybrid_int8.onnx',
+  variant: 'hybrid_int8'
+}
+
+const NLU_FP32: NluModelCandidate = {
+  path: 'voice/nlu/hierarchical_nlu.fp32.onnx',
+  variant: 'fp32'
+}
 
 interface KeywordResultJson {
   keyword: string
@@ -39,6 +60,8 @@ export interface VoiceExecutionResult {
   success: boolean
   message: string
   promptRawFile?: string
+  promptRawFiles?: string[]
+  skipPrompt?: boolean
 }
 
 export interface VoiceAssistantCallbacks {
@@ -77,6 +100,10 @@ export class VoiceAssistant {
   private enrollmentReject: ((error: Error) => void) | null = null
   private enrollmentSpeechSamples: number = 0
   private enrollmentSampleRate: number = 16000
+  private performanceTraceId: string = ''
+  private performanceFirstAsrLogged: boolean = false
+  private nluModelReady: boolean = false
+  private nluModelVariant: string = ''
 
   constructor() {
     this.audio.setCallbacks({
@@ -172,7 +199,7 @@ export class VoiceAssistant {
       }
       this.resetWakeDecodeQueue()
       this.setState(VoiceAssistantState.WAITING_WAKE, '请说“小禹小禹”')
-      this.initializeSpeakerModel(context)
+      this.initializeBackgroundModels(context)
     } catch (err) {
       this.running = false
       const message = (err as Error).message
@@ -201,6 +228,8 @@ export class VoiceAssistant {
     this.resetWakeDecodeQueue()
     await this.audio.release()
     voiceInference.release()
+    this.nluModelReady = false
+    this.nluModelVariant = ''
     this.context = null
     this.transcript = ''
     this.setState(VoiceAssistantState.STOPPED, '语音助手已停止')
@@ -240,6 +269,40 @@ export class VoiceAssistant {
       }
       console.info(`[VoiceAssistant][speaker-native-fail] ${message}`)
     }
+  }
+
+  private async initializeBackgroundModels(context: Context): Promise<void> {
+    await this.initializeSpeakerModel(context)
+    if (this.running) {
+      await this.initializeNluModel(context)
+    }
+  }
+
+  private async initializeNluModel(context: Context): Promise<void> {
+    const candidates: NluModelCandidate[] = NLU_PREFER_HYBRID ?
+      [NLU_HYBRID, NLU_FP32] : [NLU_FP32, NLU_HYBRID]
+    this.nluModelReady = false
+    this.nluModelVariant = ''
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i]
+      try {
+        const result: VoiceNativeNluInitResult = await voiceInference.initializeNlu(
+          context.resourceManager, candidate.path, NLU_VOCABULARY_PATH, candidate.variant)
+        if (!this.running) {
+          return
+        }
+        console.info(`[VoiceAssistant][nlu-native] variant=${candidate.variant} ready=${result.ready} ` +
+          `runtime=${result.runtimeVersion} message=${result.message}`)
+        if (result.success && result.ready) {
+          this.nluModelReady = true
+          this.nluModelVariant = result.modelVariant
+          return
+        }
+      } catch (err) {
+        console.info(`[VoiceAssistant][nlu-native-fail] variant=${candidate.variant} ${(err as Error).message}`)
+      }
+    }
+    console.info('[VoiceAssistant][nlu-fallback] native NLU unavailable; using deterministic parser')
   }
 
   private handlePcm16(samples: ArrayBuffer, sampleRate: number): void {
@@ -292,6 +355,9 @@ export class VoiceAssistant {
         const result = JSON.parse(json) as KeywordResultJson
         if (result.keyword.length > 0) {
           console.info(`[VoiceAssistant][wake] ${result.keyword}`)
+          this.performanceTraceId = createPerformanceTrace('voice')
+          this.performanceFirstAsrLogged = false
+          emitPerformanceEvent(this.performanceTraceId, 'voice', 'wake_detected', 0, true, result.keyword)
           this.wakeDecodeGeneration += 1
           this.wakeDecodeQueue = []
           this.wakeDecodeQueuedSamples = 0
@@ -353,6 +419,7 @@ export class VoiceAssistant {
     }
     this.clearWakeAudioRing()
     this.setState(VoiceAssistantState.LISTENING_COMMAND, '我在听，请说指令')
+    emitPerformanceEvent(this.performanceTraceId, 'voice', 'command_listen_start')
     this.clearCommandTimer()
     this.commandTimerId = setTimeout(() => {
       this.finishCommand().catch((err: Error) => {
@@ -373,6 +440,10 @@ export class VoiceAssistant {
     if (result.text.length > 0 && result.text !== this.transcript) {
       this.transcript = result.text
       console.info(`[VoiceAssistant][asr] ${this.transcript}`)
+      if (!this.performanceFirstAsrLogged) {
+        this.performanceFirstAsrLogged = true
+        emitPerformanceEvent(this.performanceTraceId, 'voice', 'asr_first_result', 0, true, this.transcript)
+      }
       this.setState(VoiceAssistantState.RECOGNIZING, '正在识别指令', this.transcript)
       this.scheduleEarlyIntentCommit()
     }
@@ -398,28 +469,50 @@ export class VoiceAssistant {
       this.transcript = result.text
     }
     console.info(`[VoiceAssistant][asr-final] ${this.transcript.length > 0 ? this.transcript : '<empty>'}`)
+    emitPerformanceEvent(this.performanceTraceId, 'voice', 'asr_final', 0,
+      this.transcript.length > 0, this.transcript.length > 0 ? this.transcript : '<empty>')
 
     if (this.transcript.length === 0) {
       this.cancelCommandSpeakerStream()
-      await this.completeWithFailure('没有听清，请重新唤醒')
+      await this.completeWithFailure('没有听清，请重新唤醒', PROMPT_NOT_HEARD)
       return
     }
 
     const speakerFailure = this.verifyCurrentSpeaker()
     if (speakerFailure.length > 0) {
+      emitPerformanceEvent(this.performanceTraceId, 'voice', 'voiceprint_rejected', 0, false, speakerFailure)
       const prompt = speakerFailure.indexOf('声纹验证未通过') === 0 ?
         PROMPT_VOICEPRINT_DENIED : PROMPT_FAILED
       await this.completeWithFailure(speakerFailure, prompt)
       return
     }
 
-    const intent = this.parser.parse(this.transcript)
+    const explicitClauses = this.parser.splitExplicitControlClauses(this.transcript)
+    if (explicitClauses.length > 0) {
+      const intents: VoiceIntent[] = []
+      for (const clause of explicitClauses) {
+        const clauseIntent = await this.resolveIntent(clause)
+        if (!this.isExplicitControlIntent(clauseIntent)) {
+          intents.length = 0
+          break
+        }
+        intents.push(clauseIntent)
+      }
+      if (intents.length === explicitClauses.length) {
+        await this.executeExplicitControlIntents(intents)
+        return
+      }
+    }
+
+    const intent = await this.resolveIntent(this.transcript)
+    emitPerformanceEvent(this.performanceTraceId, 'voice', 'intent_parsed', 0,
+      intent.type !== VoiceIntentType.UNKNOWN, `${intent.type}`)
     if (intent.type === VoiceIntentType.REQUIRES_CONFIRMATION) {
       await this.completeWithFailure('门锁指令需要人脸或手动确认')
       return
     }
     if (intent.type === VoiceIntentType.UNKNOWN) {
-      await this.completeWithFailure('暂时不支持这个指令')
+      await this.completeWithFailure('暂时不支持这个指令', PROMPT_UNSUPPORTED)
       return
     }
     if (this.callbacks === null) {
@@ -428,6 +521,7 @@ export class VoiceAssistant {
     }
 
     this.setState(VoiceAssistantState.EXECUTING, '正在执行', this.transcript)
+    emitPerformanceEvent(this.performanceTraceId, 'voice', 'execution_start')
     let execution: VoiceExecutionResult
     try {
       execution = await this.callbacks.onExecuteIntent(intent)
@@ -435,15 +529,100 @@ export class VoiceAssistant {
       execution = { success: false, message: (err as Error).message }
     }
     if (execution.success) {
+      emitPerformanceEvent(this.performanceTraceId, 'voice', 'execution_result', 0, true, execution.message)
       this.setState(VoiceAssistantState.SUCCEEDED, execution.message, this.transcript)
-      await this.playResultPrompt(execution.promptRawFile ?? PROMPT_SUCCESS)
+      if (!execution.skipPrompt) {
+        const promptFiles = execution.promptRawFiles ?? [execution.promptRawFile ?? PROMPT_SUCCESS]
+        for (const promptFile of promptFiles) {
+          await this.playResultPrompt(promptFile)
+        }
+      }
       this.resumeWakeListening(execution.message)
     } else {
-      await this.completeWithFailure(execution.message)
+      emitPerformanceEvent(this.performanceTraceId, 'voice', 'execution_result', 0, false, execution.message)
+      await this.completeWithFailure(execution.message, execution.promptRawFile ?? PROMPT_FAILED)
     }
   }
 
+  private isExplicitControlIntent(intent: VoiceIntent): boolean {
+    return intent.type === VoiceIntentType.LIGHT_SET ||
+      intent.type === VoiceIntentType.CURTAIN_SET ||
+      intent.type === VoiceIntentType.AC_SET ||
+      intent.type === VoiceIntentType.AC_TEMPERATURE_SET ||
+      intent.type === VoiceIntentType.AC_MODE_SET
+  }
+
+  private async executeExplicitControlIntents(intents: VoiceIntent[]): Promise<void> {
+    if (this.callbacks === null) {
+      await this.completeWithFailure('语音执行器未连接')
+      return
+    }
+    this.setState(VoiceAssistantState.EXECUTING, '正在执行', this.transcript)
+    emitPerformanceEvent(this.performanceTraceId, 'voice', 'execution_start', 0, true, `multi:${intents.length}`)
+    for (let i = 0; i < intents.length; i++) {
+      let execution: VoiceExecutionResult
+      try {
+        execution = await this.callbacks.onExecuteIntent(intents[i])
+      } catch (err) {
+        execution = { success: false, message: (err as Error).message }
+      }
+      if (!execution.success) {
+        const message = `第${i + 1}项操作失败: ${execution.message}`
+        emitPerformanceEvent(this.performanceTraceId, 'voice', 'execution_result', 0, false, message)
+        await this.completeWithFailure(message, execution.promptRawFile ?? PROMPT_FAILED)
+        return
+      }
+    }
+    const message = `已完成${intents.length}项设备操作`
+    emitPerformanceEvent(this.performanceTraceId, 'voice', 'execution_result', 0, true, message)
+    this.setState(VoiceAssistantState.SUCCEEDED, message, this.transcript)
+    await this.playResultPrompt(PROMPT_SUCCESS)
+    this.resumeWakeListening(message)
+  }
+
+  private async resolveIntent(text: string): Promise<VoiceIntent> {
+    const hardIntent = this.parser.parseHardRule(text)
+    if (hardIntent !== null) {
+      console.info(`[VoiceAssistant][nlu-hard-rule] ${text} -> ${hardIntent.type}`)
+      emitPerformanceEvent(this.performanceTraceId, 'voice', 'nlu_hard_rule', 0, true, `${hardIntent.type}`)
+      return hardIntent
+    }
+    const deterministicIntent = this.parser.parse(text)
+    if (deterministicIntent.type !== VoiceIntentType.UNKNOWN) {
+      console.info(`[VoiceAssistant][nlu-deterministic] ${text} -> ${deterministicIntent.type}`)
+      emitPerformanceEvent(this.performanceTraceId, 'voice', 'nlu_deterministic', 0, true,
+        `${deterministicIntent.type}`)
+      return deterministicIntent
+    }
+    if (this.nluModelReady) {
+      try {
+        const result: VoiceNativeNluResult = await voiceInference.classifyNlu(text)
+        console.info(`[VoiceAssistant][nlu] variant=${result.modelVariant} label=${result.label} ` +
+          `route=${result.route} routeConf=${result.routeConfidence.toFixed(3)} ` +
+          `intentConf=${result.intentConfidence.toFixed(3)} latencyMs=${result.latencyMs.toFixed(2)}`)
+        emitPerformanceEvent(this.performanceTraceId, 'voice', 'nlu_inference', result.latencyMs,
+          result.success, `${result.modelVariant}:${result.label}`)
+        if (result.success) {
+          const modelIntent = this.parser.parseModelLabel(text, result.label)
+          if (modelIntent.type !== VoiceIntentType.UNKNOWN) {
+            return modelIntent
+          }
+          console.info(`[VoiceAssistant][nlu-model-unknown] ${text}; trying deterministic fallback`)
+        } else {
+          console.info(`[VoiceAssistant][nlu-inference-fail] ${result.message}`)
+        }
+      } catch (err) {
+        console.info(`[VoiceAssistant][nlu-inference-error] ${(err as Error).message}`)
+      }
+    }
+    const fallback = this.parser.parse(text)
+    emitPerformanceEvent(this.performanceTraceId, 'voice', 'nlu_rule_fallback', 0,
+      fallback.type !== VoiceIntentType.UNKNOWN, `${fallback.type}`)
+    return fallback
+  }
+
   private async completeWithFailure(message: string, promptRawFile: string = PROMPT_FAILED): Promise<void> {
+    emitPerformanceEvent(this.performanceTraceId, 'voice', 'flow_failed', 0, false, message)
     this.setState(VoiceAssistantState.FAILED, message, this.transcript)
     await this.playResultPrompt(promptRawFile)
     this.resumeWakeListening(message)

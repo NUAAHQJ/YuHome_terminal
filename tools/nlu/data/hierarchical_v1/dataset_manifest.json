@@ -1,0 +1,198 @@
+{
+  "dataset": "yuhome_hierarchical_nlu",
+  "version": 1,
+  "seed": 20260802,
+  "split_strategy": "expression_template_family",
+  "labels": [
+    "light_set",
+    "ac_power_set",
+    "curtain_set",
+    "ac_temperature_set",
+    "ac_mode_set",
+    "light_status_query",
+    "curtain_status_query",
+    "ac_status_query",
+    "door_status_query",
+    "temperature_query",
+    "humidity_query",
+    "environment_query",
+    "alarm_status_query",
+    "requires_confirmation",
+    "unknown"
+  ],
+  "files": {
+    "train": {
+      "file": "train.jsonl",
+      "samples": 2856,
+      "families": 193,
+      "intent_counts": {
+        "ac_mode_set": 156,
+        "ac_power_set": 192,
+        "ac_status_query": 126,
+        "ac_temperature_set": 156,
+        "alarm_status_query": 143,
+        "curtain_set": 414,
+        "curtain_status_query": 126,
+        "door_status_query": 120,
+        "environment_query": 151,
+        "humidity_query": 154,
+        "light_set": 192,
+        "light_status_query": 126,
+        "requires_confirmation": 280,
+        "temperature_query": 149,
+        "unknown": 371
+      },
+      "route_counts": {
+        "in_domain": 2205,
+        "requires_confirmation": 280,
+        "unknown": 371
+      },
+      "safety_case_counts": {
+        "asr_hardening": 302,
+        "cancelled_control": 114,
+        "open_domain": 257,
+        "sensitive_action": 280
+      },
+      "sha256": "7a53784c5636ac4eaf8236f1ba2d3d67071f76ba030d37e9d812c1a1385feee1"
+    },
+    "validation": {
+      "file": "validation.jsonl",
+      "samples": 386,
+      "families": 50,
+      "intent_counts": {
+        "ac_mode_set": 32,
+        "ac_power_set": 32,
+        "ac_status_query": 15,
+        "ac_temperature_set": 16,
+        "alarm_status_query": 30,
+        "curtain_set": 48,
+        "curtain_status_query": 15,
+        "door_status_query": 15,
+        "environment_query": 15,
+        "humidity_query": 15,
+        "light_set": 32,
+        "light_status_query": 15,
+        "requires_confirmation": 45,
+        "temperature_query": 15,
+        "unknown": 46
+      },
+      "route_counts": {
+        "in_domain": 295,
+        "requires_confirmation": 45,
+        "unknown": 46
+      },
+      "safety_case_counts": {
+        "cancelled_control": 16,
+        "open_domain": 30,
+        "sensitive_action": 45
+      },
+      "sha256": "e91804bf6d0bd841af2a319110d545440b0f202529381e81107f3b25aa350225"
+    },
+    "test": {
+      "file": "test.jsonl",
+      "samples": 412,
+      "families": 53,
+      "intent_counts": {
+        "ac_mode_set": 36,
+        "ac_power_set": 32,
+        "ac_status_query": 20,
+        "ac_temperature_set": 20,
+        "alarm_status_query": 20,
+        "curtain_set": 32,
+        "curtain_status_query": 20,
+        "door_status_query": 20,
+        "environment_query": 20,
+        "humidity_query": 20,
+        "light_set": 32,
+        "light_status_query": 20,
+        "requires_confirmation": 43,
+        "temperature_query": 20,
+        "unknown": 57
+      },
+      "route_counts": {
+        "in_domain": 312,
+        "requires_confirmation": 43,
+        "unknown": 57
+      },
+      "safety_case_counts": {
+        "cancelled_control": 25,
+        "open_domain": 32,
+        "sensitive_action": 43
+      },
+      "sha256": "8a9f2c796139ec923bfd7bd87362acc7632500ad0805812d4e613124825f1efe"
+    },
+    "asr_noise_test": {
+      "file": "asr_noise_test.jsonl",
+      "samples": 298,
+      "families": 72,
+      "intent_counts": {
+        "ac_mode_set": 16,
+        "ac_power_set": 16,
+        "ac_status_query": 16,
+        "ac_temperature_set": 16,
+        "alarm_status_query": 16,
+        "curtain_set": 16,
+        "curtain_status_query": 16,
+        "door_status_query": 16,
+        "environment_query": 16,
+        "humidity_query": 16,
+        "light_set": 16,
+        "light_status_query": 16,
+        "requires_confirmation": 54,
+        "temperature_query": 16,
+        "unknown": 36
+      },
+      "route_counts": {
+        "in_domain": 208,
+        "requires_confirmation": 54,
+        "unknown": 36
+      },
+      "safety_case_counts": {
+        "cancelled_control_asr": 20,
+        "open_domain": 16,
+        "sensitive_action": 16,
+        "sensitive_action_asr": 38
+      },
+      "sha256": "8f22cd7ac81c313ee7e48027d03261fceba4b5d022f8ac13f9a5c4b84b878ac6"
+    },
+    "boundary_test": {
+      "file": "boundary_test.jsonl",
+      "samples": 24,
+      "families": 4,
+      "intent_counts": {
+        "ac_temperature_set": 12,
+        "curtain_set": 12
+      },
+      "route_counts": {
+        "in_domain": 24
+      },
+      "safety_case_counts": {},
+      "sha256": "9a94e4e1b0ffabd0ffc4a9defdde67f97d7d67708cc864319f191e010d4eae27"
+    },
+    "safety_adversarial_test": {
+      "file": "safety_adversarial_test.jsonl",
+      "samples": 100,
+      "families": 22,
+      "intent_counts": {
+        "ac_power_set": 2,
+        "curtain_set": 1,
+        "door_status_query": 5,
+        "light_set": 2,
+        "requires_confirmation": 47,
+        "unknown": 43
+      },
+      "route_counts": {
+        "in_domain": 10,
+        "requires_confirmation": 47,
+        "unknown": 43
+      },
+      "safety_case_counts": {
+        "cancelled_control": 40,
+        "door_query_or_ood": 8,
+        "positive_control": 5,
+        "sensitive_action": 47
+      },
+      "sha256": "367e53129278e86411ad3a6131244f26e2098a35a7d034b9638e938088451076"
+    }
+  }
+}

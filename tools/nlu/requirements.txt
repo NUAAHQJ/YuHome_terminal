@@ -1,0 +1,6 @@
+torch>=2.1
+transformers>=4.40,<6
+scikit-learn>=1.4
+onnx>=1.16
+onnxruntime>=1.17
+safetensors>=0.4

@@ -1,0 +1,2377 @@
+{
+  "voiceId": "yuhome_current_female_v1",
+  "reference": {
+    "audio": "reference/voice_reference_16k.wav",
+    "text": "声纹验证未通过，指令已拒绝。",
+    "consentConfirmed": true
+  },
+  "ranges": {
+    "temperatureTenths": {
+      "min": 200,
+      "max": 300,
+      "step": 1
+    },
+    "humidityInteger": {
+      "min": 0,
+      "max": 100,
+      "step": 1
+    },
+    "curtainPercent": {
+      "min": 0,
+      "max": 100,
+      "step": 1
+    },
+    "acTemperature": {
+      "min": 20,
+      "max": 30,
+      "step": 1
+    }
+  },
+  "outputs": [
+    {
+      "id": "awake",
+      "text": "我在，请说。",
+      "file": "fixed/awake.wav"
+    },
+    {
+      "id": "generic_success",
+      "text": "操作已完成。",
+      "file": "fixed/generic_success.wav"
+    },
+    {
+      "id": "generic_failed",
+      "text": "抱歉，执行失败，请再试一次。",
+      "file": "fixed/generic_failed.wav"
+    },
+    {
+      "id": "unsupported",
+      "text": "暂时不支持这个语音指令。",
+      "file": "fixed/unsupported.wav"
+    },
+    {
+      "id": "not_heard",
+      "text": "没有听清，请重新唤醒。",
+      "file": "fixed/not_heard.wav"
+    },
+    {
+      "id": "sensor_unavailable",
+      "text": "暂未收到温湿度传感器数据。",
+      "file": "fixed/sensor_unavailable.wav"
+    },
+    {
+      "id": "device_unavailable",
+      "text": "设备暂时无法连接，请稍后再试。",
+      "file": "fixed/device_unavailable.wav"
+    },
+    {
+      "id": "voiceprint_denied",
+      "text": "声纹验证未通过，指令已拒绝。",
+      "file": "fixed/voiceprint_denied.wav"
+    },
+    {
+      "id": "light_status_on",
+      "text": "客厅灯当前开着。",
+      "file": "fixed/light_status_on.wav"
+    },
+    {
+      "id": "light_status_off",
+      "text": "客厅灯当前关着。",
+      "file": "fixed/light_status_off.wav"
+    },
+    {
+      "id": "light_set_on",
+      "text": "客厅灯开启指令已发送。",
+      "file": "fixed/light_set_on.wav"
+    },
+    {
+      "id": "light_set_off",
+      "text": "客厅灯关闭指令已发送。",
+      "file": "fixed/light_set_off.wav"
+    },
+    {
+      "id": "ac_status_off",
+      "text": "空调当前已关闭。",
+      "file": "fixed/ac_status_off.wav"
+    },
+    {
+      "id": "ac_mode_cool",
+      "text": "空调已切换为制冷模式。",
+      "file": "fixed/ac_mode_cool.wav"
+    },
+    {
+      "id": "ac_mode_heat",
+      "text": "空调已切换为制热模式。",
+      "file": "fixed/ac_mode_heat.wav"
+    },
+    {
+      "id": "ac_set_on",
+      "text": "空调开启指令已发送。",
+      "file": "fixed/ac_set_on.wav"
+    },
+    {
+      "id": "ac_set_off",
+      "text": "空调关闭指令已发送。",
+      "file": "fixed/ac_set_off.wav"
+    },
+    {
+      "id": "goal_comfort_warmer",
+      "text": "已调整为制热模式。",
+      "file": "fixed/goal_comfort_warmer.wav"
+    },
+    {
+      "id": "goal_comfort_cooler",
+      "text": "已调整为制冷模式。",
+      "file": "fixed/goal_comfort_cooler.wav"
+    },
+    {
+      "id": "goal_sleep_scene",
+      "text": "已为你调整睡眠环境。",
+      "file": "fixed/goal_sleep_scene.wav"
+    },
+    {
+      "id": "goal_away_scene",
+      "text": "已为你设置离家场景。",
+      "file": "fixed/goal_away_scene.wav"
+    },
+    {
+      "id": "goal_home_scene",
+      "text": "已为你准备回家环境。",
+      "file": "fixed/goal_home_scene.wav"
+    },
+    {
+      "id": "door_open_locked",
+      "text": "门当前开着，门锁已上锁。",
+      "file": "fixed/door_open_locked.wav"
+    },
+    {
+      "id": "door_open_unlocked",
+      "text": "门当前开着，门锁已解锁。",
+      "file": "fixed/door_open_unlocked.wav"
+    },
+    {
+      "id": "door_closed_locked",
+      "text": "门当前关着，门锁已上锁。",
+      "file": "fixed/door_closed_locked.wav"
+    },
+    {
+      "id": "door_closed_unlocked",
+      "text": "门当前关着，门锁已解锁。",
+      "file": "fixed/door_closed_unlocked.wav"
+    },
+    {
+      "id": "door_lock_locked",
+      "text": "门锁当前已上锁。",
+      "file": "fixed/door_lock_locked.wav"
+    },
+    {
+      "id": "door_lock_unlocked",
+      "text": "门锁当前已解锁。",
+      "file": "fixed/door_lock_unlocked.wav"
+    },
+    {
+      "id": "alarm_smoke_water",
+      "text": "当前存在烟雾和水浸报警。",
+      "file": "fixed/alarm_smoke_water.wav"
+    },
+    {
+      "id": "alarm_smoke",
+      "text": "当前存在烟雾报警。",
+      "file": "fixed/alarm_smoke.wav"
+    },
+    {
+      "id": "alarm_water",
+      "text": "当前存在水浸报警。",
+      "file": "fixed/alarm_water.wav"
+    },
+    {
+      "id": "alarm_clear",
+      "text": "当前没有烟雾或水浸报警。",
+      "file": "fixed/alarm_clear.wav"
+    },
+    {
+      "id": "temperature_200",
+      "text": "当前室内温度为二十度。",
+      "file": "temperature/temperature_200.wav"
+    },
+    {
+      "id": "temperature_201",
+      "text": "当前室内温度为二十点一度。",
+      "file": "temperature/temperature_201.wav"
+    },
+    {
+      "id": "temperature_202",
+      "text": "当前室内温度为二十点二度。",
+      "file": "temperature/temperature_202.wav"
+    },
+    {
+      "id": "temperature_203",
+      "text": "当前室内温度为二十点三度。",
+      "file": "temperature/temperature_203.wav"
+    },
+    {
+      "id": "temperature_204",
+      "text": "当前室内温度为二十点四度。",
+      "file": "temperature/temperature_204.wav"
+    },
+    {
+      "id": "temperature_205",
+      "text": "当前室内温度为二十点五度。",
+      "file": "temperature/temperature_205.wav"
+    },
+    {
+      "id": "temperature_206",
+      "text": "当前室内温度为二十点六度。",
+      "file": "temperature/temperature_206.wav"
+    },
+    {
+      "id": "temperature_207",
+      "text": "当前室内温度为二十点七度。",
+      "file": "temperature/temperature_207.wav"
+    },
+    {
+      "id": "temperature_208",
+      "text": "当前室内温度为二十点八度。",
+      "file": "temperature/temperature_208.wav"
+    },
+    {
+      "id": "temperature_209",
+      "text": "当前室内温度为二十点九度。",
+      "file": "temperature/temperature_209.wav"
+    },
+    {
+      "id": "temperature_210",
+      "text": "当前室内温度为二十一度。",
+      "file": "temperature/temperature_210.wav"
+    },
+    {
+      "id": "temperature_211",
+      "text": "当前室内温度为二十一点一度。",
+      "file": "temperature/temperature_211.wav"
+    },
+    {
+      "id": "temperature_212",
+      "text": "当前室内温度为二十一点二度。",
+      "file": "temperature/temperature_212.wav"
+    },
+    {
+      "id": "temperature_213",
+      "text": "当前室内温度为二十一点三度。",
+      "file": "temperature/temperature_213.wav"
+    },
+    {
+      "id": "temperature_214",
+      "text": "当前室内温度为二十一点四度。",
+      "file": "temperature/temperature_214.wav"
+    },
+    {
+      "id": "temperature_215",
+      "text": "当前室内温度为二十一点五度。",
+      "file": "temperature/temperature_215.wav"
+    },
+    {
+      "id": "temperature_216",
+      "text": "当前室内温度为二十一点六度。",
+      "file": "temperature/temperature_216.wav"
+    },
+    {
+      "id": "temperature_217",
+      "text": "当前室内温度为二十一点七度。",
+      "file": "temperature/temperature_217.wav"
+    },
+    {
+      "id": "temperature_218",
+      "text": "当前室内温度为二十一点八度。",
+      "file": "temperature/temperature_218.wav"
+    },
+    {
+      "id": "temperature_219",
+      "text": "当前室内温度为二十一点九度。",
+      "file": "temperature/temperature_219.wav"
+    },
+    {
+      "id": "temperature_220",
+      "text": "当前室内温度为二十二度。",
+      "file": "temperature/temperature_220.wav"
+    },
+    {
+      "id": "temperature_221",
+      "text": "当前室内温度为二十二点一度。",
+      "file": "temperature/temperature_221.wav"
+    },
+    {
+      "id": "temperature_222",
+      "text": "当前室内温度为二十二点二度。",
+      "file": "temperature/temperature_222.wav"
+    },
+    {
+      "id": "temperature_223",
+      "text": "当前室内温度为二十二点三度。",
+      "file": "temperature/temperature_223.wav"
+    },
+    {
+      "id": "temperature_224",
+      "text": "当前室内温度为二十二点四度。",
+      "file": "temperature/temperature_224.wav"
+    },
+    {
+      "id": "temperature_225",
+      "text": "当前室内温度为二十二点五度。",
+      "file": "temperature/temperature_225.wav"
+    },
+    {
+      "id": "temperature_226",
+      "text": "当前室内温度为二十二点六度。",
+      "file": "temperature/temperature_226.wav"
+    },
+    {
+      "id": "temperature_227",
+      "text": "当前室内温度为二十二点七度。",
+      "file": "temperature/temperature_227.wav"
+    },
+    {
+      "id": "temperature_228",
+      "text": "当前室内温度为二十二点八度。",
+      "file": "temperature/temperature_228.wav"
+    },
+    {
+      "id": "temperature_229",
+      "text": "当前室内温度为二十二点九度。",
+      "file": "temperature/temperature_229.wav"
+    },
+    {
+      "id": "temperature_230",
+      "text": "当前室内温度为二十三度。",
+      "file": "temperature/temperature_230.wav"
+    },
+    {
+      "id": "temperature_231",
+      "text": "当前室内温度为二十三点一度。",
+      "file": "temperature/temperature_231.wav"
+    },
+    {
+      "id": "temperature_232",
+      "text": "当前室内温度为二十三点二度。",
+      "file": "temperature/temperature_232.wav"
+    },
+    {
+      "id": "temperature_233",
+      "text": "当前室内温度为二十三点三度。",
+      "file": "temperature/temperature_233.wav"
+    },
+    {
+      "id": "temperature_234",
+      "text": "当前室内温度为二十三点四度。",
+      "file": "temperature/temperature_234.wav"
+    },
+    {
+      "id": "temperature_235",
+      "text": "当前室内温度为二十三点五度。",
+      "file": "temperature/temperature_235.wav"
+    },
+    {
+      "id": "temperature_236",
+      "text": "当前室内温度为二十三点六度。",
+      "file": "temperature/temperature_236.wav"
+    },
+    {
+      "id": "temperature_237",
+      "text": "当前室内温度为二十三点七度。",
+      "file": "temperature/temperature_237.wav"
+    },
+    {
+      "id": "temperature_238",
+      "text": "当前室内温度为二十三点八度。",
+      "file": "temperature/temperature_238.wav"
+    },
+    {
+      "id": "temperature_239",
+      "text": "当前室内温度为二十三点九度。",
+      "file": "temperature/temperature_239.wav"
+    },
+    {
+      "id": "temperature_240",
+      "text": "当前室内温度为二十四度。",
+      "file": "temperature/temperature_240.wav"
+    },
+    {
+      "id": "temperature_241",
+      "text": "当前室内温度为二十四点一度。",
+      "file": "temperature/temperature_241.wav"
+    },
+    {
+      "id": "temperature_242",
+      "text": "当前室内温度为二十四点二度。",
+      "file": "temperature/temperature_242.wav"
+    },
+    {
+      "id": "temperature_243",
+      "text": "当前室内温度为二十四点三度。",
+      "file": "temperature/temperature_243.wav"
+    },
+    {
+      "id": "temperature_244",
+      "text": "当前室内温度为二十四点四度。",
+      "file": "temperature/temperature_244.wav"
+    },
+    {
+      "id": "temperature_245",
+      "text": "当前室内温度为二十四点五度。",
+      "file": "temperature/temperature_245.wav"
+    },
+    {
+      "id": "temperature_246",
+      "text": "当前室内温度为二十四点六度。",
+      "file": "temperature/temperature_246.wav"
+    },
+    {
+      "id": "temperature_247",
+      "text": "当前室内温度为二十四点七度。",
+      "file": "temperature/temperature_247.wav"
+    },
+    {
+      "id": "temperature_248",
+      "text": "当前室内温度为二十四点八度。",
+      "file": "temperature/temperature_248.wav"
+    },
+    {
+      "id": "temperature_249",
+      "text": "当前室内温度为二十四点九度。",
+      "file": "temperature/temperature_249.wav"
+    },
+    {
+      "id": "temperature_250",
+      "text": "当前室内温度为二十五度。",
+      "file": "temperature/temperature_250.wav"
+    },
+    {
+      "id": "temperature_251",
+      "text": "当前室内温度为二十五点一度。",
+      "file": "temperature/temperature_251.wav"
+    },
+    {
+      "id": "temperature_252",
+      "text": "当前室内温度为二十五点二度。",
+      "file": "temperature/temperature_252.wav"
+    },
+    {
+      "id": "temperature_253",
+      "text": "当前室内温度为二十五点三度。",
+      "file": "temperature/temperature_253.wav"
+    },
+    {
+      "id": "temperature_254",
+      "text": "当前室内温度为二十五点四度。",
+      "file": "temperature/temperature_254.wav"
+    },
+    {
+      "id": "temperature_255",
+      "text": "当前室内温度为二十五点五度。",
+      "file": "temperature/temperature_255.wav"
+    },
+    {
+      "id": "temperature_256",
+      "text": "当前室内温度为二十五点六度。",
+      "file": "temperature/temperature_256.wav"
+    },
+    {
+      "id": "temperature_257",
+      "text": "当前室内温度为二十五点七度。",
+      "file": "temperature/temperature_257.wav"
+    },
+    {
+      "id": "temperature_258",
+      "text": "当前室内温度为二十五点八度。",
+      "file": "temperature/temperature_258.wav"
+    },
+    {
+      "id": "temperature_259",
+      "text": "当前室内温度为二十五点九度。",
+      "file": "temperature/temperature_259.wav"
+    },
+    {
+      "id": "temperature_260",
+      "text": "当前室内温度为二十六度。",
+      "file": "temperature/temperature_260.wav"
+    },
+    {
+      "id": "temperature_261",
+      "text": "当前室内温度为二十六点一度。",
+      "file": "temperature/temperature_261.wav"
+    },
+    {
+      "id": "temperature_262",
+      "text": "当前室内温度为二十六点二度。",
+      "file": "temperature/temperature_262.wav"
+    },
+    {
+      "id": "temperature_263",
+      "text": "当前室内温度为二十六点三度。",
+      "file": "temperature/temperature_263.wav"
+    },
+    {
+      "id": "temperature_264",
+      "text": "当前室内温度为二十六点四度。",
+      "file": "temperature/temperature_264.wav"
+    },
+    {
+      "id": "temperature_265",
+      "text": "当前室内温度为二十六点五度。",
+      "file": "temperature/temperature_265.wav"
+    },
+    {
+      "id": "temperature_266",
+      "text": "当前室内温度为二十六点六度。",
+      "file": "temperature/temperature_266.wav"
+    },
+    {
+      "id": "temperature_267",
+      "text": "当前室内温度为二十六点七度。",
+      "file": "temperature/temperature_267.wav"
+    },
+    {
+      "id": "temperature_268",
+      "text": "当前室内温度为二十六点八度。",
+      "file": "temperature/temperature_268.wav"
+    },
+    {
+      "id": "temperature_269",
+      "text": "当前室内温度为二十六点九度。",
+      "file": "temperature/temperature_269.wav"
+    },
+    {
+      "id": "temperature_270",
+      "text": "当前室内温度为二十七度。",
+      "file": "temperature/temperature_270.wav"
+    },
+    {
+      "id": "temperature_271",
+      "text": "当前室内温度为二十七点一度。",
+      "file": "temperature/temperature_271.wav"
+    },
+    {
+      "id": "temperature_272",
+      "text": "当前室内温度为二十七点二度。",
+      "file": "temperature/temperature_272.wav"
+    },
+    {
+      "id": "temperature_273",
+      "text": "当前室内温度为二十七点三度。",
+      "file": "temperature/temperature_273.wav"
+    },
+    {
+      "id": "temperature_274",
+      "text": "当前室内温度为二十七点四度。",
+      "file": "temperature/temperature_274.wav"
+    },
+    {
+      "id": "temperature_275",
+      "text": "当前室内温度为二十七点五度。",
+      "file": "temperature/temperature_275.wav"
+    },
+    {
+      "id": "temperature_276",
+      "text": "当前室内温度为二十七点六度。",
+      "file": "temperature/temperature_276.wav"
+    },
+    {
+      "id": "temperature_277",
+      "text": "当前室内温度为二十七点七度。",
+      "file": "temperature/temperature_277.wav"
+    },
+    {
+      "id": "temperature_278",
+      "text": "当前室内温度为二十七点八度。",
+      "file": "temperature/temperature_278.wav"
+    },
+    {
+      "id": "temperature_279",
+      "text": "当前室内温度为二十七点九度。",
+      "file": "temperature/temperature_279.wav"
+    },
+    {
+      "id": "temperature_280",
+      "text": "当前室内温度为二十八度。",
+      "file": "temperature/temperature_280.wav"
+    },
+    {
+      "id": "temperature_281",
+      "text": "当前室内温度为二十八点一度。",
+      "file": "temperature/temperature_281.wav"
+    },
+    {
+      "id": "temperature_282",
+      "text": "当前室内温度为二十八点二度。",
+      "file": "temperature/temperature_282.wav"
+    },
+    {
+      "id": "temperature_283",
+      "text": "当前室内温度为二十八点三度。",
+      "file": "temperature/temperature_283.wav"
+    },
+    {
+      "id": "temperature_284",
+      "text": "当前室内温度为二十八点四度。",
+      "file": "temperature/temperature_284.wav"
+    },
+    {
+      "id": "temperature_285",
+      "text": "当前室内温度为二十八点五度。",
+      "file": "temperature/temperature_285.wav"
+    },
+    {
+      "id": "temperature_286",
+      "text": "当前室内温度为二十八点六度。",
+      "file": "temperature/temperature_286.wav"
+    },
+    {
+      "id": "temperature_287",
+      "text": "当前室内温度为二十八点七度。",
+      "file": "temperature/temperature_287.wav"
+    },
+    {
+      "id": "temperature_288",
+      "text": "当前室内温度为二十八点八度。",
+      "file": "temperature/temperature_288.wav"
+    },
+    {
+      "id": "temperature_289",
+      "text": "当前室内温度为二十八点九度。",
+      "file": "temperature/temperature_289.wav"
+    },
+    {
+      "id": "temperature_290",
+      "text": "当前室内温度为二十九度。",
+      "file": "temperature/temperature_290.wav"
+    },
+    {
+      "id": "temperature_291",
+      "text": "当前室内温度为二十九点一度。",
+      "file": "temperature/temperature_291.wav"
+    },
+    {
+      "id": "temperature_292",
+      "text": "当前室内温度为二十九点二度。",
+      "file": "temperature/temperature_292.wav"
+    },
+    {
+      "id": "temperature_293",
+      "text": "当前室内温度为二十九点三度。",
+      "file": "temperature/temperature_293.wav"
+    },
+    {
+      "id": "temperature_294",
+      "text": "当前室内温度为二十九点四度。",
+      "file": "temperature/temperature_294.wav"
+    },
+    {
+      "id": "temperature_295",
+      "text": "当前室内温度为二十九点五度。",
+      "file": "temperature/temperature_295.wav"
+    },
+    {
+      "id": "temperature_296",
+      "text": "当前室内温度为二十九点六度。",
+      "file": "temperature/temperature_296.wav"
+    },
+    {
+      "id": "temperature_297",
+      "text": "当前室内温度为二十九点七度。",
+      "file": "temperature/temperature_297.wav"
+    },
+    {
+      "id": "temperature_298",
+      "text": "当前室内温度为二十九点八度。",
+      "file": "temperature/temperature_298.wav"
+    },
+    {
+      "id": "temperature_299",
+      "text": "当前室内温度为二十九点九度。",
+      "file": "temperature/temperature_299.wav"
+    },
+    {
+      "id": "temperature_300",
+      "text": "当前室内温度为三十度。",
+      "file": "temperature/temperature_300.wav"
+    },
+    {
+      "id": "humidity_000",
+      "text": "当前室内湿度为百分之零。",
+      "file": "humidity/humidity_000.wav"
+    },
+    {
+      "id": "humidity_001",
+      "text": "当前室内湿度为百分之一。",
+      "file": "humidity/humidity_001.wav"
+    },
+    {
+      "id": "humidity_002",
+      "text": "当前室内湿度为百分之二。",
+      "file": "humidity/humidity_002.wav"
+    },
+    {
+      "id": "humidity_003",
+      "text": "当前室内湿度为百分之三。",
+      "file": "humidity/humidity_003.wav"
+    },
+    {
+      "id": "humidity_004",
+      "text": "当前室内湿度为百分之四。",
+      "file": "humidity/humidity_004.wav"
+    },
+    {
+      "id": "humidity_005",
+      "text": "当前室内湿度为百分之五。",
+      "file": "humidity/humidity_005.wav"
+    },
+    {
+      "id": "humidity_006",
+      "text": "当前室内湿度为百分之六。",
+      "file": "humidity/humidity_006.wav"
+    },
+    {
+      "id": "humidity_007",
+      "text": "当前室内湿度为百分之七。",
+      "file": "humidity/humidity_007.wav"
+    },
+    {
+      "id": "humidity_008",
+      "text": "当前室内湿度为百分之八。",
+      "file": "humidity/humidity_008.wav"
+    },
+    {
+      "id": "humidity_009",
+      "text": "当前室内湿度为百分之九。",
+      "file": "humidity/humidity_009.wav"
+    },
+    {
+      "id": "humidity_010",
+      "text": "当前室内湿度为百分之十。",
+      "file": "humidity/humidity_010.wav"
+    },
+    {
+      "id": "humidity_011",
+      "text": "当前室内湿度为百分之十一。",
+      "file": "humidity/humidity_011.wav"
+    },
+    {
+      "id": "humidity_012",
+      "text": "当前室内湿度为百分之十二。",
+      "file": "humidity/humidity_012.wav"
+    },
+    {
+      "id": "humidity_013",
+      "text": "当前室内湿度为百分之十三。",
+      "file": "humidity/humidity_013.wav"
+    },
+    {
+      "id": "humidity_014",
+      "text": "当前室内湿度为百分之十四。",
+      "file": "humidity/humidity_014.wav"
+    },
+    {
+      "id": "humidity_015",
+      "text": "当前室内湿度为百分之十五。",
+      "file": "humidity/humidity_015.wav"
+    },
+    {
+      "id": "humidity_016",
+      "text": "当前室内湿度为百分之十六。",
+      "file": "humidity/humidity_016.wav"
+    },
+    {
+      "id": "humidity_017",
+      "text": "当前室内湿度为百分之十七。",
+      "file": "humidity/humidity_017.wav"
+    },
+    {
+      "id": "humidity_018",
+      "text": "当前室内湿度为百分之十八。",
+      "file": "humidity/humidity_018.wav"
+    },
+    {
+      "id": "humidity_019",
+      "text": "当前室内湿度为百分之十九。",
+      "file": "humidity/humidity_019.wav"
+    },
+    {
+      "id": "humidity_020",
+      "text": "当前室内湿度为百分之二十。",
+      "file": "humidity/humidity_020.wav"
+    },
+    {
+      "id": "humidity_021",
+      "text": "当前室内湿度为百分之二十一。",
+      "file": "humidity/humidity_021.wav"
+    },
+    {
+      "id": "humidity_022",
+      "text": "当前室内湿度为百分之二十二。",
+      "file": "humidity/humidity_022.wav"
+    },
+    {
+      "id": "humidity_023",
+      "text": "当前室内湿度为百分之二十三。",
+      "file": "humidity/humidity_023.wav"
+    },
+    {
+      "id": "humidity_024",
+      "text": "当前室内湿度为百分之二十四。",
+      "file": "humidity/humidity_024.wav"
+    },
+    {
+      "id": "humidity_025",
+      "text": "当前室内湿度为百分之二十五。",
+      "file": "humidity/humidity_025.wav"
+    },
+    {
+      "id": "humidity_026",
+      "text": "当前室内湿度为百分之二十六。",
+      "file": "humidity/humidity_026.wav"
+    },
+    {
+      "id": "humidity_027",
+      "text": "当前室内湿度为百分之二十七。",
+      "file": "humidity/humidity_027.wav"
+    },
+    {
+      "id": "humidity_028",
+      "text": "当前室内湿度为百分之二十八。",
+      "file": "humidity/humidity_028.wav"
+    },
+    {
+      "id": "humidity_029",
+      "text": "当前室内湿度为百分之二十九。",
+      "file": "humidity/humidity_029.wav"
+    },
+    {
+      "id": "humidity_030",
+      "text": "当前室内湿度为百分之三十。",
+      "file": "humidity/humidity_030.wav"
+    },
+    {
+      "id": "humidity_031",
+      "text": "当前室内湿度为百分之三十一。",
+      "file": "humidity/humidity_031.wav"
+    },
+    {
+      "id": "humidity_032",
+      "text": "当前室内湿度为百分之三十二。",
+      "file": "humidity/humidity_032.wav"
+    },
+    {
+      "id": "humidity_033",
+      "text": "当前室内湿度为百分之三十三。",
+      "file": "humidity/humidity_033.wav"
+    },
+    {
+      "id": "humidity_034",
+      "text": "当前室内湿度为百分之三十四。",
+      "file": "humidity/humidity_034.wav"
+    },
+    {
+      "id": "humidity_035",
+      "text": "当前室内湿度为百分之三十五。",
+      "file": "humidity/humidity_035.wav"
+    },
+    {
+      "id": "humidity_036",
+      "text": "当前室内湿度为百分之三十六。",
+      "file": "humidity/humidity_036.wav"
+    },
+    {
+      "id": "humidity_037",
+      "text": "当前室内湿度为百分之三十七。",
+      "file": "humidity/humidity_037.wav"
+    },
+    {
+      "id": "humidity_038",
+      "text": "当前室内湿度为百分之三十八。",
+      "file": "humidity/humidity_038.wav"
+    },
+    {
+      "id": "humidity_039",
+      "text": "当前室内湿度为百分之三十九。",
+      "file": "humidity/humidity_039.wav"
+    },
+    {
+      "id": "humidity_040",
+      "text": "当前室内湿度为百分之四十。",
+      "file": "humidity/humidity_040.wav"
+    },
+    {
+      "id": "humidity_041",
+      "text": "当前室内湿度为百分之四十一。",
+      "file": "humidity/humidity_041.wav"
+    },
+    {
+      "id": "humidity_042",
+      "text": "当前室内湿度为百分之四十二。",
+      "file": "humidity/humidity_042.wav"
+    },
+    {
+      "id": "humidity_043",
+      "text": "当前室内湿度为百分之四十三。",
+      "file": "humidity/humidity_043.wav"
+    },
+    {
+      "id": "humidity_044",
+      "text": "当前室内湿度为百分之四十四。",
+      "file": "humidity/humidity_044.wav"
+    },
+    {
+      "id": "humidity_045",
+      "text": "当前室内湿度为百分之四十五。",
+      "file": "humidity/humidity_045.wav"
+    },
+    {
+      "id": "humidity_046",
+      "text": "当前室内湿度为百分之四十六。",
+      "file": "humidity/humidity_046.wav"
+    },
+    {
+      "id": "humidity_047",
+      "text": "当前室内湿度为百分之四十七。",
+      "file": "humidity/humidity_047.wav"
+    },
+    {
+      "id": "humidity_048",
+      "text": "当前室内湿度为百分之四十八。",
+      "file": "humidity/humidity_048.wav"
+    },
+    {
+      "id": "humidity_049",
+      "text": "当前室内湿度为百分之四十九。",
+      "file": "humidity/humidity_049.wav"
+    },
+    {
+      "id": "humidity_050",
+      "text": "当前室内湿度为百分之五十。",
+      "file": "humidity/humidity_050.wav"
+    },
+    {
+      "id": "humidity_051",
+      "text": "当前室内湿度为百分之五十一。",
+      "file": "humidity/humidity_051.wav"
+    },
+    {
+      "id": "humidity_052",
+      "text": "当前室内湿度为百分之五十二。",
+      "file": "humidity/humidity_052.wav"
+    },
+    {
+      "id": "humidity_053",
+      "text": "当前室内湿度为百分之五十三。",
+      "file": "humidity/humidity_053.wav"
+    },
+    {
+      "id": "humidity_054",
+      "text": "当前室内湿度为百分之五十四。",
+      "file": "humidity/humidity_054.wav"
+    },
+    {
+      "id": "humidity_055",
+      "text": "当前室内湿度为百分之五十五。",
+      "file": "humidity/humidity_055.wav"
+    },
+    {
+      "id": "humidity_056",
+      "text": "当前室内湿度为百分之五十六。",
+      "file": "humidity/humidity_056.wav"
+    },
+    {
+      "id": "humidity_057",
+      "text": "当前室内湿度为百分之五十七。",
+      "file": "humidity/humidity_057.wav"
+    },
+    {
+      "id": "humidity_058",
+      "text": "当前室内湿度为百分之五十八。",
+      "file": "humidity/humidity_058.wav"
+    },
+    {
+      "id": "humidity_059",
+      "text": "当前室内湿度为百分之五十九。",
+      "file": "humidity/humidity_059.wav"
+    },
+    {
+      "id": "humidity_060",
+      "text": "当前室内湿度为百分之六十。",
+      "file": "humidity/humidity_060.wav"
+    },
+    {
+      "id": "humidity_061",
+      "text": "当前室内湿度为百分之六十一。",
+      "file": "humidity/humidity_061.wav"
+    },
+    {
+      "id": "humidity_062",
+      "text": "当前室内湿度为百分之六十二。",
+      "file": "humidity/humidity_062.wav"
+    },
+    {
+      "id": "humidity_063",
+      "text": "当前室内湿度为百分之六十三。",
+      "file": "humidity/humidity_063.wav"
+    },
+    {
+      "id": "humidity_064",
+      "text": "当前室内湿度为百分之六十四。",
+      "file": "humidity/humidity_064.wav"
+    },
+    {
+      "id": "humidity_065",
+      "text": "当前室内湿度为百分之六十五。",
+      "file": "humidity/humidity_065.wav"
+    },
+    {
+      "id": "humidity_066",
+      "text": "当前室内湿度为百分之六十六。",
+      "file": "humidity/humidity_066.wav"
+    },
+    {
+      "id": "humidity_067",
+      "text": "当前室内湿度为百分之六十七。",
+      "file": "humidity/humidity_067.wav"
+    },
+    {
+      "id": "humidity_068",
+      "text": "当前室内湿度为百分之六十八。",
+      "file": "humidity/humidity_068.wav"
+    },
+    {
+      "id": "humidity_069",
+      "text": "当前室内湿度为百分之六十九。",
+      "file": "humidity/humidity_069.wav"
+    },
+    {
+      "id": "humidity_070",
+      "text": "当前室内湿度为百分之七十。",
+      "file": "humidity/humidity_070.wav"
+    },
+    {
+      "id": "humidity_071",
+      "text": "当前室内湿度为百分之七十一。",
+      "file": "humidity/humidity_071.wav"
+    },
+    {
+      "id": "humidity_072",
+      "text": "当前室内湿度为百分之七十二。",
+      "file": "humidity/humidity_072.wav"
+    },
+    {
+      "id": "humidity_073",
+      "text": "当前室内湿度为百分之七十三。",
+      "file": "humidity/humidity_073.wav"
+    },
+    {
+      "id": "humidity_074",
+      "text": "当前室内湿度为百分之七十四。",
+      "file": "humidity/humidity_074.wav"
+    },
+    {
+      "id": "humidity_075",
+      "text": "当前室内湿度为百分之七十五。",
+      "file": "humidity/humidity_075.wav"
+    },
+    {
+      "id": "humidity_076",
+      "text": "当前室内湿度为百分之七十六。",
+      "file": "humidity/humidity_076.wav"
+    },
+    {
+      "id": "humidity_077",
+      "text": "当前室内湿度为百分之七十七。",
+      "file": "humidity/humidity_077.wav"
+    },
+    {
+      "id": "humidity_078",
+      "text": "当前室内湿度为百分之七十八。",
+      "file": "humidity/humidity_078.wav"
+    },
+    {
+      "id": "humidity_079",
+      "text": "当前室内湿度为百分之七十九。",
+      "file": "humidity/humidity_079.wav"
+    },
+    {
+      "id": "humidity_080",
+      "text": "当前室内湿度为百分之八十。",
+      "file": "humidity/humidity_080.wav"
+    },
+    {
+      "id": "humidity_081",
+      "text": "当前室内湿度为百分之八十一。",
+      "file": "humidity/humidity_081.wav"
+    },
+    {
+      "id": "humidity_082",
+      "text": "当前室内湿度为百分之八十二。",
+      "file": "humidity/humidity_082.wav"
+    },
+    {
+      "id": "humidity_083",
+      "text": "当前室内湿度为百分之八十三。",
+      "file": "humidity/humidity_083.wav"
+    },
+    {
+      "id": "humidity_084",
+      "text": "当前室内湿度为百分之八十四。",
+      "file": "humidity/humidity_084.wav"
+    },
+    {
+      "id": "humidity_085",
+      "text": "当前室内湿度为百分之八十五。",
+      "file": "humidity/humidity_085.wav"
+    },
+    {
+      "id": "humidity_086",
+      "text": "当前室内湿度为百分之八十六。",
+      "file": "humidity/humidity_086.wav"
+    },
+    {
+      "id": "humidity_087",
+      "text": "当前室内湿度为百分之八十七。",
+      "file": "humidity/humidity_087.wav"
+    },
+    {
+      "id": "humidity_088",
+      "text": "当前室内湿度为百分之八十八。",
+      "file": "humidity/humidity_088.wav"
+    },
+    {
+      "id": "humidity_089",
+      "text": "当前室内湿度为百分之八十九。",
+      "file": "humidity/humidity_089.wav"
+    },
+    {
+      "id": "humidity_090",
+      "text": "当前室内湿度为百分之九十。",
+      "file": "humidity/humidity_090.wav"
+    },
+    {
+      "id": "humidity_091",
+      "text": "当前室内湿度为百分之九十一。",
+      "file": "humidity/humidity_091.wav"
+    },
+    {
+      "id": "humidity_092",
+      "text": "当前室内湿度为百分之九十二。",
+      "file": "humidity/humidity_092.wav"
+    },
+    {
+      "id": "humidity_093",
+      "text": "当前室内湿度为百分之九十三。",
+      "file": "humidity/humidity_093.wav"
+    },
+    {
+      "id": "humidity_094",
+      "text": "当前室内湿度为百分之九十四。",
+      "file": "humidity/humidity_094.wav"
+    },
+    {
+      "id": "humidity_095",
+      "text": "当前室内湿度为百分之九十五。",
+      "file": "humidity/humidity_095.wav"
+    },
+    {
+      "id": "humidity_096",
+      "text": "当前室内湿度为百分之九十六。",
+      "file": "humidity/humidity_096.wav"
+    },
+    {
+      "id": "humidity_097",
+      "text": "当前室内湿度为百分之九十七。",
+      "file": "humidity/humidity_097.wav"
+    },
+    {
+      "id": "humidity_098",
+      "text": "当前室内湿度为百分之九十八。",
+      "file": "humidity/humidity_098.wav"
+    },
+    {
+      "id": "humidity_099",
+      "text": "当前室内湿度为百分之九十九。",
+      "file": "humidity/humidity_099.wav"
+    },
+    {
+      "id": "humidity_100",
+      "text": "当前室内湿度为百分之一百。",
+      "file": "humidity/humidity_100.wav"
+    },
+    {
+      "id": "curtain_status_000",
+      "text": "窗帘当前已完全关闭。",
+      "file": "curtain/status_000.wav"
+    },
+    {
+      "id": "curtain_set_000",
+      "text": "窗帘已完全关闭。",
+      "file": "curtain/set_000.wav"
+    },
+    {
+      "id": "curtain_status_001",
+      "text": "窗帘当前开合度为百分之一。",
+      "file": "curtain/status_001.wav"
+    },
+    {
+      "id": "curtain_set_001",
+      "text": "窗帘已调至百分之一。",
+      "file": "curtain/set_001.wav"
+    },
+    {
+      "id": "curtain_status_002",
+      "text": "窗帘当前开合度为百分之二。",
+      "file": "curtain/status_002.wav"
+    },
+    {
+      "id": "curtain_set_002",
+      "text": "窗帘已调至百分之二。",
+      "file": "curtain/set_002.wav"
+    },
+    {
+      "id": "curtain_status_003",
+      "text": "窗帘当前开合度为百分之三。",
+      "file": "curtain/status_003.wav"
+    },
+    {
+      "id": "curtain_set_003",
+      "text": "窗帘已调至百分之三。",
+      "file": "curtain/set_003.wav"
+    },
+    {
+      "id": "curtain_status_004",
+      "text": "窗帘当前开合度为百分之四。",
+      "file": "curtain/status_004.wav"
+    },
+    {
+      "id": "curtain_set_004",
+      "text": "窗帘已调至百分之四。",
+      "file": "curtain/set_004.wav"
+    },
+    {
+      "id": "curtain_status_005",
+      "text": "窗帘当前开合度为百分之五。",
+      "file": "curtain/status_005.wav"
+    },
+    {
+      "id": "curtain_set_005",
+      "text": "窗帘已调至百分之五。",
+      "file": "curtain/set_005.wav"
+    },
+    {
+      "id": "curtain_status_006",
+      "text": "窗帘当前开合度为百分之六。",
+      "file": "curtain/status_006.wav"
+    },
+    {
+      "id": "curtain_set_006",
+      "text": "窗帘已调至百分之六。",
+      "file": "curtain/set_006.wav"
+    },
+    {
+      "id": "curtain_status_007",
+      "text": "窗帘当前开合度为百分之七。",
+      "file": "curtain/status_007.wav"
+    },
+    {
+      "id": "curtain_set_007",
+      "text": "窗帘已调至百分之七。",
+      "file": "curtain/set_007.wav"
+    },
+    {
+      "id": "curtain_status_008",
+      "text": "窗帘当前开合度为百分之八。",
+      "file": "curtain/status_008.wav"
+    },
+    {
+      "id": "curtain_set_008",
+      "text": "窗帘已调至百分之八。",
+      "file": "curtain/set_008.wav"
+    },
+    {
+      "id": "curtain_status_009",
+      "text": "窗帘当前开合度为百分之九。",
+      "file": "curtain/status_009.wav"
+    },
+    {
+      "id": "curtain_set_009",
+      "text": "窗帘已调至百分之九。",
+      "file": "curtain/set_009.wav"
+    },
+    {
+      "id": "curtain_status_010",
+      "text": "窗帘当前开合度为百分之十。",
+      "file": "curtain/status_010.wav"
+    },
+    {
+      "id": "curtain_set_010",
+      "text": "窗帘已调至百分之十。",
+      "file": "curtain/set_010.wav"
+    },
+    {
+      "id": "curtain_status_011",
+      "text": "窗帘当前开合度为百分之十一。",
+      "file": "curtain/status_011.wav"
+    },
+    {
+      "id": "curtain_set_011",
+      "text": "窗帘已调至百分之十一。",
+      "file": "curtain/set_011.wav"
+    },
+    {
+      "id": "curtain_status_012",
+      "text": "窗帘当前开合度为百分之十二。",
+      "file": "curtain/status_012.wav"
+    },
+    {
+      "id": "curtain_set_012",
+      "text": "窗帘已调至百分之十二。",
+      "file": "curtain/set_012.wav"
+    },
+    {
+      "id": "curtain_status_013",
+      "text": "窗帘当前开合度为百分之十三。",
+      "file": "curtain/status_013.wav"
+    },
+    {
+      "id": "curtain_set_013",
+      "text": "窗帘已调至百分之十三。",
+      "file": "curtain/set_013.wav"
+    },
+    {
+      "id": "curtain_status_014",
+      "text": "窗帘当前开合度为百分之十四。",
+      "file": "curtain/status_014.wav"
+    },
+    {
+      "id": "curtain_set_014",
+      "text": "窗帘已调至百分之十四。",
+      "file": "curtain/set_014.wav"
+    },
+    {
+      "id": "curtain_status_015",
+      "text": "窗帘当前开合度为百分之十五。",
+      "file": "curtain/status_015.wav"
+    },
+    {
+      "id": "curtain_set_015",
+      "text": "窗帘已调至百分之十五。",
+      "file": "curtain/set_015.wav"
+    },
+    {
+      "id": "curtain_status_016",
+      "text": "窗帘当前开合度为百分之十六。",
+      "file": "curtain/status_016.wav"
+    },
+    {
+      "id": "curtain_set_016",
+      "text": "窗帘已调至百分之十六。",
+      "file": "curtain/set_016.wav"
+    },
+    {
+      "id": "curtain_status_017",
+      "text": "窗帘当前开合度为百分之十七。",
+      "file": "curtain/status_017.wav"
+    },
+    {
+      "id": "curtain_set_017",
+      "text": "窗帘已调至百分之十七。",
+      "file": "curtain/set_017.wav"
+    },
+    {
+      "id": "curtain_status_018",
+      "text": "窗帘当前开合度为百分之十八。",
+      "file": "curtain/status_018.wav"
+    },
+    {
+      "id": "curtain_set_018",
+      "text": "窗帘已调至百分之十八。",
+      "file": "curtain/set_018.wav"
+    },
+    {
+      "id": "curtain_status_019",
+      "text": "窗帘当前开合度为百分之十九。",
+      "file": "curtain/status_019.wav"
+    },
+    {
+      "id": "curtain_set_019",
+      "text": "窗帘已调至百分之十九。",
+      "file": "curtain/set_019.wav"
+    },
+    {
+      "id": "curtain_status_020",
+      "text": "窗帘当前开合度为百分之二十。",
+      "file": "curtain/status_020.wav"
+    },
+    {
+      "id": "curtain_set_020",
+      "text": "窗帘已调至百分之二十。",
+      "file": "curtain/set_020.wav"
+    },
+    {
+      "id": "curtain_status_021",
+      "text": "窗帘当前开合度为百分之二十一。",
+      "file": "curtain/status_021.wav"
+    },
+    {
+      "id": "curtain_set_021",
+      "text": "窗帘已调至百分之二十一。",
+      "file": "curtain/set_021.wav"
+    },
+    {
+      "id": "curtain_status_022",
+      "text": "窗帘当前开合度为百分之二十二。",
+      "file": "curtain/status_022.wav"
+    },
+    {
+      "id": "curtain_set_022",
+      "text": "窗帘已调至百分之二十二。",
+      "file": "curtain/set_022.wav"
+    },
+    {
+      "id": "curtain_status_023",
+      "text": "窗帘当前开合度为百分之二十三。",
+      "file": "curtain/status_023.wav"
+    },
+    {
+      "id": "curtain_set_023",
+      "text": "窗帘已调至百分之二十三。",
+      "file": "curtain/set_023.wav"
+    },
+    {
+      "id": "curtain_status_024",
+      "text": "窗帘当前开合度为百分之二十四。",
+      "file": "curtain/status_024.wav"
+    },
+    {
+      "id": "curtain_set_024",
+      "text": "窗帘已调至百分之二十四。",
+      "file": "curtain/set_024.wav"
+    },
+    {
+      "id": "curtain_status_025",
+      "text": "窗帘当前开合度为百分之二十五。",
+      "file": "curtain/status_025.wav"
+    },
+    {
+      "id": "curtain_set_025",
+      "text": "窗帘已调至百分之二十五。",
+      "file": "curtain/set_025.wav"
+    },
+    {
+      "id": "curtain_status_026",
+      "text": "窗帘当前开合度为百分之二十六。",
+      "file": "curtain/status_026.wav"
+    },
+    {
+      "id": "curtain_set_026",
+      "text": "窗帘已调至百分之二十六。",
+      "file": "curtain/set_026.wav"
+    },
+    {
+      "id": "curtain_status_027",
+      "text": "窗帘当前开合度为百分之二十七。",
+      "file": "curtain/status_027.wav"
+    },
+    {
+      "id": "curtain_set_027",
+      "text": "窗帘已调至百分之二十七。",
+      "file": "curtain/set_027.wav"
+    },
+    {
+      "id": "curtain_status_028",
+      "text": "窗帘当前开合度为百分之二十八。",
+      "file": "curtain/status_028.wav"
+    },
+    {
+      "id": "curtain_set_028",
+      "text": "窗帘已调至百分之二十八。",
+      "file": "curtain/set_028.wav"
+    },
+    {
+      "id": "curtain_status_029",
+      "text": "窗帘当前开合度为百分之二十九。",
+      "file": "curtain/status_029.wav"
+    },
+    {
+      "id": "curtain_set_029",
+      "text": "窗帘已调至百分之二十九。",
+      "file": "curtain/set_029.wav"
+    },
+    {
+      "id": "curtain_status_030",
+      "text": "窗帘当前开合度为百分之三十。",
+      "file": "curtain/status_030.wav"
+    },
+    {
+      "id": "curtain_set_030",
+      "text": "窗帘已调至百分之三十。",
+      "file": "curtain/set_030.wav"
+    },
+    {
+      "id": "curtain_status_031",
+      "text": "窗帘当前开合度为百分之三十一。",
+      "file": "curtain/status_031.wav"
+    },
+    {
+      "id": "curtain_set_031",
+      "text": "窗帘已调至百分之三十一。",
+      "file": "curtain/set_031.wav"
+    },
+    {
+      "id": "curtain_status_032",
+      "text": "窗帘当前开合度为百分之三十二。",
+      "file": "curtain/status_032.wav"
+    },
+    {
+      "id": "curtain_set_032",
+      "text": "窗帘已调至百分之三十二。",
+      "file": "curtain/set_032.wav"
+    },
+    {
+      "id": "curtain_status_033",
+      "text": "窗帘当前开合度为百分之三十三。",
+      "file": "curtain/status_033.wav"
+    },
+    {
+      "id": "curtain_set_033",
+      "text": "窗帘已调至百分之三十三。",
+      "file": "curtain/set_033.wav"
+    },
+    {
+      "id": "curtain_status_034",
+      "text": "窗帘当前开合度为百分之三十四。",
+      "file": "curtain/status_034.wav"
+    },
+    {
+      "id": "curtain_set_034",
+      "text": "窗帘已调至百分之三十四。",
+      "file": "curtain/set_034.wav"
+    },
+    {
+      "id": "curtain_status_035",
+      "text": "窗帘当前开合度为百分之三十五。",
+      "file": "curtain/status_035.wav"
+    },
+    {
+      "id": "curtain_set_035",
+      "text": "窗帘已调至百分之三十五。",
+      "file": "curtain/set_035.wav"
+    },
+    {
+      "id": "curtain_status_036",
+      "text": "窗帘当前开合度为百分之三十六。",
+      "file": "curtain/status_036.wav"
+    },
+    {
+      "id": "curtain_set_036",
+      "text": "窗帘已调至百分之三十六。",
+      "file": "curtain/set_036.wav"
+    },
+    {
+      "id": "curtain_status_037",
+      "text": "窗帘当前开合度为百分之三十七。",
+      "file": "curtain/status_037.wav"
+    },
+    {
+      "id": "curtain_set_037",
+      "text": "窗帘已调至百分之三十七。",
+      "file": "curtain/set_037.wav"
+    },
+    {
+      "id": "curtain_status_038",
+      "text": "窗帘当前开合度为百分之三十八。",
+      "file": "curtain/status_038.wav"
+    },
+    {
+      "id": "curtain_set_038",
+      "text": "窗帘已调至百分之三十八。",
+      "file": "curtain/set_038.wav"
+    },
+    {
+      "id": "curtain_status_039",
+      "text": "窗帘当前开合度为百分之三十九。",
+      "file": "curtain/status_039.wav"
+    },
+    {
+      "id": "curtain_set_039",
+      "text": "窗帘已调至百分之三十九。",
+      "file": "curtain/set_039.wav"
+    },
+    {
+      "id": "curtain_status_040",
+      "text": "窗帘当前开合度为百分之四十。",
+      "file": "curtain/status_040.wav"
+    },
+    {
+      "id": "curtain_set_040",
+      "text": "窗帘已调至百分之四十。",
+      "file": "curtain/set_040.wav"
+    },
+    {
+      "id": "curtain_status_041",
+      "text": "窗帘当前开合度为百分之四十一。",
+      "file": "curtain/status_041.wav"
+    },
+    {
+      "id": "curtain_set_041",
+      "text": "窗帘已调至百分之四十一。",
+      "file": "curtain/set_041.wav"
+    },
+    {
+      "id": "curtain_status_042",
+      "text": "窗帘当前开合度为百分之四十二。",
+      "file": "curtain/status_042.wav"
+    },
+    {
+      "id": "curtain_set_042",
+      "text": "窗帘已调至百分之四十二。",
+      "file": "curtain/set_042.wav"
+    },
+    {
+      "id": "curtain_status_043",
+      "text": "窗帘当前开合度为百分之四十三。",
+      "file": "curtain/status_043.wav"
+    },
+    {
+      "id": "curtain_set_043",
+      "text": "窗帘已调至百分之四十三。",
+      "file": "curtain/set_043.wav"
+    },
+    {
+      "id": "curtain_status_044",
+      "text": "窗帘当前开合度为百分之四十四。",
+      "file": "curtain/status_044.wav"
+    },
+    {
+      "id": "curtain_set_044",
+      "text": "窗帘已调至百分之四十四。",
+      "file": "curtain/set_044.wav"
+    },
+    {
+      "id": "curtain_status_045",
+      "text": "窗帘当前开合度为百分之四十五。",
+      "file": "curtain/status_045.wav"
+    },
+    {
+      "id": "curtain_set_045",
+      "text": "窗帘已调至百分之四十五。",
+      "file": "curtain/set_045.wav"
+    },
+    {
+      "id": "curtain_status_046",
+      "text": "窗帘当前开合度为百分之四十六。",
+      "file": "curtain/status_046.wav"
+    },
+    {
+      "id": "curtain_set_046",
+      "text": "窗帘已调至百分之四十六。",
+      "file": "curtain/set_046.wav"
+    },
+    {
+      "id": "curtain_status_047",
+      "text": "窗帘当前开合度为百分之四十七。",
+      "file": "curtain/status_047.wav"
+    },
+    {
+      "id": "curtain_set_047",
+      "text": "窗帘已调至百分之四十七。",
+      "file": "curtain/set_047.wav"
+    },
+    {
+      "id": "curtain_status_048",
+      "text": "窗帘当前开合度为百分之四十八。",
+      "file": "curtain/status_048.wav"
+    },
+    {
+      "id": "curtain_set_048",
+      "text": "窗帘已调至百分之四十八。",
+      "file": "curtain/set_048.wav"
+    },
+    {
+      "id": "curtain_status_049",
+      "text": "窗帘当前开合度为百分之四十九。",
+      "file": "curtain/status_049.wav"
+    },
+    {
+      "id": "curtain_set_049",
+      "text": "窗帘已调至百分之四十九。",
+      "file": "curtain/set_049.wav"
+    },
+    {
+      "id": "curtain_status_050",
+      "text": "窗帘当前开合度为百分之五十。",
+      "file": "curtain/status_050.wav"
+    },
+    {
+      "id": "curtain_set_050",
+      "text": "窗帘已调至百分之五十。",
+      "file": "curtain/set_050.wav"
+    },
+    {
+      "id": "curtain_status_051",
+      "text": "窗帘当前开合度为百分之五十一。",
+      "file": "curtain/status_051.wav"
+    },
+    {
+      "id": "curtain_set_051",
+      "text": "窗帘已调至百分之五十一。",
+      "file": "curtain/set_051.wav"
+    },
+    {
+      "id": "curtain_status_052",
+      "text": "窗帘当前开合度为百分之五十二。",
+      "file": "curtain/status_052.wav"
+    },
+    {
+      "id": "curtain_set_052",
+      "text": "窗帘已调至百分之五十二。",
+      "file": "curtain/set_052.wav"
+    },
+    {
+      "id": "curtain_status_053",
+      "text": "窗帘当前开合度为百分之五十三。",
+      "file": "curtain/status_053.wav"
+    },
+    {
+      "id": "curtain_set_053",
+      "text": "窗帘已调至百分之五十三。",
+      "file": "curtain/set_053.wav"
+    },
+    {
+      "id": "curtain_status_054",
+      "text": "窗帘当前开合度为百分之五十四。",
+      "file": "curtain/status_054.wav"
+    },
+    {
+      "id": "curtain_set_054",
+      "text": "窗帘已调至百分之五十四。",
+      "file": "curtain/set_054.wav"
+    },
+    {
+      "id": "curtain_status_055",
+      "text": "窗帘当前开合度为百分之五十五。",
+      "file": "curtain/status_055.wav"
+    },
+    {
+      "id": "curtain_set_055",
+      "text": "窗帘已调至百分之五十五。",
+      "file": "curtain/set_055.wav"
+    },
+    {
+      "id": "curtain_status_056",
+      "text": "窗帘当前开合度为百分之五十六。",
+      "file": "curtain/status_056.wav"
+    },
+    {
+      "id": "curtain_set_056",
+      "text": "窗帘已调至百分之五十六。",
+      "file": "curtain/set_056.wav"
+    },
+    {
+      "id": "curtain_status_057",
+      "text": "窗帘当前开合度为百分之五十七。",
+      "file": "curtain/status_057.wav"
+    },
+    {
+      "id": "curtain_set_057",
+      "text": "窗帘已调至百分之五十七。",
+      "file": "curtain/set_057.wav"
+    },
+    {
+      "id": "curtain_status_058",
+      "text": "窗帘当前开合度为百分之五十八。",
+      "file": "curtain/status_058.wav"
+    },
+    {
+      "id": "curtain_set_058",
+      "text": "窗帘已调至百分之五十八。",
+      "file": "curtain/set_058.wav"
+    },
+    {
+      "id": "curtain_status_059",
+      "text": "窗帘当前开合度为百分之五十九。",
+      "file": "curtain/status_059.wav"
+    },
+    {
+      "id": "curtain_set_059",
+      "text": "窗帘已调至百分之五十九。",
+      "file": "curtain/set_059.wav"
+    },
+    {
+      "id": "curtain_status_060",
+      "text": "窗帘当前开合度为百分之六十。",
+      "file": "curtain/status_060.wav"
+    },
+    {
+      "id": "curtain_set_060",
+      "text": "窗帘已调至百分之六十。",
+      "file": "curtain/set_060.wav"
+    },
+    {
+      "id": "curtain_status_061",
+      "text": "窗帘当前开合度为百分之六十一。",
+      "file": "curtain/status_061.wav"
+    },
+    {
+      "id": "curtain_set_061",
+      "text": "窗帘已调至百分之六十一。",
+      "file": "curtain/set_061.wav"
+    },
+    {
+      "id": "curtain_status_062",
+      "text": "窗帘当前开合度为百分之六十二。",
+      "file": "curtain/status_062.wav"
+    },
+    {
+      "id": "curtain_set_062",
+      "text": "窗帘已调至百分之六十二。",
+      "file": "curtain/set_062.wav"
+    },
+    {
+      "id": "curtain_status_063",
+      "text": "窗帘当前开合度为百分之六十三。",
+      "file": "curtain/status_063.wav"
+    },
+    {
+      "id": "curtain_set_063",
+      "text": "窗帘已调至百分之六十三。",
+      "file": "curtain/set_063.wav"
+    },
+    {
+      "id": "curtain_status_064",
+      "text": "窗帘当前开合度为百分之六十四。",
+      "file": "curtain/status_064.wav"
+    },
+    {
+      "id": "curtain_set_064",
+      "text": "窗帘已调至百分之六十四。",
+      "file": "curtain/set_064.wav"
+    },
+    {
+      "id": "curtain_status_065",
+      "text": "窗帘当前开合度为百分之六十五。",
+      "file": "curtain/status_065.wav"
+    },
+    {
+      "id": "curtain_set_065",
+      "text": "窗帘已调至百分之六十五。",
+      "file": "curtain/set_065.wav"
+    },
+    {
+      "id": "curtain_status_066",
+      "text": "窗帘当前开合度为百分之六十六。",
+      "file": "curtain/status_066.wav"
+    },
+    {
+      "id": "curtain_set_066",
+      "text": "窗帘已调至百分之六十六。",
+      "file": "curtain/set_066.wav"
+    },
+    {
+      "id": "curtain_status_067",
+      "text": "窗帘当前开合度为百分之六十七。",
+      "file": "curtain/status_067.wav"
+    },
+    {
+      "id": "curtain_set_067",
+      "text": "窗帘已调至百分之六十七。",
+      "file": "curtain/set_067.wav"
+    },
+    {
+      "id": "curtain_status_068",
+      "text": "窗帘当前开合度为百分之六十八。",
+      "file": "curtain/status_068.wav"
+    },
+    {
+      "id": "curtain_set_068",
+      "text": "窗帘已调至百分之六十八。",
+      "file": "curtain/set_068.wav"
+    },
+    {
+      "id": "curtain_status_069",
+      "text": "窗帘当前开合度为百分之六十九。",
+      "file": "curtain/status_069.wav"
+    },
+    {
+      "id": "curtain_set_069",
+      "text": "窗帘已调至百分之六十九。",
+      "file": "curtain/set_069.wav"
+    },
+    {
+      "id": "curtain_status_070",
+      "text": "窗帘当前开合度为百分之七十。",
+      "file": "curtain/status_070.wav"
+    },
+    {
+      "id": "curtain_set_070",
+      "text": "窗帘已调至百分之七十。",
+      "file": "curtain/set_070.wav"
+    },
+    {
+      "id": "curtain_status_071",
+      "text": "窗帘当前开合度为百分之七十一。",
+      "file": "curtain/status_071.wav"
+    },
+    {
+      "id": "curtain_set_071",
+      "text": "窗帘已调至百分之七十一。",
+      "file": "curtain/set_071.wav"
+    },
+    {
+      "id": "curtain_status_072",
+      "text": "窗帘当前开合度为百分之七十二。",
+      "file": "curtain/status_072.wav"
+    },
+    {
+      "id": "curtain_set_072",
+      "text": "窗帘已调至百分之七十二。",
+      "file": "curtain/set_072.wav"
+    },
+    {
+      "id": "curtain_status_073",
+      "text": "窗帘当前开合度为百分之七十三。",
+      "file": "curtain/status_073.wav"
+    },
+    {
+      "id": "curtain_set_073",
+      "text": "窗帘已调至百分之七十三。",
+      "file": "curtain/set_073.wav"
+    },
+    {
+      "id": "curtain_status_074",
+      "text": "窗帘当前开合度为百分之七十四。",
+      "file": "curtain/status_074.wav"
+    },
+    {
+      "id": "curtain_set_074",
+      "text": "窗帘已调至百分之七十四。",
+      "file": "curtain/set_074.wav"
+    },
+    {
+      "id": "curtain_status_075",
+      "text": "窗帘当前开合度为百分之七十五。",
+      "file": "curtain/status_075.wav"
+    },
+    {
+      "id": "curtain_set_075",
+      "text": "窗帘已调至百分之七十五。",
+      "file": "curtain/set_075.wav"
+    },
+    {
+      "id": "curtain_status_076",
+      "text": "窗帘当前开合度为百分之七十六。",
+      "file": "curtain/status_076.wav"
+    },
+    {
+      "id": "curtain_set_076",
+      "text": "窗帘已调至百分之七十六。",
+      "file": "curtain/set_076.wav"
+    },
+    {
+      "id": "curtain_status_077",
+      "text": "窗帘当前开合度为百分之七十七。",
+      "file": "curtain/status_077.wav"
+    },
+    {
+      "id": "curtain_set_077",
+      "text": "窗帘已调至百分之七十七。",
+      "file": "curtain/set_077.wav"
+    },
+    {
+      "id": "curtain_status_078",
+      "text": "窗帘当前开合度为百分之七十八。",
+      "file": "curtain/status_078.wav"
+    },
+    {
+      "id": "curtain_set_078",
+      "text": "窗帘已调至百分之七十八。",
+      "file": "curtain/set_078.wav"
+    },
+    {
+      "id": "curtain_status_079",
+      "text": "窗帘当前开合度为百分之七十九。",
+      "file": "curtain/status_079.wav"
+    },
+    {
+      "id": "curtain_set_079",
+      "text": "窗帘已调至百分之七十九。",
+      "file": "curtain/set_079.wav"
+    },
+    {
+      "id": "curtain_status_080",
+      "text": "窗帘当前开合度为百分之八十。",
+      "file": "curtain/status_080.wav"
+    },
+    {
+      "id": "curtain_set_080",
+      "text": "窗帘已调至百分之八十。",
+      "file": "curtain/set_080.wav"
+    },
+    {
+      "id": "curtain_status_081",
+      "text": "窗帘当前开合度为百分之八十一。",
+      "file": "curtain/status_081.wav"
+    },
+    {
+      "id": "curtain_set_081",
+      "text": "窗帘已调至百分之八十一。",
+      "file": "curtain/set_081.wav"
+    },
+    {
+      "id": "curtain_status_082",
+      "text": "窗帘当前开合度为百分之八十二。",
+      "file": "curtain/status_082.wav"
+    },
+    {
+      "id": "curtain_set_082",
+      "text": "窗帘已调至百分之八十二。",
+      "file": "curtain/set_082.wav"
+    },
+    {
+      "id": "curtain_status_083",
+      "text": "窗帘当前开合度为百分之八十三。",
+      "file": "curtain/status_083.wav"
+    },
+    {
+      "id": "curtain_set_083",
+      "text": "窗帘已调至百分之八十三。",
+      "file": "curtain/set_083.wav"
+    },
+    {
+      "id": "curtain_status_084",
+      "text": "窗帘当前开合度为百分之八十四。",
+      "file": "curtain/status_084.wav"
+    },
+    {
+      "id": "curtain_set_084",
+      "text": "窗帘已调至百分之八十四。",
+      "file": "curtain/set_084.wav"
+    },
+    {
+      "id": "curtain_status_085",
+      "text": "窗帘当前开合度为百分之八十五。",
+      "file": "curtain/status_085.wav"
+    },
+    {
+      "id": "curtain_set_085",
+      "text": "窗帘已调至百分之八十五。",
+      "file": "curtain/set_085.wav"
+    },
+    {
+      "id": "curtain_status_086",
+      "text": "窗帘当前开合度为百分之八十六。",
+      "file": "curtain/status_086.wav"
+    },
+    {
+      "id": "curtain_set_086",
+      "text": "窗帘已调至百分之八十六。",
+      "file": "curtain/set_086.wav"
+    },
+    {
+      "id": "curtain_status_087",
+      "text": "窗帘当前开合度为百分之八十七。",
+      "file": "curtain/status_087.wav"
+    },
+    {
+      "id": "curtain_set_087",
+      "text": "窗帘已调至百分之八十七。",
+      "file": "curtain/set_087.wav"
+    },
+    {
+      "id": "curtain_status_088",
+      "text": "窗帘当前开合度为百分之八十八。",
+      "file": "curtain/status_088.wav"
+    },
+    {
+      "id": "curtain_set_088",
+      "text": "窗帘已调至百分之八十八。",
+      "file": "curtain/set_088.wav"
+    },
+    {
+      "id": "curtain_status_089",
+      "text": "窗帘当前开合度为百分之八十九。",
+      "file": "curtain/status_089.wav"
+    },
+    {
+      "id": "curtain_set_089",
+      "text": "窗帘已调至百分之八十九。",
+      "file": "curtain/set_089.wav"
+    },
+    {
+      "id": "curtain_status_090",
+      "text": "窗帘当前开合度为百分之九十。",
+      "file": "curtain/status_090.wav"
+    },
+    {
+      "id": "curtain_set_090",
+      "text": "窗帘已调至百分之九十。",
+      "file": "curtain/set_090.wav"
+    },
+    {
+      "id": "curtain_status_091",
+      "text": "窗帘当前开合度为百分之九十一。",
+      "file": "curtain/status_091.wav"
+    },
+    {
+      "id": "curtain_set_091",
+      "text": "窗帘已调至百分之九十一。",
+      "file": "curtain/set_091.wav"
+    },
+    {
+      "id": "curtain_status_092",
+      "text": "窗帘当前开合度为百分之九十二。",
+      "file": "curtain/status_092.wav"
+    },
+    {
+      "id": "curtain_set_092",
+      "text": "窗帘已调至百分之九十二。",
+      "file": "curtain/set_092.wav"
+    },
+    {
+      "id": "curtain_status_093",
+      "text": "窗帘当前开合度为百分之九十三。",
+      "file": "curtain/status_093.wav"
+    },
+    {
+      "id": "curtain_set_093",
+      "text": "窗帘已调至百分之九十三。",
+      "file": "curtain/set_093.wav"
+    },
+    {
+      "id": "curtain_status_094",
+      "text": "窗帘当前开合度为百分之九十四。",
+      "file": "curtain/status_094.wav"
+    },
+    {
+      "id": "curtain_set_094",
+      "text": "窗帘已调至百分之九十四。",
+      "file": "curtain/set_094.wav"
+    },
+    {
+      "id": "curtain_status_095",
+      "text": "窗帘当前开合度为百分之九十五。",
+      "file": "curtain/status_095.wav"
+    },
+    {
+      "id": "curtain_set_095",
+      "text": "窗帘已调至百分之九十五。",
+      "file": "curtain/set_095.wav"
+    },
+    {
+      "id": "curtain_status_096",
+      "text": "窗帘当前开合度为百分之九十六。",
+      "file": "curtain/status_096.wav"
+    },
+    {
+      "id": "curtain_set_096",
+      "text": "窗帘已调至百分之九十六。",
+      "file": "curtain/set_096.wav"
+    },
+    {
+      "id": "curtain_status_097",
+      "text": "窗帘当前开合度为百分之九十七。",
+      "file": "curtain/status_097.wav"
+    },
+    {
+      "id": "curtain_set_097",
+      "text": "窗帘已调至百分之九十七。",
+      "file": "curtain/set_097.wav"
+    },
+    {
+      "id": "curtain_status_098",
+      "text": "窗帘当前开合度为百分之九十八。",
+      "file": "curtain/status_098.wav"
+    },
+    {
+      "id": "curtain_set_098",
+      "text": "窗帘已调至百分之九十八。",
+      "file": "curtain/set_098.wav"
+    },
+    {
+      "id": "curtain_status_099",
+      "text": "窗帘当前开合度为百分之九十九。",
+      "file": "curtain/status_099.wav"
+    },
+    {
+      "id": "curtain_set_099",
+      "text": "窗帘已调至百分之九十九。",
+      "file": "curtain/set_099.wav"
+    },
+    {
+      "id": "curtain_status_100",
+      "text": "窗帘当前已完全打开。",
+      "file": "curtain/status_100.wav"
+    },
+    {
+      "id": "curtain_set_100",
+      "text": "窗帘已完全打开。",
+      "file": "curtain/set_100.wav"
+    },
+    {
+      "id": "ac_status_cool_20",
+      "text": "空调当前已开启，制冷模式，设定温度二十度。",
+      "file": "ac/status_cool_20.wav"
+    },
+    {
+      "id": "ac_status_heat_20",
+      "text": "空调当前已开启，制热模式，设定温度二十度。",
+      "file": "ac/status_heat_20.wav"
+    },
+    {
+      "id": "ac_temperature_set_20",
+      "text": "空调温度已设置为二十度。",
+      "file": "ac/temperature_set_20.wav"
+    },
+    {
+      "id": "ac_status_cool_21",
+      "text": "空调当前已开启，制冷模式，设定温度二十一度。",
+      "file": "ac/status_cool_21.wav"
+    },
+    {
+      "id": "ac_status_heat_21",
+      "text": "空调当前已开启，制热模式，设定温度二十一度。",
+      "file": "ac/status_heat_21.wav"
+    },
+    {
+      "id": "ac_temperature_set_21",
+      "text": "空调温度已设置为二十一度。",
+      "file": "ac/temperature_set_21.wav"
+    },
+    {
+      "id": "ac_status_cool_22",
+      "text": "空调当前已开启，制冷模式，设定温度二十二度。",
+      "file": "ac/status_cool_22.wav"
+    },
+    {
+      "id": "ac_status_heat_22",
+      "text": "空调当前已开启，制热模式，设定温度二十二度。",
+      "file": "ac/status_heat_22.wav"
+    },
+    {
+      "id": "ac_temperature_set_22",
+      "text": "空调温度已设置为二十二度。",
+      "file": "ac/temperature_set_22.wav"
+    },
+    {
+      "id": "ac_status_cool_23",
+      "text": "空调当前已开启，制冷模式，设定温度二十三度。",
+      "file": "ac/status_cool_23.wav"
+    },
+    {
+      "id": "ac_status_heat_23",
+      "text": "空调当前已开启，制热模式，设定温度二十三度。",
+      "file": "ac/status_heat_23.wav"
+    },
+    {
+      "id": "ac_temperature_set_23",
+      "text": "空调温度已设置为二十三度。",
+      "file": "ac/temperature_set_23.wav"
+    },
+    {
+      "id": "ac_status_cool_24",
+      "text": "空调当前已开启，制冷模式，设定温度二十四度。",
+      "file": "ac/status_cool_24.wav"
+    },
+    {
+      "id": "ac_status_heat_24",
+      "text": "空调当前已开启，制热模式，设定温度二十四度。",
+      "file": "ac/status_heat_24.wav"
+    },
+    {
+      "id": "ac_temperature_set_24",
+      "text": "空调温度已设置为二十四度。",
+      "file": "ac/temperature_set_24.wav"
+    },
+    {
+      "id": "ac_status_cool_25",
+      "text": "空调当前已开启，制冷模式，设定温度二十五度。",
+      "file": "ac/status_cool_25.wav"
+    },
+    {
+      "id": "ac_status_heat_25",
+      "text": "空调当前已开启，制热模式，设定温度二十五度。",
+      "file": "ac/status_heat_25.wav"
+    },
+    {
+      "id": "ac_temperature_set_25",
+      "text": "空调温度已设置为二十五度。",
+      "file": "ac/temperature_set_25.wav"
+    },
+    {
+      "id": "ac_status_cool_26",
+      "text": "空调当前已开启，制冷模式，设定温度二十六度。",
+      "file": "ac/status_cool_26.wav"
+    },
+    {
+      "id": "ac_status_heat_26",
+      "text": "空调当前已开启，制热模式，设定温度二十六度。",
+      "file": "ac/status_heat_26.wav"
+    },
+    {
+      "id": "ac_temperature_set_26",
+      "text": "空调温度已设置为二十六度。",
+      "file": "ac/temperature_set_26.wav"
+    },
+    {
+      "id": "ac_status_cool_27",
+      "text": "空调当前已开启，制冷模式，设定温度二十七度。",
+      "file": "ac/status_cool_27.wav"
+    },
+    {
+      "id": "ac_status_heat_27",
+      "text": "空调当前已开启，制热模式，设定温度二十七度。",
+      "file": "ac/status_heat_27.wav"
+    },
+    {
+      "id": "ac_temperature_set_27",
+      "text": "空调温度已设置为二十七度。",
+      "file": "ac/temperature_set_27.wav"
+    },
+    {
+      "id": "ac_status_cool_28",
+      "text": "空调当前已开启，制冷模式，设定温度二十八度。",
+      "file": "ac/status_cool_28.wav"
+    },
+    {
+      "id": "ac_status_heat_28",
+      "text": "空调当前已开启，制热模式，设定温度二十八度。",
+      "file": "ac/status_heat_28.wav"
+    },
+    {
+      "id": "ac_temperature_set_28",
+      "text": "空调温度已设置为二十八度。",
+      "file": "ac/temperature_set_28.wav"
+    },
+    {
+      "id": "ac_status_cool_29",
+      "text": "空调当前已开启，制冷模式，设定温度二十九度。",
+      "file": "ac/status_cool_29.wav"
+    },
+    {
+      "id": "ac_status_heat_29",
+      "text": "空调当前已开启，制热模式，设定温度二十九度。",
+      "file": "ac/status_heat_29.wav"
+    },
+    {
+      "id": "ac_temperature_set_29",
+      "text": "空调温度已设置为二十九度。",
+      "file": "ac/temperature_set_29.wav"
+    },
+    {
+      "id": "ac_status_cool_30",
+      "text": "空调当前已开启，制冷模式，设定温度三十度。",
+      "file": "ac/status_cool_30.wav"
+    },
+    {
+      "id": "ac_status_heat_30",
+      "text": "空调当前已开启，制热模式，设定温度三十度。",
+      "file": "ac/status_heat_30.wav"
+    },
+    {
+      "id": "ac_temperature_set_30",
+      "text": "空调温度已设置为三十度。",
+      "file": "ac/temperature_set_30.wav"
+    }
+  ]
+}

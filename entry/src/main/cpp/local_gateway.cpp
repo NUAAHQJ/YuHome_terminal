@@ -15,10 +15,12 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
 #include <vector>
+#include <linux/usbdevice_fs.h>
 
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
@@ -904,6 +906,42 @@ napi_value PollEvents(napi_env env, napi_callback_info info)
     return result;
 }
 
+napi_value UsbControlLineState(napi_env env, napi_callback_info info)
+{
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) {
+        napi_throw_type_error(env, nullptr, "Expected file descriptor, interface and asserted");
+        return nullptr;
+    }
+
+    int32_t fd = -1;
+    int32_t interfaceId = -1;
+    bool asserted = false;
+    napi_get_value_int32(env, argv[0], &fd);
+    napi_get_value_int32(env, argv[1], &interfaceId);
+    napi_get_value_bool(env, argv[2], &asserted);
+    if (fd < 0 || interfaceId < 0 || interfaceId > 255) {
+        napi_value invalid = nullptr;
+        napi_create_int32(env, -EINVAL, &invalid);
+        return invalid;
+    }
+
+    usbdevfs_ctrltransfer request{};
+    request.bRequestType = 0x21; // Host-to-device | Class | Interface
+    request.bRequest = 0x22;     // CDC SET_CONTROL_LINE_STATE
+    request.wValue = asserted ? 0x0001 : 0x0000; // DTR; RTS remains low
+    request.wIndex = static_cast<uint16_t>(interfaceId);
+    request.wLength = 0;
+    request.timeout = 1000;
+    const int result = ioctl(fd, USBDEVFS_CONTROL, &request);
+    const int error = result < 0 ? -errno : 0;
+    napi_value output = nullptr;
+    napi_create_int32(env, result < 0 ? error : 0, &output);
+    return output;
+}
+
 napi_value Init(napi_env env, napi_value exports)
 {
     napi_property_descriptor descriptors[] = {
@@ -913,7 +951,8 @@ napi_value Init(napi_env env, napi_value exports)
         {"stop", nullptr, Stop, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getStatus", nullptr, GetStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"enqueueCommand", nullptr, EnqueueCommand, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"pollEvents", nullptr, PollEvents, nullptr, nullptr, nullptr, napi_default, nullptr}
+        {"pollEvents", nullptr, PollEvents, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"usbControlLineState", nullptr, UsbControlLineState, nullptr, nullptr, nullptr, napi_default, nullptr}
     };
     napi_define_properties(env, exports, sizeof(descriptors) / sizeof(descriptors[0]), descriptors);
     return exports;

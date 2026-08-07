@@ -31,6 +31,15 @@ cppcrash-*.log
 /*.docx
 /*.png
 /output/
+/performance-results/
+/ac*.txt
+/layout-device.json
+/hilog-capture*
+/entry/src/main/ets/pages/_color_bodies.txt
+/tools/nlu/dist/
+/tools/**/__pycache__/
+/tools/tts/generated/
+/tools/planner/generated/*.log
 /.vscode/
 /tools/face_conversion_output/
 /third_party/ncnn/*

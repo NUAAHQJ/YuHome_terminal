@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "route_labels": [
+    "in_domain",
+    "requires_confirmation",
+    "unknown"
+  ],
+  "intent_labels": [
+    "light_set",
+    "ac_power_set",
+    "curtain_set",
+    "ac_temperature_set",
+    "ac_mode_set",
+    "light_status_query",
+    "curtain_status_query",
+    "ac_status_query",
+    "door_status_query",
+    "temperature_query",
+    "humidity_query",
+    "environment_query",
+    "alarm_status_query",
+    "comfort_warmer",
+    "comfort_cooler",
+    "sleep_scene",
+    "away_scene",
+    "home_scene"
+  ],
+  "final_labels": [
+    "light_set",
+    "ac_power_set",
+    "curtain_set",
+    "ac_temperature_set",
+    "ac_mode_set",
+    "light_status_query",
+    "curtain_status_query",
+    "ac_status_query",
+    "door_status_query",
+    "temperature_query",
+    "humidity_query",
+    "environment_query",
+    "alarm_status_query",
+    "comfort_warmer",
+    "comfort_cooler",
+    "sleep_scene",
+    "away_scene",
+    "home_scene",
+    "requires_confirmation",
+    "unknown"
+  ]
+}

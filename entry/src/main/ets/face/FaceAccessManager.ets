@@ -3,6 +3,7 @@ import camera from '@ohos.multimedia.camera'
 import fs from '@ohos.file.fs'
 import image from '@ohos.multimedia.image'
 import { checkFaceModelName, extractFaceEmbedding, getFaceInferenceBackendInfo, loadFaceRecognizer } from './FaceInferenceNative'
+import { emitPerformanceEvent } from '../performance/PerformanceTrace'
 
 const CAMERA_PERMISSION: Permissions = 'ohos.permission.CAMERA'
 const FACE_USERS_FILE: string = 'face_users.json'
@@ -473,12 +474,13 @@ export class FaceAccessManager {
     }
   }
 
-  async captureFaceSample(_context: Context): Promise<FaceCaptureResult> {
+  async captureFaceSample(_context: Context, performanceTraceId: string = ''): Promise<FaceCaptureResult> {
     try {
       if (this.photoOutput === null) {
         return this.buildCaptureResult(false, '请先启动相机预览', 0, 0, 0, 0)
       }
-      const capturePromise = this.waitForPhoto(this.photoOutput)
+      emitPerformanceEvent(performanceTraceId, 'face', 'capture_requested')
+      const capturePromise = this.waitForPhoto(this.photoOutput, performanceTraceId)
       this.photoOutput.capture({
         quality: camera.QualityLevel.QUALITY_LEVEL_LOW,
         rotation: camera.ImageRotation.ROTATION_0,
@@ -487,6 +489,8 @@ export class FaceAccessManager {
         console.info(`[FaceAccess][capture-call-fail] ${err.message}`)
       })
       const result = await capturePromise
+      emitPerformanceEvent(performanceTraceId, 'face', 'capture_completed', 0, result.ok,
+        `${result.width}x${result.height} q=${result.qualityScore.toFixed(3)}`)
       console.info(`[FaceAccess][capture] ${result.byteLength}B ${result.width}x${result.height} fmt=${result.format}`)
       return result
     } catch (err) {
@@ -495,7 +499,7 @@ export class FaceAccessManager {
     }
   }
 
-  private waitForPhoto(photoOutput: camera.PhotoOutput): Promise<FaceCaptureResult> {
+  private waitForPhoto(photoOutput: camera.PhotoOutput, performanceTraceId: string): Promise<FaceCaptureResult> {
     return new Promise((resolve) => {
       let finished = false
       const finish = (result: FaceCaptureResult): void => {
@@ -524,6 +528,7 @@ export class FaceAccessManager {
         }
         clearTimeout(timer)
         console.info('[FaceAccess][photo-callback]')
+        emitPerformanceEvent(performanceTraceId, 'face', 'photo_callback', 0, !err)
         if (err) {
           finish(this.buildCaptureResult(false, `photo callback failed: ${err.message}`, 0, 0, 0, 0))
           return
@@ -554,6 +559,7 @@ export class FaceAccessManager {
             clearTimeout(jpegTimer)
             const bytes = new Uint8Array(component.byteBuffer)
             console.info(`[FaceAccess][jpeg-read-ok] ${bytes.length}B`)
+            emitPerformanceEvent(performanceTraceId, 'face', 'jpeg_ready', 0, true, `${bytes.length}B`)
             let preprocessDone = false
             const preprocessTimer = setTimeout(() => {
               if (preprocessDone) {
@@ -563,7 +569,7 @@ export class FaceAccessManager {
               console.info('[FaceAccess][pixel-decode-timeout]')
               finish(this.buildCaptureResult(false, 'pixel decode timeout', bytes.length, width, height, format))
             }, FACE_INFERENCE_TIMEOUT_MS)
-            this.extractEmbeddingFromJpeg(component.byteBuffer).then((embedding: FaceEmbeddingCapture) => {
+            this.extractEmbeddingFromJpeg(component.byteBuffer, performanceTraceId).then((embedding: FaceEmbeddingCapture) => {
               if (preprocessDone) {
                 return
               }
@@ -617,7 +623,8 @@ export class FaceAccessManager {
     })
   }
 
-  private async extractEmbeddingFromJpeg(jpegBuffer: ArrayBuffer): Promise<FaceEmbeddingCapture> {
+  private async extractEmbeddingFromJpeg(jpegBuffer: ArrayBuffer,
+    performanceTraceId: string = ''): Promise<FaceEmbeddingCapture> {
     let source: image.ImageSource | null = null
     let pixelMap: image.PixelMap | null = null
     try {
@@ -642,8 +649,11 @@ export class FaceAccessManager {
       payload.set(new Uint8Array(rgbaBuffer), 8)
 
       const inferenceStartedAt = Date.now()
+      emitPerformanceEvent(performanceTraceId, 'face', 'inference_start')
       const result = extractFaceEmbedding(payloadBuffer)
       console.info(`[FaceAccess][inference] ${Date.now() - inferenceStartedAt}ms ok=${result.ok}`)
+      emitPerformanceEvent(performanceTraceId, 'face', 'inference_complete', 0, result.ok,
+        `${Date.now() - inferenceStartedAt}ms dim=${result.dimension}`)
       const resultOk: boolean = result.ok
       const resultDimension: number = result.dimension
       const resultMessage: string = result.message
