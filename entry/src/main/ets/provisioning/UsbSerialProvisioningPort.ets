@@ -17,7 +17,7 @@ const SERIAL_NONE: number = -1
 const WCH_VENDOR_ID: number = 0x1A86
 const CP210X_VENDOR_ID: number = 0x10C4
 const READ_TIMEOUT_MS: number = 250
-const USB_READ_TIMEOUT_MS: number = 5000
+const USB_READ_TIMEOUT_MS: number = 1000
 const USB_READ_RETRY_DELAY_MS: number = 250
 const USB_READ_BUFFER_SIZE: number = 1024
 const READ_ACTIVE_DELAY_MS: number = 0
@@ -196,6 +196,7 @@ export class UsbSerialProvisioningPort {
   private readBuffer: Uint8Array = new Uint8Array(0)
   private reading: boolean = false
   private usbWriteInProgress: boolean = false
+  private usbWritePending: boolean = false
   private nextRxErrorLogAt: number = 0
   private nextEnterConfigTxLogAt: number = 0
   private nextAsciiHexHintAt: number = 0
@@ -281,6 +282,8 @@ export class UsbSerialProvisioningPort {
     this.readGeneration += 1
     this.idleReadSince = 0
     this.burstReadUntil = 0
+    this.usbWritePending = false
+    this.usbWriteInProgress = false
     if (this.backend === 'serial' && this.serialPortId !== SERIAL_NONE) {
       try {
         serialManager.close(this.serialPortId)
@@ -330,6 +333,12 @@ export class UsbSerialProvisioningPort {
       return
     }
     if (this.backend === 'usb' && this.pipe !== null && this.endpointSet !== null) {
+      this.usbWritePending = true
+      const waitDeadline = Date.now() + USB_READ_TIMEOUT_MS + 250
+      while (this.usbReadInFlightByEndpoint.some((inFlight: boolean) => inFlight) &&
+        Date.now() < waitDeadline) {
+        await this.waitMs(2)
+      }
       while (this.usbWriteInProgress) {
         await this.waitMs(2)
       }
@@ -340,6 +349,8 @@ export class UsbSerialProvisioningPort {
         this.ensureFrameFullyWritten(frame.length, written, 'USB-BULK')
       } finally {
         this.usbWriteInProgress = false
+        this.usbWritePending = false
+        this.startUsbReadLoops(this.readGeneration)
       }
       return
     }
@@ -1115,7 +1126,7 @@ export class UsbSerialProvisioningPort {
   private readUsbEndpointOnce(index: number, generation: number): void {
     if (!this.reading || this.backend !== 'usb' || this.pipe === null ||
       generation !== this.readGeneration || index < 0 || index >= this.usbReadEndpoints.length ||
-      this.usbReadInFlightByEndpoint[index]) {
+      this.usbReadInFlightByEndpoint[index] || this.usbWritePending || this.usbWriteInProgress) {
       return
     }
     const pipe = this.pipe
@@ -1148,13 +1159,20 @@ export class UsbSerialProvisioningPort {
     if (!this.reading || generation !== this.readGeneration) {
       return
     }
+    if (this.usbWritePending || this.usbWriteInProgress) {
+      return
+    }
     if (lastReadCount > 0) {
       this.readUsbEndpointOnce(index, generation)
       return
     }
+    // OpenHarmony may abort an in-flight USB IN transfer when a control frame is
+    // written on the same pipe. During the command/ACK window, re-arm quickly so
+    // the gateway's immediate control_result and device ACK stay in the CDC queue.
+    const retryDelay = Date.now() < this.burstReadUntil ? 5 : USB_READ_RETRY_DELAY_MS
     setTimeout(() => {
       this.readUsbEndpointOnce(index, generation)
-    }, USB_READ_RETRY_DELAY_MS)
+    }, retryDelay)
   }
 
   private consumeReadBuffer(buffer: Uint8Array, count: number): void {

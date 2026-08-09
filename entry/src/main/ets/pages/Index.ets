@@ -53,10 +53,24 @@ const VOICEPRINT_PHRASES: string[] = [
 ]
 
 interface SensorPacket {
+  t?: string
+  d?: string
+  tp?: number | string
   temperature?: number | string
   humidity?: number | string
   temp?: number | string
   hum?: number | string
+  p?: boolean | number | string
+  lx?: number | string
+  l?: boolean | number | string
+  do?: boolean | number | string
+  dl?: boolean | number | string
+  sq?: number
+  lux?: number | string
+  lightLevel?: number | string
+  light_level?: number | string
+  pir?: boolean | number | string
+  presence?: boolean | number | string
   smoke?: boolean | AlarmSensorReading
   water?: AlarmSensorReading
   waterLeak?: boolean
@@ -122,7 +136,6 @@ interface DoorControlCommand {
   val: number
   source: string
   priority: number
-  lockMs: number
   seq: number
   userId?: string
   userName?: string
@@ -210,6 +223,13 @@ interface GatewayBleDeviceInfo {
 interface BleLedControlCommand {
   cmd: string
   val: number
+  seq: number
+}
+
+interface BleDoorControlCommand {
+  cmd: string
+  val: number
+  priority: number
   seq: number
 }
 
@@ -376,7 +396,6 @@ const LED_CONTROL_PRIORITY: number = 10
 const LED_CONTROL_LOCK_MS: number = 5000
 const LED_OPTIMISTIC_HOLD_MS: number = 20000
 const DOOR_CONTROL_PRIORITY: number = 10
-const DOOR_CONTROL_LOCK_MS: number = 5000
 const JIANGNING_LATITUDE: number = 31.953168
 const JIANGNING_LONGITUDE: number = 118.83951
 const OUTDOOR_WEATHER_REFRESH_MS: number = 10 * 60 * 1000
@@ -579,6 +598,10 @@ struct Index {
   @State bleDebugLightOn: boolean = false
   @State bleDebugLightStatus: string = '等待连接 BLE 照明设备'
   @State bleDebugLightBusy: boolean = false
+  @State bleDebugDoorLocked: boolean = true
+  @State bleDebugDoorOpen: boolean = false
+  @State bleDebugDoorStatus: string = '等待连接 BLE 门禁设备'
+  @State bleDebugDoorBusy: boolean = false
   @State bleDebugCryptoMode: string = 'SM4'
   @State bleDebugKeyStatus: string = '连接照明设备后将自动协商 BLE 动态密钥'
   @State bleDebugKeyReadyDeviceId: string = ''
@@ -591,7 +614,13 @@ struct Index {
   private bleDebugLedSeq: number = 0
   private bleDebugPendingSeq: number = 0
   private bleDebugPendingDeviceId: string = ''
+  private bleDebugPendingLightOn: boolean = false
   private bleDebugTimerId: number = -1
+  private bleDebugDoorSeq: number = 0
+  private bleDebugDoorPendingSeq: number = 0
+  private bleDebugDoorPendingDeviceId: string = ''
+  private bleDebugDoorTargetLocked: boolean = true
+  private bleDebugDoorTimerId: number = -1
   private bleKeyTimerId: number = -1
   private bleKeyAutoTimerId: number = -1
   private bleKeyEpochByDevice: Map<string, number> = new Map()
@@ -777,6 +806,8 @@ struct Index {
   private gatewayBleReconnectTimerId: number = -1
   private gatewayBleCandidateAddresses: string[] = []
   private gatewayBleControlSeq: number = 0
+  private bleDebugLightGatewaySeq: number = 0
+  private bleDebugDoorGatewaySeq: number = 0
   private gatewayAutoConnectTimerId: number = -1
   private gatewayAutoConnectAttempt: number = 0
   private debugInfoScroller: Scroller = new Scroller()
@@ -935,11 +966,18 @@ struct Index {
     this.clearGatewayBleReconnectTimer()
     this.gatewayBleReconnecting = false
     this.clearBleDebugTimer()
+    this.clearBleDebugDoorTimer()
     this.clearBleKeyTimer()
     this.clearBleKeyAutoTimer()
     this.bleDebugPendingSeq = 0
     this.bleDebugPendingDeviceId = ''
+    this.bleDebugPendingLightOn = false
+    this.bleDebugLightGatewaySeq = 0
     this.bleDebugLightBusy = false
+    this.bleDebugDoorPendingSeq = 0
+    this.bleDebugDoorPendingDeviceId = ''
+    this.bleDebugDoorGatewaySeq = 0
+    this.bleDebugDoorBusy = false
     this.bleDebugKeyBusy = false
     this.clearGatewayAutoConnectTimer()
     this.clearIrLearnTimer()
@@ -3377,7 +3415,7 @@ struct Index {
     }
     this.syncProtocolFromSensorData(data, source, deviceId)
     const nextTemp = this.findNumber(data as Object as Record<string, Object>, [
-      'temperature', 'temp', 't', 'Temperature', 'Temp', 'TEMP'
+      'temperature', 'temp', 'tp', 't', 'Temperature', 'Temp', 'TEMP'
     ])
     const nextHumidity = this.findNumber(data as Object as Record<string, Object>, [
       'humidity', 'hum', 'h', 'Humidity', 'Hum', 'HUM'
@@ -3394,6 +3432,28 @@ struct Index {
       this.indoorHumidityText = `${nextHumidity.toFixed(1)}%`
       if (this.indoorHumidity !== nextHumidity) {
         this.indoorHumidity = nextHumidity
+      }
+    }
+
+    const rawData = data as Object as Record<string, Object>
+    const nextLux = this.findNumber(rawData, ['lux', 'lx', 'lightLevel', 'light_level', 'illumination'])
+    if (nextLux !== null && nextLux >= 0) {
+      this.federatedLux = nextLux
+    }
+    const nextPresence = this.findBoolLike(rawData, ['pir', 'p', 'presence', 'occupied', 'humanDetected'])
+    if (nextPresence !== null) {
+      this.federatedPresence = nextPresence ? 1 : 0
+    }
+    const nextDoorOpen = this.findBoolLike(rawData, ['doorOpen', 'door', 'do'])
+    const nextDoorLocked = this.findBoolLike(rawData, ['doorLocked', 'locked', 'dl'])
+    if ((nextDoorOpen !== null || nextDoorLocked !== null) &&
+      deviceId === this.deviceForCapability('door')) {
+      if (nextDoorOpen !== null) {
+        this.doorOpen = nextDoorOpen
+        this.hasDoorOpenStatus = true
+      }
+      if (nextDoorLocked !== null) {
+        this.doorLocked = nextDoorLocked
       }
     }
     if (nextTemp !== null || nextHumidity !== null) {
@@ -3424,6 +3484,10 @@ struct Index {
     if (data.smoke === true || data.waterLeak === true || data.fallDetected === true) {
       nextLevel = Math.max(nextLevel, 3)
       msg = data.message ?? '检测到一级严重突发预警'
+    }
+    if (nextPresence === true && nextLevel < 1) {
+      nextLevel = 1
+      msg = data.message ?? '检测到人员活动'
     }
 
     if (this.hasActiveDeviceAlarm()) {
@@ -3483,6 +3547,17 @@ struct Index {
   applySensorJson(jsonStr: string, source: string, deviceId: string = this.activeDeviceId): void {
     try {
       const data = JSON.parse(jsonStr) as SensorPacket
+      // BLE uses compact field names to keep encrypted Notify packets below MTU.
+      // Normalize them here so the existing UI and cloud paths remain unchanged.
+      if (data.temperature === undefined && data.temp === undefined && data.tp !== undefined) {
+        data.temperature = data.tp
+      }
+      if (data.lux === undefined && data.lx !== undefined) {
+        data.lux = data.lx
+      }
+      if (data.pir === undefined && data.p !== undefined) {
+        data.pir = data.p
+      }
       this.applySensorData(data, source, deviceId)
       if (deviceId === this.activeDeviceId && this.cryptoPendingMode.length === 0) {
         this.cryptoDebugText = `${source}解析OK ${this.sensorDisplay[0]}/${this.sensorDisplay[1]}`
@@ -3520,6 +3595,28 @@ struct Index {
       const nested = data[nestedKeys[i]]
       if (typeof nested === 'object' && nested !== null) {
         const parsed = this.findNumber(nested as Record<string, Object>, keys)
+        if (parsed !== null) {
+          return parsed
+        }
+      }
+    }
+
+    return null
+  }
+
+  findBoolLike(data: Record<string, Object>, keys: string[]): boolean | null {
+    for (let i = 0; i < keys.length; i++) {
+      const parsed = this.readBoolLike(data[keys[i]] as boolean | number | string | undefined)
+      if (parsed !== null) {
+        return parsed
+      }
+    }
+
+    const nestedKeys: string[] = ['data', 'sensor', 'payload', 'msg', 'message']
+    for (let i = 0; i < nestedKeys.length; i++) {
+      const nested = data[nestedKeys[i]]
+      if (typeof nested === 'object' && nested !== null) {
+        const parsed = this.findBoolLike(nested as Record<string, Object>, keys)
         if (parsed !== null) {
           return parsed
         }
@@ -3665,7 +3762,7 @@ struct Index {
         return true
       }
       const data = JSON.parse(jsonStr) as Record<string, Object>
-      const payloadDeviceId = data['deviceId'] as string
+      const payloadDeviceId = (typeof data['deviceId'] === 'string' ? data['deviceId'] : data['d']) as string
       if (typeof payloadDeviceId === 'string' && this.normalizeDeviceId(payloadDeviceId) !== deviceId) {
         console.info(`[DEVICE][payload-reject] source=${deviceId} payload=${payloadDeviceId}`)
         return true
@@ -3688,24 +3785,26 @@ struct Index {
         return true
       }
 
-      const ledState = this.readBoolLike(data['led'] as boolean | number | string | undefined)
+      const ledState = this.findBoolLike(data, ['led', 'l'])
       if (ledState !== null && deviceId === this.deviceForCapability('light')) {
         const lightStatus: LightStatusPacket = {
           led: ledState,
           ledLock: data['ledLock'] as LedLockStatus | undefined,
-          seq: typeof data['seq'] === 'number' ? data['seq'] as number : undefined
+          seq: typeof data['seq'] === 'number' ? data['seq'] as number :
+            (typeof data['sq'] === 'number' ? data['sq'] as number : undefined)
         }
         this.applyLightStatus(lightStatus, 'DEVICE_JSON')
       }
-      const lockedState = this.readBoolLike(data['locked'] as boolean | number | string | undefined)
-      const doorState = this.readBoolLike(data['door'] as boolean | number | string | undefined)
+      const lockedState = this.findBoolLike(data, ['locked', 'doorLocked', 'dl'])
+      const doorState = this.findBoolLike(data, ['door', 'doorOpen', 'do'])
       if ((lockedState !== null || doorState !== null) && deviceId === this.deviceForCapability('door')) {
         this.applyLightStatus({
           locked: lockedState !== null ? lockedState : undefined,
           door: doorState !== null ? doorState : undefined,
           doorLock: data['doorLock'] as LedLockStatus | undefined,
           source: data['source'] as string | undefined,
-          seq: typeof data['seq'] === 'number' ? data['seq'] as number : undefined
+          seq: typeof data['seq'] === 'number' ? data['seq'] as number :
+            (typeof data['sq'] === 'number' ? data['sq'] as number : undefined)
         }, 'DEVICE_JSON')
       }
       const curtainPercent = this.findNumber(data, ['percent', 'openPercent', 'curtainPercent'])
@@ -4052,6 +4151,9 @@ struct Index {
       return
     }
     if (cmd === 'door') {
+      if (this.handleBleDebugDoorAck(data, deviceId)) {
+        return
+      }
       if (deviceId !== this.deviceForCapability('door')) {
         console.info(`[DOOR][ack-ignore-device] expected=${this.deviceForCapability('door')} received=${deviceId}`)
         return
@@ -4324,20 +4426,6 @@ struct Index {
 
       const data = JSON.parse(jsonStr) as SensorPacket
       const rawData = data as Object as Record<string, Object>
-      if (typeof rawData['lux'] === 'number') {
-        // 光照度 — 暂不显示在 UI，仅日志
-        this.federatedLux = rawData['lux'] as number
-        console.info(`[Crypto] lux=${this.federatedLux}`)
-      }
-      if (typeof rawData['pir'] === 'number') {
-        // PIR 人体检测映射到 alertLevel
-        const pirVal = rawData['pir'] as number
-        this.federatedPresence = pirVal === 1 ? 1 : 0
-        if (pirVal === 1 && this.alertLevel < 1) {
-          this.alertLevel = 1
-          this.alertMessage = '检测到人员活动'
-        }
-      }
       if (typeof rawData['proto'] === 'string') {
         console.info(`[Crypto] proto=${rawData['proto']}, dev=${rawData['dev']}`)
       }
@@ -5544,7 +5632,6 @@ struct Index {
       val: unlock ? 1 : 0,
       source: 'dayu',
       priority: DOOR_CONTROL_PRIORITY,
-      lockMs: DOOR_CONTROL_LOCK_MS,
       seq
     }
     if (userId.length > 0) {
@@ -6010,6 +6097,18 @@ struct Index {
     }
   }
 
+  nextBleDebugDoorSeq(): number {
+    this.bleDebugDoorSeq = (this.bleDebugDoorSeq % 999999) + 1
+    return this.bleDebugDoorSeq
+  }
+
+  clearBleDebugDoorTimer(): void {
+    if (this.bleDebugDoorTimerId !== -1) {
+      clearTimeout(this.bleDebugDoorTimerId)
+      this.bleDebugDoorTimerId = -1
+    }
+  }
+
   clearBleKeyTimer(): void {
     if (this.bleKeyTimerId !== -1) {
       clearTimeout(this.bleKeyTimerId)
@@ -6039,11 +6138,13 @@ struct Index {
   }
 
   selectBleDebugCryptoMode(mode: string): void {
-    if (mode !== 'AES' && mode !== 'SM4' || this.bleDebugLightBusy || this.bleDebugKeyBusy) {
+    if (mode !== 'AES' && mode !== 'SM4' || this.bleDebugLightBusy ||
+      this.bleDebugDoorBusy || this.bleDebugKeyBusy) {
       return
     }
     this.bleDebugCryptoMode = mode
     this.bleDebugLightStatus = `BLE 加密方式已选择 ${mode}-GCM`
+    this.bleDebugDoorStatus = `BLE 加密方式已选择 ${mode}-GCM`
   }
 
   scheduleBleDebugKeyExchange(delayMs: number = 350): void {
@@ -6197,8 +6298,10 @@ struct Index {
   }
 
   processBleBusinessJson(jsonStr: string, topic: string, deviceId: string): void {
-    console.info(`[BLE][business] device=${deviceId} topic=${topic} ${jsonStr.substring(0, 80)}`)
+    console.info(`[BLE][business] device=${deviceId} topic=${topic} ${jsonStr.substring(0, 180)}`)
     this.addMqttMessage(topic, jsonStr)
+    this.syncBleDebugLightStatus(jsonStr, deviceId)
+    this.syncBleDebugDoorStatus(jsonStr, deviceId)
     if (this.handleDeviceStatusJson(jsonStr, deviceId)) {
       return
     }
@@ -6255,6 +6358,7 @@ struct Index {
         this.bleDebugKeyBusy = false
         this.bleDebugKeyStatus = `BLE 动态密钥已就绪 · ${mode}-GCM`
         this.bleDebugLightStatus = 'BLE 安全通道已就绪，可以控制灯光'
+        this.bleDebugDoorStatus = 'BLE 安全通道已就绪，可以控制门禁'
         return
       }
     }
@@ -6287,6 +6391,7 @@ struct Index {
     const seq = this.nextBleDebugLedSeq()
     this.bleDebugPendingSeq = seq
     this.bleDebugPendingDeviceId = lightDevice.deviceId
+    this.bleDebugPendingLightOn = power
     this.bleDebugLightBusy = true
     this.bleDebugLightStatus = `正在通过 BLE ${power ? '开灯' : '关灯'} #${seq}`
     this.clearBleDebugTimer()
@@ -6297,8 +6402,10 @@ struct Index {
       }
       this.bleDebugPendingSeq = 0
       this.bleDebugPendingDeviceId = ''
+      this.bleDebugPendingLightOn = false
+      this.bleDebugLightGatewaySeq = 0
       this.bleDebugLightBusy = false
-      this.provisioningPort.endReceiveBoost()
+      this.endBleControlReceiveBoostIfIdle()
       this.bleDebugLightStatus = `BLE 等待设备 ACK 超时 #${seq}`
     }, GATEWAY_BLE_CONTROL_TIMEOUT_MS)
 
@@ -6319,7 +6426,7 @@ struct Index {
         epoch,
         payloadBase64: this.uint8ArrayToBase64(encrypted)
       }))
-      await this.sendBleEncryptedPayload(
+      this.bleDebugLightGatewaySeq = await this.sendBleEncryptedPayload(
         lightDevice.deviceId,
         this.commandTopicForDevice('dayu/cmd', lightDevice.deviceId),
         this.uint8ArrayToBase64(envelope), envelope.length, this.bleDebugCryptoMode)
@@ -6328,8 +6435,10 @@ struct Index {
       this.clearBleDebugTimer()
       this.bleDebugPendingSeq = 0
       this.bleDebugPendingDeviceId = ''
+      this.bleDebugPendingLightOn = false
+      this.bleDebugLightGatewaySeq = 0
       this.bleDebugLightBusy = false
-      this.provisioningPort.endReceiveBoost()
+      this.endBleControlReceiveBoostIfIdle()
       this.bleDebugLightStatus = `BLE 发送失败：${(err as Error).message}`
     }
   }
@@ -6351,8 +6460,10 @@ struct Index {
     this.clearBleDebugTimer()
     this.bleDebugPendingSeq = 0
     this.bleDebugPendingDeviceId = ''
+    this.bleDebugPendingLightOn = false
+    this.bleDebugLightGatewaySeq = 0
     this.bleDebugLightBusy = false
-    this.provisioningPort.endReceiveBoost()
+    this.endBleControlReceiveBoostIfIdle()
     if (ok && value !== null) {
       this.bleDebugLightOn = value
     }
@@ -6363,10 +6474,208 @@ struct Index {
     return true
   }
 
+  syncBleDebugLightStatus(jsonStr: string, deviceId: string): void {
+    if (deviceId !== this.deviceForBleLight()) {
+      return
+    }
+    try {
+      const data = JSON.parse(jsonStr) as Record<string, Object>
+      const lightOn = this.findBoolLike(data, ['led', 'l'])
+      if (lightOn === null) {
+        return
+      }
+      const type = typeof data['type'] === 'string' ? (data['type'] as string).toLowerCase() : ''
+      this.bleDebugLightOn = lightOn
+      if (type !== 'ack' && this.bleDebugPendingSeq > 0 && deviceId === this.bleDebugPendingDeviceId &&
+        lightOn === this.bleDebugPendingLightOn) {
+        const confirmedSeq = this.bleDebugPendingSeq
+        this.clearBleDebugTimer()
+        this.bleDebugPendingSeq = 0
+        this.bleDebugPendingDeviceId = ''
+        this.bleDebugPendingLightOn = false
+        this.bleDebugLightGatewaySeq = 0
+        this.bleDebugLightBusy = false
+        this.endBleControlReceiveBoostIfIdle()
+        this.bleDebugLightStatus = `BLE 状态已确认${lightOn ? '开灯' : '关灯'} #${confirmedSeq}`
+        this.cryptoDebugText = `BLE LED 状态确认 #${confirmedSeq}`
+        this.addProvisioningDiagnosticLog(`BLE 灯光状态确认 seq=${confirmedSeq} on=${lightOn}`)
+        return
+      }
+      if (!this.bleDebugLightBusy) {
+        this.bleDebugLightStatus = `BLE 状态同步：灯已${lightOn ? '开启' : '关闭'}`
+      }
+    } catch (err) {
+      console.info(`[BLE][light-status-parse-fail] ${(err as Error).message}`)
+    }
+  }
+
+  syncBleDebugDoorStatus(jsonStr: string, deviceId: string): void {
+    if (deviceId !== this.deviceForBleDoor()) {
+      return
+    }
+    try {
+      const data = JSON.parse(jsonStr) as Record<string, Object>
+      const locked = this.findBoolLike(data, ['locked', 'doorLocked', 'dl'])
+      const open = this.findBoolLike(data, ['door', 'doorOpen', 'do'])
+      if (locked === null && open === null) {
+        return
+      }
+      if (locked !== null) {
+        this.bleDebugDoorLocked = locked
+      }
+      if (open !== null) {
+        this.bleDebugDoorOpen = open
+      }
+      const type = typeof data['type'] === 'string' ? (data['type'] as string).toLowerCase() : ''
+      if (type !== 'ack' && this.bleDebugDoorPendingSeq > 0 &&
+        deviceId === this.bleDebugDoorPendingDeviceId) {
+        const targetLocked = this.bleDebugDoorTargetLocked
+        const targetConfirmed = targetLocked ?
+          (locked === true && open !== true) : (open === true || locked === false)
+        if (targetConfirmed) {
+          const confirmedSeq = this.bleDebugDoorPendingSeq
+          this.clearBleDebugDoorTimer()
+          this.bleDebugDoorPendingSeq = 0
+          this.bleDebugDoorPendingDeviceId = ''
+          this.bleDebugDoorGatewaySeq = 0
+          this.bleDebugDoorBusy = false
+          this.endBleControlReceiveBoostIfIdle()
+          this.bleDebugDoorStatus = targetLocked ?
+            `BLE 状态已确认关门上锁 #${confirmedSeq}` :
+            `BLE 状态已确认开门 #${confirmedSeq}`
+          this.cryptoDebugText = `BLE DOOR 状态确认 #${confirmedSeq}`
+          this.addProvisioningDiagnosticLog(
+            `BLE 门禁状态确认 seq=${confirmedSeq} locked=${this.bleDebugDoorLocked} open=${this.bleDebugDoorOpen}`)
+          return
+        }
+      }
+      if (type !== 'ack' && !this.bleDebugDoorBusy) {
+        this.bleDebugDoorStatus = this.bleDebugDoorOpen ?
+          'BLE 状态同步：门已打开' : this.bleDebugDoorLocked ?
+            'BLE 状态同步：门已关闭并上锁' : 'BLE 状态同步：门已关闭'
+      }
+    } catch (err) {
+      console.info(`[BLE][door-status-parse-fail] ${(err as Error).message}`)
+    }
+  }
+
+  async sendBleDebugDoorControl(open: boolean): Promise<void> {
+    if (this.bleDebugDoorBusy) {
+      return
+    }
+    const doorDevice = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
+      item.capabilities.indexOf('door') >= 0)
+    if (doorDevice === undefined) {
+      this.bleDebugDoorStatus = '未发现 BLE 门禁设备'
+      return
+    }
+    if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+      this.bleDebugDoorStatus = 'BLE 网关 USB 未连接'
+      return
+    }
+    if (!this.bleDebugHasDynamicKey(doorDevice.deviceId)) {
+      this.bleDebugDoorStatus = '请先协商 BLE 动态密钥'
+      return
+    }
+
+    const seq = this.nextBleDebugDoorSeq()
+    this.bleDebugDoorPendingSeq = seq
+    this.bleDebugDoorPendingDeviceId = doorDevice.deviceId
+    this.bleDebugDoorTargetLocked = !open
+    this.bleDebugDoorBusy = true
+    this.bleDebugDoorStatus = `正在通过 BLE ${open ? '开门' : '关门'} #${seq}`
+    this.clearBleDebugDoorTimer()
+    this.bleDebugDoorTimerId = setTimeout(() => {
+      this.bleDebugDoorTimerId = -1
+      if (this.bleDebugDoorPendingSeq !== seq) {
+        return
+      }
+      this.bleDebugDoorPendingSeq = 0
+      this.bleDebugDoorPendingDeviceId = ''
+      this.bleDebugDoorGatewaySeq = 0
+      this.bleDebugDoorBusy = false
+      this.endBleControlReceiveBoostIfIdle()
+      this.bleDebugDoorStatus = `BLE 等待门禁 ACK 超时 #${seq}`
+    }, GATEWAY_BLE_CONTROL_TIMEOUT_MS)
+
+    const command: BleDoorControlCommand = {
+      cmd: 'door',
+      val: open ? 1 : 0,
+      priority: DOOR_CONTROL_PRIORITY,
+      seq
+    }
+    try {
+      const sessionId = this.bleCryptoSessionId(doorDevice.deviceId)
+      const encrypted = await encryptWithModeForDevice(
+        JSON.stringify(command), this.bleDebugCryptoMode, sessionId)
+      const epoch = this.bleKeyEpochByDevice.get(doorDevice.deviceId) ?? 1
+      const envelope = utf8Encode(JSON.stringify({
+        type: 'ble_secure',
+        version: 1,
+        crypto: this.bleDebugCryptoMode,
+        epoch,
+        payloadBase64: this.uint8ArrayToBase64(encrypted)
+      }))
+      this.bleDebugDoorGatewaySeq = await this.sendBleEncryptedPayload(
+        doorDevice.deviceId,
+        this.commandTopicForDevice('dayu/cmd', doorDevice.deviceId),
+        this.uint8ArrayToBase64(envelope), envelope.length, this.bleDebugCryptoMode)
+      this.bleDebugDoorStatus = `BLE 门禁指令已写入，等待设备 ACK #${seq}`
+    } catch (err) {
+      this.clearBleDebugDoorTimer()
+      this.bleDebugDoorPendingSeq = 0
+      this.bleDebugDoorPendingDeviceId = ''
+      this.bleDebugDoorGatewaySeq = 0
+      this.bleDebugDoorBusy = false
+      this.endBleControlReceiveBoostIfIdle()
+      this.bleDebugDoorStatus = `BLE 门禁发送失败：${(err as Error).message}`
+    }
+  }
+
+  handleBleDebugDoorAck(data: Record<string, Object>, deviceId: string): boolean {
+    if (this.bleDebugDoorPendingSeq <= 0 || this.bleDebugDoorPendingDeviceId.length === 0 ||
+      deviceId !== this.bleDebugDoorPendingDeviceId) {
+      return false
+    }
+    const seq = typeof data['seq'] === 'number' ? data['seq'] as number : 0
+    if (seq > 0 && seq !== this.bleDebugDoorPendingSeq) {
+      return false
+    }
+    const acknowledgedSeq = seq > 0 ? seq : this.bleDebugDoorPendingSeq
+    const ok = data['ok'] === true
+    const val = this.readBoolLike(data['val'] as boolean | number | string | undefined)
+    const locked = this.findBoolLike(data, ['locked', 'doorLocked'])
+    const open = this.findBoolLike(data, ['door', 'doorOpen'])
+    this.clearBleDebugDoorTimer()
+    this.bleDebugDoorPendingSeq = 0
+    this.bleDebugDoorPendingDeviceId = ''
+    this.bleDebugDoorGatewaySeq = 0
+    this.bleDebugDoorBusy = false
+    this.endBleControlReceiveBoostIfIdle()
+    if (ok) {
+      this.bleDebugDoorLocked = locked !== null ? locked :
+        val !== null ? !val : this.bleDebugDoorTargetLocked
+      this.bleDebugDoorOpen = open !== null ? open :
+        val !== null ? val : !this.bleDebugDoorTargetLocked
+    }
+    this.bleDebugDoorStatus = ok ?
+      this.bleDebugDoorOpen ? `BLE 已开门 #${acknowledgedSeq}` :
+        `BLE 已关门上锁 #${acknowledgedSeq}` : `BLE 门禁执行失败 #${acknowledgedSeq}`
+    this.cryptoDebugText = ok ?
+      `BLE DOOR ACK #${acknowledgedSeq}` : `BLE DOOR ACK失败 #${acknowledgedSeq}`
+    return true
+  }
+
   deviceForBleLight(): string {
     const lightDevice = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
       item.capabilities.indexOf('light') >= 0)
     return lightDevice === undefined ? '' : lightDevice.deviceId
+  }
+
+  deviceForBleDoor(): string {
+    const doorDevice = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
+      item.capabilities.indexOf('door') >= 0)
+    return doorDevice === undefined ? '' : doorDevice.deviceId
   }
 
   deviceForConnectedBleLight(): string {
@@ -6396,6 +6705,21 @@ struct Index {
     return `${device.name} · ${this.deviceIdDisplayText(device.deviceId)}`
   }
 
+  bleDebugDoorDeviceText(): string {
+    const device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
+      item.connected && item.capabilities.indexOf('door') >= 0)
+    if (device === undefined) {
+      return '未连接门禁设备'
+    }
+    return `${device.name} · ${this.deviceIdDisplayText(device.deviceId)}`
+  }
+
+  bleDebugDoorControlReady(): boolean {
+    const deviceId = this.deviceForBleDoor()
+    return this.provisioningConnected && this.provisioningPort.isOpen() &&
+      deviceId.length > 0 && this.bleDebugHasDynamicKey(deviceId)
+  }
+
   bleDebugLightButtonText(): string {
     if (this.bleDebugLightBusy) {
       return '等待设备 ACK'
@@ -6403,8 +6727,14 @@ struct Index {
     return this.bleDebugLightOn ? '通过 BLE 关灯' : '通过 BLE 开灯'
   }
 
+  endBleControlReceiveBoostIfIdle(): void {
+    if (!this.bleDebugLightBusy && !this.bleDebugDoorBusy) {
+      this.provisioningPort.endReceiveBoost()
+    }
+  }
+
   async sendBleEncryptedPayload(targetDeviceId: string, topic: string,
-    payloadBase64: string, bytes: number, cryptoMode: string): Promise<void> {
+    payloadBase64: string, bytes: number, cryptoMode: string): Promise<number> {
     if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
       throw new Error('BLE 网关 USB 未连接')
     }
@@ -6432,12 +6762,13 @@ struct Index {
     const sent = await this.sendProvisioningFrameWithSeq(
       ProvisioningFrameType.GATEWAY_BLE_COMMAND, seq, payload)
     if (!sent) {
-      this.provisioningPort.endReceiveBoost()
+      this.endBleControlReceiveBoostIfIdle()
       throw new Error(this.provisioningStatus)
     }
     this.cryptoDebugText = `BLE 指令已发送 ${targetDeviceId} ${bytes}B ${cryptoMode}`
     this.addProvisioningDiagnosticLog(
       `BLE 控制帧已发送 #${seq} device=${targetDeviceId} encrypted=${bytes}B`)
+    return seq
   }
 
   /**
@@ -7930,20 +8261,43 @@ struct Index {
       if (eventType === 'ble_control_result') {
         const deviceId = typeof data['deviceId'] === 'string' ?
           this.normalizeDeviceId(data['deviceId'] as string) : ''
+        const resultSeq = typeof data['seq'] === 'number' ? data['seq'] as number : 0
         const message = typeof data['message'] === 'string' ? data['message'] as string : ''
+        const lightResult = resultSeq > 0 ? resultSeq === this.bleDebugLightGatewaySeq :
+          this.bleDebugLightBusy && !this.bleDebugDoorBusy
+        const doorResult = resultSeq > 0 ? resultSeq === this.bleDebugDoorGatewaySeq :
+          this.bleDebugDoorBusy && !this.bleDebugLightBusy
         this.cryptoDebugText = data['ok'] === true ?
           `BLE 指令已写入 ${deviceId}` : `BLE 指令失败 ${message}`
-        if (data['ok'] !== true && deviceId === this.bleDebugPendingDeviceId &&
+        if (data['ok'] === true && lightResult) {
+          this.bleDebugLightGatewaySeq = 0
+        }
+        if (data['ok'] === true && doorResult) {
+          this.bleDebugDoorGatewaySeq = 0
+        }
+        if (data['ok'] !== true && lightResult && deviceId === this.bleDebugPendingDeviceId &&
           this.bleDebugPendingSeq > 0) {
           this.clearBleDebugTimer()
           this.bleDebugPendingSeq = 0
           this.bleDebugPendingDeviceId = ''
+          this.bleDebugPendingLightOn = false
+          this.bleDebugLightGatewaySeq = 0
           this.bleDebugLightBusy = false
-          this.provisioningPort.endReceiveBoost()
+          this.endBleControlReceiveBoostIfIdle()
           this.bleDebugLightStatus = `BLE 网关写入失败：${message}`
         }
+        if (data['ok'] !== true && doorResult && deviceId === this.bleDebugDoorPendingDeviceId &&
+          this.bleDebugDoorPendingSeq > 0) {
+          this.clearBleDebugDoorTimer()
+          this.bleDebugDoorPendingSeq = 0
+          this.bleDebugDoorPendingDeviceId = ''
+          this.bleDebugDoorGatewaySeq = 0
+          this.bleDebugDoorBusy = false
+          this.endBleControlReceiveBoostIfIdle()
+          this.bleDebugDoorStatus = `BLE 网关写入门禁指令失败：${message}`
+        }
         this.addProvisioningDiagnosticLog(
-          `BLE 控制结果 device=${deviceId} ok=${data['ok'] === true} ${message}`)
+          `BLE 控制结果 seq=${resultSeq} device=${deviceId} ok=${data['ok'] === true} ${message}`)
         return
       }
       if (eventType === 'ble_message') {
@@ -10826,11 +11180,11 @@ struct Index {
             .borderRadius(16)
 
             Column() {
-              Text('BLE 灯光控制测试')
+              Text('BLE 设备控制测试')
                 .fontSize(22)
                 .fontWeight(FontWeight.Bold)
                 .fontColor(this.textColor())
-              Text('该页面只使用蓝牙链路，不会切换或降级到 MQTT / HTTP')
+              Text('灯光与门禁只使用蓝牙链路，不会切换或降级到 MQTT / HTTP')
                 .fontSize(13)
                 .fontColor(this.subTextColor())
                 .margin({ top: 6 })
@@ -10871,6 +11225,21 @@ struct Index {
             }
             .width('100%')
             .margin({ top: 8 })
+
+            Row() {
+              Text('BLE 门禁设备')
+                .fontSize(14)
+                .fontColor(this.subTextColor())
+                .layoutWeight(1)
+              Text(this.bleDebugDoorDeviceText())
+                .fontSize(14)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(this.bleDebugDoorControlReady() ? this.accentGreen() : this.warningRed())
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .width('100%')
+            .margin({ top: 8 })
           }
           .width('100%')
           .padding(10)
@@ -10905,7 +11274,8 @@ struct Index {
               .backgroundColor(this.bleDebugLightReady() && !this.bleDebugKeyBusy ?
                 this.accentGreen() : '#7B8583')
               .borderRadius(10)
-              .enabled(this.bleDebugLightReady() && !this.bleDebugKeyBusy && !this.bleDebugLightBusy)
+              .enabled(this.bleDebugLightReady() && !this.bleDebugKeyBusy &&
+                !this.bleDebugLightBusy && !this.bleDebugDoorBusy)
               .onClick(() => {
                 this.bleKeyRetryByDevice.delete(this.deviceForConnectedBleLight())
                 this.startBleDebugKeyExchange(true)
@@ -10946,43 +11316,97 @@ struct Index {
           .width(260)
           .margin({ top: 2 })
 
-          Stack({ alignContent: Alignment.Center }) {
-            Image(this.bleDebugLightOn ? $r('app.media.overview_light_on') :
-              $r('app.media.overview_light_off'))
-              .width(104)
-              .height(62)
-              .objectFit(ImageFit.Contain)
+          Row() {
+            Column() {
+              Image(this.bleDebugLightOn ? $r('app.media.overview_light_on') :
+                $r('app.media.overview_light_off'))
+                .width(78)
+                .height(44)
+                .objectFit(ImageFit.Contain)
+
+              Text(this.bleDebugLightStatus)
+                .width('100%')
+                .height(24)
+                .fontSize(12)
+                .fontColor(this.bleDebugLightStatus.indexOf('失败') >= 0 ||
+                  this.bleDebugLightStatus.indexOf('超时') >= 0 ||
+                  this.bleDebugLightStatus.indexOf('未连接') >= 0 ||
+                  this.bleDebugLightStatus.indexOf('未发现') >= 0 ? this.warningRed() : this.subTextColor())
+                .textAlign(TextAlign.Center)
+                .maxLines(2)
+
+              Button(this.bleDebugLightButtonText())
+                .width(230)
+                .height(34)
+                .fontSize(14)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#FFFFFF')
+                .backgroundColor(this.bleDebugControlReady() && !this.bleDebugLightBusy ?
+                  this.accentGreen() : '#7B8583')
+                .borderRadius(11)
+                .enabled(this.bleDebugControlReady() && !this.bleDebugLightBusy && !this.bleDebugKeyBusy)
+                .onClick(() => {
+                  this.sendBleDebugLightControl(!this.bleDebugLightOn)
+                })
+            }
+            .layoutWeight(1)
+            .height(124)
+            .alignItems(HorizontalAlign.Center)
+            .justifyContent(FlexAlign.SpaceBetween)
+            .padding({ top: 4, bottom: 3 })
+            .backgroundColor(this.softPanelBg())
+            .border({ width: 1.5, color: this.hairlineColor() })
+            .borderRadius(14)
+
+            Column() {
+              Image(this.bleDebugDoorLocked ? $r('app.media.overview_door_locked') :
+                $r('app.media.overview_door_unlocked'))
+                .width(44)
+                .height(44)
+                .objectFit(ImageFit.Contain)
+
+              Text(this.bleDebugDoorStatus)
+                .width('100%')
+                .height(24)
+                .fontSize(12)
+                .fontColor(this.bleDebugDoorStatus.indexOf('失败') >= 0 ||
+                  this.bleDebugDoorStatus.indexOf('超时') >= 0 ||
+                  this.bleDebugDoorStatus.indexOf('未连接') >= 0 ||
+                  this.bleDebugDoorStatus.indexOf('未发现') >= 0 ? this.warningRed() : this.subTextColor())
+                .textAlign(TextAlign.Center)
+                .maxLines(2)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+              Button(this.bleDebugDoorBusy ? '等待门禁 ACK' :
+                this.bleDebugDoorLocked ? '通过 BLE 开门' : '通过 BLE 关门')
+                .width(230)
+                .height(34)
+                .fontSize(14)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#FFFFFF')
+                .backgroundColor(this.bleDebugDoorControlReady() && !this.bleDebugDoorBusy ?
+                  this.accentGreen() : '#7B8583')
+                .borderRadius(11)
+                .enabled(this.bleDebugDoorControlReady() && !this.bleDebugDoorBusy && !this.bleDebugKeyBusy)
+                .onClick(() => {
+                  this.sendBleDebugDoorControl(this.bleDebugDoorLocked)
+                })
+            }
+            .layoutWeight(1)
+            .height(124)
+            .alignItems(HorizontalAlign.Center)
+            .justifyContent(FlexAlign.SpaceBetween)
+            .padding({ top: 4, bottom: 3 })
+            .backgroundColor(this.softPanelBg())
+            .border({ width: 1.5, color: this.hairlineColor() })
+            .borderRadius(14)
+            .margin({ left: 12 })
           }
           .width('100%')
-          .height(66)
-          .margin({ top: 2 })
-
-          Text(this.bleDebugLightStatus)
-            .width('100%')
-            .height(24)
-            .fontSize(13)
-            .fontColor(this.bleDebugLightStatus.indexOf('失败') >= 0 ||
-              this.bleDebugLightStatus.indexOf('超时') >= 0 ||
-              this.bleDebugLightStatus.indexOf('未连接') >= 0 ||
-              this.bleDebugLightStatus.indexOf('未发现') >= 0 ? this.warningRed() : this.subTextColor())
-            .textAlign(TextAlign.Center)
-            .maxLines(2)
-
-          Button(this.bleDebugLightButtonText())
-            .width(260)
-            .height(40)
-            .fontSize(16)
-            .fontWeight(FontWeight.Bold)
-            .fontColor('#FFFFFF')
-            .backgroundColor(this.bleDebugControlReady() && !this.bleDebugLightBusy ?
-              this.accentGreen() : '#7B8583')
-            .borderRadius(12)
-            .enabled(this.bleDebugControlReady() && !this.bleDebugLightBusy && !this.bleDebugKeyBusy)
-            .onClick(() => {
-              this.sendBleDebugLightControl(!this.bleDebugLightOn)
-            })
+          .height(124)
+          .margin({ top: 5 })
         }
-        .width(620)
+        .width(660)
         .padding(16)
         .alignItems(HorizontalAlign.Center)
         .backgroundColor(this.cardBg())
