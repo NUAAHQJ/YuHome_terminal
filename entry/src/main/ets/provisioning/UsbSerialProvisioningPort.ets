@@ -17,6 +17,9 @@ const SERIAL_NONE: number = -1
 const WCH_VENDOR_ID: number = 0x1A86
 const CP210X_VENDOR_ID: number = 0x10C4
 const READ_TIMEOUT_MS: number = 250
+const USB_READ_TIMEOUT_MS: number = 5000
+const USB_READ_RETRY_DELAY_MS: number = 250
+const USB_READ_BUFFER_SIZE: number = 1024
 const READ_ACTIVE_DELAY_MS: number = 0
 // 分级空闲退避：刚空闲时保持较快轮询以压低首字节延迟，
 // 持续空闲超过 READ_IDLE_SLOW_AFTER_MS 后放慢，避免空载占满 UI 线程。
@@ -1117,16 +1120,19 @@ export class UsbSerialProvisioningPort {
     }
     const pipe = this.pipe
     const readEndpoint = this.usbReadEndpoints[index]
-    const buffer = new Uint8Array(256)
+    const buffer = new Uint8Array(USB_READ_BUFFER_SIZE)
     this.usbReadInFlightByEndpoint[index] = true
-    usbManager.bulkTransfer(pipe, readEndpoint.endpoint, buffer, READ_TIMEOUT_MS)
+    usbManager.bulkTransfer(pipe, readEndpoint.endpoint, buffer, USB_READ_TIMEOUT_MS)
       .then((count: number) => {
         if (generation !== this.readGeneration || pipe !== this.pipe) {
           return
         }
         this.usbReadInFlightByEndpoint[index] = false
-        this.consumeReadBuffer(buffer, count)
+        // Re-arm the IN endpoint before parsing the current chunk. BLE replay
+        // sends several near-maximum frames in quick succession, and returning
+        // through the ArkTS timer queue here leaves a receive gap between them.
         this.scheduleUsbEndpointRead(index, generation, count)
+        this.consumeReadBuffer(buffer, count)
       })
       .catch((err: Error) => {
         if (generation !== this.readGeneration || pipe !== this.pipe) {
@@ -1142,9 +1148,13 @@ export class UsbSerialProvisioningPort {
     if (!this.reading || generation !== this.readGeneration) {
       return
     }
+    if (lastReadCount > 0) {
+      this.readUsbEndpointOnce(index, generation)
+      return
+    }
     setTimeout(() => {
       this.readUsbEndpointOnce(index, generation)
-    }, this.nextReadDelay(lastReadCount))
+    }, USB_READ_RETRY_DELAY_MS)
   }
 
   private consumeReadBuffer(buffer: Uint8Array, count: number): void {

@@ -9,6 +9,8 @@ const SALT = new Uint8Array([
 
 interface DeviceKeyState {
   deviceId: string
+  localIdentityId: string
+  hkdfDomain: string
   keyPair: cryptoFramework.KeyPair | null
   publicKeyRaw: Uint8Array | null
   remotePublicKeyRaw: Uint8Array | null
@@ -17,6 +19,12 @@ interface DeviceKeyState {
   pendingAesKey: Uint8Array | null
   pendingSm4Key: Uint8Array | null
   pendingRemotePublicKeyRaw: Uint8Array | null
+}
+
+interface LocalKeyIdentity {
+  keyPair: cryptoFramework.KeyPair
+  publicKeyRaw: Uint8Array
+  curveName: string
 }
 
 interface CurveChoice {
@@ -89,6 +97,22 @@ function rawPublicKeyToPoint(payload: Uint8Array): cryptoFramework.Point {
     x: bytesToBigint(payload.slice(1, 33)),
     y: bytesToBigint(payload.slice(33, 65))
   }
+}
+
+export function isValidP256PublicKey(payload: Uint8Array): boolean {
+  if (payload.length !== 65 || payload[0] !== 0x04) {
+    return false
+  }
+  const p = BigInt('0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF')
+  const b = BigInt('0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B')
+  const x = bytesToBigint(payload.slice(1, 33))
+  const y = bytesToBigint(payload.slice(33, 65))
+  if (x < BigInt(0) || x >= p || y < BigInt(0) || y >= p) {
+    return false
+  }
+  const left = (y * y) % p
+  const right = (((x * x % p) * x % p) - (BigInt(3) * x % p) + b + p) % p
+  return left === right
 }
 
 function pointToRawPublicKey(point: cryptoFramework.Point): Uint8Array {
@@ -314,6 +338,9 @@ async function hkdfSha256(ikm: Uint8Array, infoText: string, length: number): Pr
 
 export class KeyExchangeLayer {
   private states: Map<string, DeviceKeyState> = new Map()
+  private localIdentities: Map<string, LocalKeyIdentity> = new Map()
+  private identityBySession: Map<string, string> = new Map()
+  private hkdfDomainBySession: Map<string, string> = new Map()
 
   isKeyExchangeTopic(topic: string): boolean {
     return topic.startsWith(ECDH_TOPIC_PREFIX)
@@ -324,37 +351,84 @@ export class KeyExchangeLayer {
     console.info(`[ECDH] reset local state for ${deviceId}`)
   }
 
+  bindLocalIdentity(sessionId: string, identityId: string, hkdfDomain: string = ''): void {
+    if (sessionId.length === 0 || identityId.length === 0) {
+      return
+    }
+    this.identityBySession.set(sessionId, identityId)
+    this.hkdfDomainBySession.set(sessionId, hkdfDomain)
+    const state = this.states.get(sessionId)
+    if (state !== undefined) {
+      state.localIdentityId = identityId
+      state.hkdfDomain = hkdfDomain
+      const identity = this.localIdentities.get(identityId)
+      if (identity !== undefined) {
+        state.keyPair = identity.keyPair
+        state.publicKeyRaw = identity.publicKeyRaw
+        state.curveName = identity.curveName
+      }
+    }
+  }
+
+  private createEmptyState(deviceId: string): DeviceKeyState {
+    return {
+      deviceId,
+      localIdentityId: this.identityBySession.get(deviceId) ?? deviceId,
+      hkdfDomain: this.hkdfDomainBySession.get(deviceId) ?? '',
+      keyPair: null,
+      publicKeyRaw: null,
+      remotePublicKeyRaw: null,
+      established: false,
+      curveName: CURVE_CANDIDATES[0],
+      pendingAesKey: null,
+      pendingSm4Key: null,
+      pendingRemotePublicKeyRaw: null
+    }
+  }
+
+  private async ensureLocalIdentity(state: DeviceKeyState): Promise<void> {
+    const cached = this.localIdentities.get(state.localIdentityId)
+    if (cached !== undefined) {
+      state.keyPair = cached.keyPair
+      state.publicKeyRaw = cached.publicKeyRaw
+      state.curveName = cached.curveName
+      return
+    }
+    const curve = getCurveChoice()
+    const generator = cryptoFramework.createAsyKeyGeneratorBySpec(curve.params)
+    const keyPair = await generator.generateKeyPair()
+    const publicPoint: cryptoFramework.Point = {
+      x: keyPair.pubKey.getAsyKeySpec(cryptoFramework.AsyKeySpecItem.ECC_PK_X_BN) as bigint,
+      y: keyPair.pubKey.getAsyKeySpec(cryptoFramework.AsyKeySpecItem.ECC_PK_Y_BN) as bigint
+    }
+    const identity: LocalKeyIdentity = {
+      keyPair,
+      publicKeyRaw: pointToRawPublicKey(publicPoint),
+      curveName: curve.name
+    }
+    this.localIdentities.set(state.localIdentityId, identity)
+    state.keyPair = identity.keyPair
+    state.publicKeyRaw = identity.publicKeyRaw
+    state.curveName = identity.curveName
+  }
+
   async createLocalPublicKey(deviceId: string): Promise<KeyExchangeResult> {
     if (deviceId.length === 0) {
       return buildResult(false, 'empty ECDH deviceId', '')
     }
     let state = this.states.get(deviceId)
     if (!state) {
-      state = {
-        deviceId,
-        keyPair: null,
-        publicKeyRaw: null,
-        remotePublicKeyRaw: null,
-        established: false,
-        curveName: CURVE_CANDIDATES[0],
-        pendingAesKey: null,
-        pendingSm4Key: null,
-        pendingRemotePublicKeyRaw: null
-      }
+      state = this.createEmptyState(deviceId)
       this.states.set(deviceId, state)
     }
     if (state.keyPair === null || state.publicKeyRaw === null) {
-      const curve = getCurveChoice()
-      const generator = cryptoFramework.createAsyKeyGeneratorBySpec(curve.params)
-      state.keyPair = await generator.generateKeyPair()
-      state.curveName = curve.name
-      const publicPoint: cryptoFramework.Point = {
-        x: state.keyPair.pubKey.getAsyKeySpec(cryptoFramework.AsyKeySpecItem.ECC_PK_X_BN) as bigint,
-        y: state.keyPair.pubKey.getAsyKeySpec(cryptoFramework.AsyKeySpecItem.ECC_PK_Y_BN) as bigint
-      }
-      state.publicKeyRaw = pointToRawPublicKey(publicPoint)
+      await this.ensureLocalIdentity(state)
     }
-    return buildResult(true, `ECDH local public key ready ${deviceId}`, deviceId, `${ECDH_TOPIC_PREFIX}${deviceId}`, state.publicKeyRaw, state.established)
+    const publicKeyRaw = state.publicKeyRaw
+    if (publicKeyRaw === null) {
+      return buildResult(false, `ECDH local public key unavailable ${deviceId}`, deviceId)
+    }
+    return buildResult(true, `ECDH local public key ready ${deviceId}`, deviceId, `${ECDH_TOPIC_PREFIX}${deviceId}`, publicKeyRaw, state.established)
   }
 
   async derivePendingKeys(deviceId: string, state: DeviceKeyState, payload: Uint8Array): Promise<boolean> {
@@ -376,8 +450,10 @@ export class KeyExchangeLayer {
       const remotePubKey = await cryptoFramework.createAsyKeyGeneratorBySpec(remotePubSpec).generatePubKey()
       const agreement = cryptoFramework.createKeyAgreement('ECC')
       const secret = normalizeSecret((await agreement.generateSecret(state.keyPair.priKey, remotePubKey)).data)
-      const aesKey = await hkdfSha256(secret, 'aes-key', 32)
-      const sm4Key = await hkdfSha256(secret, 'sm4-key', 16)
+      const aesInfo = state.hkdfDomain.length > 0 ? `${state.hkdfDomain}-aes-key` : 'aes-key'
+      const sm4Info = state.hkdfDomain.length > 0 ? `${state.hkdfDomain}-sm4-key` : 'sm4-key'
+      const aesKey = await hkdfSha256(secret, aesInfo, 32)
+      const sm4Key = await hkdfSha256(secret, sm4Info, 16)
 
       state.pendingAesKey = aesKey.slice()
       state.pendingSm4Key = sm4Key.slice()
@@ -450,17 +526,7 @@ export class KeyExchangeLayer {
 
     let state = this.states.get(deviceId)
     if (!state) {
-      state = {
-        deviceId,
-        keyPair: null,
-        publicKeyRaw: null,
-        remotePublicKeyRaw: null,
-        established: false,
-        curveName: CURVE_CANDIDATES[0],
-        pendingAesKey: null,
-        pendingSm4Key: null,
-        pendingRemotePublicKeyRaw: null
-      }
+      state = this.createEmptyState(deviceId)
       this.states.set(deviceId, state)
     }
 
@@ -473,17 +539,12 @@ export class KeyExchangeLayer {
     }
 
     if (state.keyPair === null || state.publicKeyRaw === null) {
-      const curve = getCurveChoice()
-      const generator = cryptoFramework.createAsyKeyGeneratorBySpec(curve.params)
-      state.keyPair = await generator.generateKeyPair()
-      state.curveName = curve.name
-      const publicPoint: cryptoFramework.Point = {
-        x: state.keyPair.pubKey.getAsyKeySpec(cryptoFramework.AsyKeySpecItem.ECC_PK_X_BN) as bigint,
-        y: state.keyPair.pubKey.getAsyKeySpec(cryptoFramework.AsyKeySpecItem.ECC_PK_Y_BN) as bigint
-      }
-      state.publicKeyRaw = pointToRawPublicKey(publicPoint)
+      await this.ensureLocalIdentity(state)
     }
-
-    return buildResult(true, `ECDH public key ready ${deviceId}`, deviceId, `${ECDH_TOPIC_PREFIX}${deviceId}`, state.publicKeyRaw, state.established)
+    const publicKeyRaw = state.publicKeyRaw
+    if (publicKeyRaw === null) {
+      return buildResult(false, `ECDH local public key unavailable ${deviceId}`, deviceId)
+    }
+    return buildResult(true, `ECDH public key ready ${deviceId}`, deviceId, `${ECDH_TOPIC_PREFIX}${deviceId}`, publicKeyRaw, state.established)
   }
 }
