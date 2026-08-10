@@ -43,6 +43,8 @@ const GATEWAY_BLE_SCAN_DURATION_MS: number = 25000
 const GATEWAY_BLE_SCAN_TIMEOUT_MS: number = 60000
 const GATEWAY_BLE_RECONNECT_TIMEOUT_MS: number = 95000
 const GATEWAY_BLE_CONTROL_TIMEOUT_MS: number = 8000
+const GATEWAY_REBOOT_ACK_TIMEOUT_MS: number = 5000
+const GATEWAY_REBOOT_CLOSE_DELAY_MS: number = 900
 const IR_COMMAND_ACK_TIMEOUT_MS: number = 8000
 const IR_LEARN_STEP_ACK_TIMEOUT_MS: number = 90000
 const IR_LEARN_KEY_LABELS: string[] = ['开机', '关机', '温度+', '温度-', '制冷', '制热']
@@ -625,6 +627,7 @@ struct Index {
   private bleKeyAutoTimerId: number = -1
   private bleKeyEpochByDevice: Map<string, number> = new Map()
   private bleKeyRetryByDevice: Map<string, number> = new Map()
+  private bleKeyDecryptFailuresByDevice: Map<string, number> = new Map()
   private bleKeyReadyDevices: Set<string> = new Set()
   private bleCryptoReceiveChain: Promise<void> = Promise.resolve()
 
@@ -794,6 +797,10 @@ struct Index {
   private gatewayUsbTestPendingSeq: number = -1
   private gatewayUsbTestTimerId: number = -1
   private gatewayUsbTestStartedAt: number = 0
+  @State gatewayRebootStatus: string = '网关运行中'
+  @State gatewayRebootBusy: boolean = false
+  private gatewayRebootPendingSeq: number = -1
+  private gatewayRebootTimerId: number = -1
   private gatewayReconnectAfterUsbTest: boolean = false
   @State gatewayBleStatus: string = '等待开始蓝牙设备扫描'
   @State gatewayBleScanning: boolean = false
@@ -808,6 +815,7 @@ struct Index {
   private gatewayBleControlSeq: number = 0
   private bleDebugLightGatewaySeq: number = 0
   private bleDebugDoorGatewaySeq: number = 0
+  private bleDebugKeyGatewaySeq: number = 0
   private gatewayAutoConnectTimerId: number = -1
   private gatewayAutoConnectAttempt: number = 0
   private debugInfoScroller: Scroller = new Scroller()
@@ -960,6 +968,9 @@ struct Index {
     this.clearGatewayUsbTestTimer()
     this.gatewayUsbTestPendingSeq = -1
     this.gatewayUsbTestBusy = false
+    this.clearGatewayRebootTimer()
+    this.gatewayRebootPendingSeq = -1
+    this.gatewayRebootBusy = false
     this.gatewayReconnectAfterUsbTest = false
     this.clearGatewayBleScanTimer()
     this.gatewayBleScanning = false
@@ -977,6 +988,7 @@ struct Index {
     this.bleDebugDoorPendingSeq = 0
     this.bleDebugDoorPendingDeviceId = ''
     this.bleDebugDoorGatewaySeq = 0
+    this.bleDebugKeyGatewaySeq = 0
     this.bleDebugDoorBusy = false
     this.bleDebugKeyBusy = false
     this.clearGatewayAutoConnectTimer()
@@ -5158,9 +5170,10 @@ struct Index {
       text: text,
       deviceId: this.debugDeviceIdFromTopic(topic)
     }
+    const scrollOffset = this.captureDebugInfoScrollOffset()
     this.mqttMessages = [...this.mqttMessages, item].slice(-MAX_MQTT_MESSAGES)
     if (this.showDebugPanel) {
-      this.restoreDebugInfoScrollPosition()
+      this.restoreDebugInfoScrollPosition(scrollOffset)
     }
     if (CLOUD_SYNC_ENABLED) {
       this.reportCloudMessage(topic, text)
@@ -6131,6 +6144,11 @@ struct Index {
     return `key/ecdh/pub/${this.bleCryptoSessionId(deviceId)}`
   }
 
+  resetBleCryptoReceiveQueue(reason: string): void {
+    this.bleCryptoReceiveChain = Promise.resolve()
+    this.addProvisioningDiagnosticLog(`BLE 解密队列已重建：${reason}`)
+  }
+
   bleDebugHasDynamicKey(deviceId: string): boolean {
     const sessionId = this.bleCryptoSessionId(deviceId)
     return this.bleDebugKeyReadyDeviceId === deviceId && this.bleKeyReadyDevices.has(deviceId) &&
@@ -6181,6 +6199,7 @@ struct Index {
     this.keyExchange.resetDevice(sessionId)
     this.clearBleKeyTimer()
     this.clearBleKeyAutoTimer()
+    this.bleDebugKeyGatewaySeq = 0
     this.bleDebugKeyBusy = false
     this.bleDebugKeyStatus = 'BLE 设备已断开，重连后将自动协商密钥'
   }
@@ -6201,7 +6220,9 @@ struct Index {
       return
     }
     this.clearBleKeyAutoTimer()
+    this.resetBleCryptoReceiveQueue(`开始新一轮 ECDH device=${deviceId}`)
     this.bleDebugKeyBusy = true
+    this.bleDebugKeyGatewaySeq = 0
     this.bleKeyReadyDevices.delete(deviceId)
     if (this.bleDebugKeyReadyDeviceId === deviceId) {
       this.bleDebugKeyReadyDeviceId = ''
@@ -6209,21 +6230,31 @@ struct Index {
     clearDeviceDynamicCryptoKeys(sessionId)
     this.keyExchange.bindLocalIdentity(sessionId, deviceId, 'ble')
     this.keyExchange.resetDevice(sessionId)
-    const epoch = (this.bleKeyEpochByDevice.get(deviceId) ?? 0) + 1
+    // A process-local 1,2,3... epoch collides with encrypted packets left from
+    // a previous app run. Use wall-clock seconds as the floor and still keep it
+    // strictly increasing when several negotiations start in the same second.
+    const previousEpoch = this.bleKeyEpochByDevice.get(deviceId) ?? 0
+    const epochFloor = Math.floor(Date.now() / 1000) % 2147483647
+    const epoch = Math.max(previousEpoch + 1, epochFloor)
     this.bleKeyEpochByDevice.set(deviceId, epoch)
+    this.bleKeyDecryptFailuresByDevice.delete(deviceId)
     this.bleDebugKeyStatus = `正在协商 BLE 动态密钥 · epoch ${epoch}`
     this.clearBleKeyTimer()
     this.bleKeyTimerId = setTimeout(() => {
       this.bleKeyTimerId = -1
       if (this.bleDebugKeyBusy) {
         this.bleDebugKeyBusy = false
+        this.bleDebugKeyGatewaySeq = 0
         const retry = (this.bleKeyRetryByDevice.get(deviceId) ?? 0) + 1
         this.bleKeyRetryByDevice.set(deviceId, retry)
         if (retry < 3 && this.deviceForConnectedBleLight() === deviceId) {
           this.bleDebugKeyStatus = `BLE 密钥协商超时，准备自动重试 ${retry}/2`
           this.scheduleBleDebugKeyExchange(1200)
         } else {
-          this.bleDebugKeyStatus = `BLE 自动密钥协商超时 · 设备未返回公钥/确认`
+          const decryptFailures = this.bleKeyDecryptFailuresByDevice.get(deviceId) ?? 0
+          this.bleDebugKeyStatus = decryptFailures > 0 ?
+            `BLE 密钥确认超时 · ${decryptFailures} 个当前 epoch 密文认证失败` :
+            `BLE 自动密钥协商超时 · 设备未返回公钥/确认`
         }
       }
     }, 15000)
@@ -6265,12 +6296,13 @@ struct Index {
         `tail=${tailHex} b64Len=${handshakeBase64.length} b64Tail=${handshakeBase64.slice(-12)}`)
       this.addProvisioningDiagnosticLog(
         `BLE ECDH发送前校验通过 device=${deviceId} json=${handshake.length}B tail=${tailHex}`)
-      await this.sendBleEncryptedPayload(
+      this.bleDebugKeyGatewaySeq = await this.sendBleEncryptedPayload(
         deviceId, `key/ble/ecdh/pub/${deviceId}`,
         handshakeBase64, handshake.length, 'none')
       this.bleDebugKeyStatus = `已发送 BLE 公钥，等待设备确认 · epoch ${epoch}`
     } catch (err) {
       this.clearBleKeyTimer()
+      this.bleDebugKeyGatewaySeq = 0
       this.bleDebugKeyBusy = false
       this.bleDebugKeyStatus = `BLE 密钥协商失败：${(err as Error).message}`
     }
@@ -6278,8 +6310,18 @@ struct Index {
 
   async handleBleKeyExchangeMessage(data: Record<string, Object>, deviceId: string): Promise<void> {
     const publicKeyBase64 = typeof data['publicKeyBase64'] === 'string' ? data['publicKeyBase64'] as string : ''
+    const remoteEpoch = typeof data['epoch'] === 'number' ? data['epoch'] as number : 0
+    const expectedEpoch = this.bleKeyEpochByDevice.get(deviceId) ?? 0
+    console.info(`[BLE-ECDH][RX-PUB] device=${deviceId} epoch=${remoteEpoch} expected=${expectedEpoch} ` +
+      `b64Len=${publicKeyBase64.length}`)
+    if (remoteEpoch > 0 && expectedEpoch > 0 && remoteEpoch !== expectedEpoch) {
+      this.addProvisioningDiagnosticLog(
+        `忽略过期 BLE 公钥 device=${deviceId} epoch=${remoteEpoch} expected=${expectedEpoch}`)
+      return
+    }
     if (publicKeyBase64.length === 0) {
       this.clearBleKeyTimer()
+      this.bleDebugKeyGatewaySeq = 0
       this.bleDebugKeyBusy = false
       this.bleDebugKeyStatus = 'BLE 密钥协商失败：设备公钥为空'
       return
@@ -6288,8 +6330,12 @@ struct Index {
     const sessionId = this.bleCryptoSessionId(deviceId)
     const topic = this.bleKeyTopic(deviceId)
     const result = await this.keyExchange.handlePublicKey(topic, remotePublicKey)
-    if (!result.ok || !await this.keyExchange.prepareKeysForPublicKey(topic, remotePublicKey)) {
+    console.info(`[BLE-ECDH][RX-PUB] local state ready=${result.ok} device=${deviceId}`)
+    const prepared = result.ok && await this.keyExchange.prepareKeysForPublicKey(topic, remotePublicKey)
+    console.info(`[BLE-ECDH][RX-PUB] pending keys prepared=${prepared} device=${deviceId}`)
+    if (!result.ok || !prepared) {
       this.clearBleKeyTimer()
+      this.bleDebugKeyGatewaySeq = 0
       this.bleDebugKeyBusy = false
       this.bleDebugKeyStatus = `BLE 密钥派生失败：${result.message}`
       return
@@ -6312,9 +6358,12 @@ struct Index {
     deviceId: string): void {
     this.bleCryptoReceiveChain = this.bleCryptoReceiveChain.then(async (): Promise<void> => {
       if (type === 'ble_key_exchange') {
+        console.info(`[BLE-ECDH][QUEUE] processing public key device=${deviceId}`)
         try {
           await this.handleBleKeyExchangeMessage(data, deviceId)
         } catch (err) {
+          this.clearBleKeyTimer()
+          this.bleDebugKeyGatewaySeq = 0
           this.bleDebugKeyBusy = false
           this.bleDebugKeyStatus = `BLE 密钥协商失败：${(err as Error).message}`
         }
@@ -6323,8 +6372,21 @@ struct Index {
       try {
         await this.handleBleSecureEnvelope(data, topic, deviceId)
       } catch (err) {
-        this.cryptoDebugText = `BLE 安全消息失败 ${(err as Error).message}`
-        this.bleDebugLightStatus = `BLE 解密失败：${(err as Error).message}`
+        const message = (err as Error).message
+        this.cryptoDebugText = `BLE 安全消息失败 ${message}`
+        this.bleDebugLightStatus = `BLE 解密失败：${message}`
+        console.info(`[BLE][secure-fail] device=${deviceId} ${message}`)
+        const sessionId = this.bleCryptoSessionId(deviceId)
+        if (this.bleDebugKeyBusy && this.keyExchange.getPendingKeys(sessionId) !== null) {
+          this.clearBleKeyTimer()
+          this.clearBleKeyAutoTimer()
+          this.bleDebugKeyGatewaySeq = 0
+          this.bleDebugKeyBusy = false
+          this.bleKeyRetryByDevice.delete(deviceId)
+          this.bleDebugKeyStatus = `BLE 密钥确认解密失败：${message}`
+          this.addProvisioningDiagnosticLog(
+            `BLE 已收到密钥确认包，但 pending key 解密失败 device=${deviceId}: ${message}`)
+        }
       }
     }).catch((err: Error): void => {
       this.cryptoDebugText = `BLE 接收队列失败 ${err.message}`
@@ -6342,8 +6404,27 @@ struct Index {
     const sessionId = this.bleCryptoSessionId(deviceId)
     const pending = this.keyExchange.getPendingKeys(sessionId)
     if (pending !== null) {
+      const envelopeEpoch = typeof data['epoch'] === 'number' ? data['epoch'] as number : 0
+      const expectedEpoch = this.bleKeyEpochByDevice.get(deviceId) ?? 0
+      if (envelopeEpoch > 0 && expectedEpoch > 0 && envelopeEpoch !== expectedEpoch) {
+        console.info(`[BLE-ECDH][RX-IGNORE] stale secure packet device=${deviceId} ` +
+          `epoch=${envelopeEpoch} expected=${expectedEpoch} raw=${raw.length}B`)
+        return
+      }
+      console.info(`[BLE-ECDH][RX-ACK] trying pending ${mode} key device=${deviceId} raw=${raw.length}B`)
       const pendingKey = mode === 'AES' ? pending.aesKey : pending.sm4Key
-      const decrypted = await decryptWithProvidedKey(raw, mode, pendingKey)
+      let decrypted: CryptoDecryptResult
+      try {
+        decrypted = await decryptWithProvidedKey(raw, mode, pendingKey)
+      } catch (err) {
+        const failures = (this.bleKeyDecryptFailuresByDevice.get(deviceId) ?? 0) + 1
+        this.bleKeyDecryptFailuresByDevice.set(deviceId, failures)
+        console.info(`[BLE-ECDH][RX-IGNORE] unauthenticated pending packet device=${deviceId} ` +
+          `epoch=${envelopeEpoch} raw=${raw.length}B count=${failures}: ${(err as Error).message}`)
+        this.bleDebugKeyStatus = `已收到设备公钥，当前 epoch 密文认证失败 ${failures} 次，继续等待确认`
+        return
+      }
+      console.info(`[BLE-ECDH][RX-ACK] decrypted device=${deviceId} ${decrypted.plaintext.substring(0, 160)}`)
       const ack = JSON.parse(decrypted.plaintext) as Record<string, Object>
       if (ack['type'] === 'ack' && ack['cmd'] === 'key' && ack['ok'] !== false) {
         const activated = this.keyExchange.activatePendingKeys(sessionId)
@@ -6354,13 +6435,18 @@ struct Index {
         this.bleKeyReadyDevices.add(deviceId)
         this.bleDebugKeyReadyDeviceId = deviceId
         this.bleKeyRetryByDevice.delete(deviceId)
+        this.bleKeyDecryptFailuresByDevice.delete(deviceId)
         this.clearBleKeyTimer()
+        this.clearBleKeyAutoTimer()
+        this.bleDebugKeyGatewaySeq = 0
         this.bleDebugKeyBusy = false
         this.bleDebugKeyStatus = `BLE 动态密钥已就绪 · ${mode}-GCM`
         this.bleDebugLightStatus = 'BLE 安全通道已就绪，可以控制灯光'
         this.bleDebugDoorStatus = 'BLE 安全通道已就绪，可以控制门禁'
         return
       }
+      console.info(`[BLE-ECDH][RX-IGNORE] pending key decrypted a non-key message device=${deviceId}`)
+      return
     }
     if (!this.bleDebugHasDynamicKey(deviceId)) {
       throw new Error('BLE dynamic key is not established')
@@ -7643,6 +7729,112 @@ struct Index {
     }
   }
 
+  clearGatewayRebootTimer(): void {
+    if (this.gatewayRebootTimerId !== -1) {
+      clearTimeout(this.gatewayRebootTimerId)
+      this.gatewayRebootTimerId = -1
+    }
+  }
+
+  prepareForGatewayReboot(): void {
+    this.clearGatewayUsbTestTimer()
+    this.clearGatewayBleScanTimer()
+    this.clearGatewayBleReconnectTimer()
+    this.gatewayUsbTestPendingSeq = -1
+    this.gatewayUsbTestBusy = false
+    this.gatewayReconnectAfterUsbTest = false
+    this.gatewayBleScanning = false
+    this.gatewayBleReconnecting = false
+    this.clearBleDebugTimer()
+    this.clearBleDebugDoorTimer()
+    this.bleDebugPendingSeq = 0
+    this.bleDebugPendingDeviceId = ''
+    this.bleDebugPendingLightOn = false
+    this.bleDebugLightGatewaySeq = 0
+    this.bleDebugLightBusy = false
+    this.bleDebugDoorPendingSeq = 0
+    this.bleDebugDoorPendingDeviceId = ''
+    this.bleDebugDoorGatewaySeq = 0
+    this.bleDebugDoorBusy = false
+    this.gatewayBleDevices.forEach((device: GatewayBleDeviceInfo) => {
+      if (device.capabilities.indexOf('light') >= 0) {
+        this.invalidateBleDebugKey(device.deviceId)
+      }
+      device.connected = false
+    })
+    this.gatewayBleDevices = this.gatewayBleDevices.slice()
+    this.persistGatewayBleDevices()
+    this.bleDebugLightStatus = '蓝牙网关正在重启'
+    this.bleDebugDoorStatus = '蓝牙网关正在重启'
+    this.gatewayBleStatus = '蓝牙网关正在重启，设备暂时离线'
+    this.provisioningPort.endReceiveBoost()
+  }
+
+  scheduleGatewayRebootRecovery(closeDelayMs: number): void {
+    this.prepareForGatewayReboot()
+    setTimeout(() => {
+      this.disconnectGatewayUsb().then(() => {
+        this.gatewayRebootStatus = '网关已重启，正在等待 USB 重新枚举'
+        this.gatewayAutoConnectAttempt = 0
+        this.scheduleGatewayAutoConnect()
+      }).catch((err: Error) => {
+        this.gatewayRebootStatus = `关闭旧 USB 连接失败：${err.message}`
+        this.scheduleGatewayAutoConnect()
+      })
+    }, Math.max(0, closeDelayMs))
+  }
+
+  async sendGatewayReboot(): Promise<void> {
+    if (this.gatewayRebootBusy) {
+      return
+    }
+    if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+      this.gatewayRebootStatus = '请先连接 USB 网关'
+      return
+    }
+    if (this.gatewayUsbTestBusy || this.gatewayBleScanning || this.gatewayBleReconnecting ||
+      this.bleDebugLightBusy || this.bleDebugDoorBusy || this.bleDebugKeyBusy) {
+      this.addProvisioningDiagnosticLog('网关重启请求正在终止当前 BLE/USB 调试任务')
+    }
+    this.prepareForGatewayReboot()
+
+    const seq = this.nextProvisioningSeq()
+    this.gatewayRebootPendingSeq = seq
+    this.gatewayRebootBusy = true
+    this.gatewayRebootStatus = `正在请求重启网关 #${seq}`
+    const payload = utf8Encode(JSON.stringify({
+      type: 'gateway_ble_command',
+      cmd: 'ble',
+      action: 'gateway-reboot',
+      seq
+    }))
+    this.provisioningPort.boostReceive(GATEWAY_REBOOT_ACK_TIMEOUT_MS)
+    this.clearGatewayRebootTimer()
+    this.gatewayRebootTimerId = setTimeout(() => {
+      this.gatewayRebootTimerId = -1
+      if (!this.gatewayRebootBusy || this.gatewayRebootPendingSeq !== seq) {
+        return
+      }
+      this.gatewayRebootBusy = false
+      this.gatewayRebootPendingSeq = -1
+      this.gatewayRebootStatus = `重启 ACK 超时 #${seq}，按网关已重启处理`
+      this.addProvisioningDiagnosticLog(this.gatewayRebootStatus)
+      this.scheduleGatewayRebootRecovery(0)
+    }, GATEWAY_REBOOT_ACK_TIMEOUT_MS)
+
+    const sent = await this.sendProvisioningFrameWithSeq(
+      ProvisioningFrameType.GATEWAY_BLE_COMMAND, seq, payload)
+    if (!sent) {
+      this.clearGatewayRebootTimer()
+      this.gatewayRebootPendingSeq = -1
+      this.gatewayRebootBusy = false
+      this.provisioningPort.endReceiveBoost()
+      this.gatewayRebootStatus = `重启命令发送失败：${this.provisioningStatus}`
+      return
+    }
+    this.addProvisioningDiagnosticLog(`已发送蓝牙网关重启命令 #${seq}`)
+  }
+
   refreshGatewayUsbDevices(): void {
     this.refreshProvisioningUsbDevices()
     if (this.provisioningUsbDevices.length === 0) {
@@ -8137,7 +8329,7 @@ struct Index {
       existing.deviceId : candidateId
     const capabilities = this.parseGatewayBleCapabilities(data)
     const connectedFromEvent = typeof data['connected'] === 'boolean' ? data['connected'] as boolean :
-      eventType === 'device_hello'
+      (existing !== null ? existing.connected : false)
     const rawName = typeof data['name'] === 'string' ? data['name'] as string : ''
     const name = !this.isGatewayBlePlaceholder(rawName) ? rawName.trim() :
       (existing !== null ? existing.name : '蓝牙家居设备')
@@ -8151,7 +8343,9 @@ struct Index {
         (existing !== null ? existing.rssi : 0),
       capabilities: capabilities.length > 0 ? capabilities :
         (existing !== null ? existing.capabilities : []),
-      connected: typeof data['connected'] === 'boolean' || eventType === 'device_hello' ?
+      // device_hello may be replayed from the gateway cache, so only an explicit
+      // connected field is allowed to change the live GATT connection state.
+      connected: typeof data['connected'] === 'boolean' ?
         connectedFromEvent : (existing !== null ? existing.connected : false),
       transport: typeof data['transport'] === 'string' ? data['transport'] as string :
         (existing !== null ? existing.transport : 'ble'),
@@ -8181,7 +8375,7 @@ struct Index {
     if (device === undefined || device.capabilities.indexOf('light') < 0) {
       return
     }
-    if (device.connected && eventType === 'device_hello') {
+    if (device.connected && eventType === 'ble_device_state' && data['connected'] === true) {
       this.scheduleBleDebugKeyExchange()
     } else if (!device.connected && eventType === 'ble_device_state') {
       this.invalidateBleDebugKey(device.deviceId)
@@ -8209,6 +8403,9 @@ struct Index {
       console.info(`[BLE][plain] device=${deviceId} topic=${topic} ${jsonStr.substring(0, 80)}`)
       const type = typeof data['type'] === 'string' ? (data['type'] as string).toLowerCase() : ''
       if (type === 'ble_key_exchange') {
+        // A fresh public key must not wait behind sensor packets left from an
+        // older session. The following encrypted key ACK will queue behind it.
+        this.resetBleCryptoReceiveQueue(`收到设备公钥 device=${deviceId}`)
         this.enqueueBleCryptoMessage(type, data, topic, deviceId)
         return
       }
@@ -8231,6 +8428,31 @@ struct Index {
       const data = JSON.parse(payloadText) as Record<string, Object>
       const eventType = typeof data['type'] === 'string' ? (data['type'] as string).toLowerCase() : ''
       const payloadSeq = typeof data['seq'] === 'number' ? data['seq'] as number : frame.seq
+      if (eventType === 'gateway_reboot_ack') {
+        if (!this.gatewayRebootBusy || payloadSeq !== this.gatewayRebootPendingSeq) {
+          this.addProvisioningDiagnosticLog(
+            `忽略非当前网关重启 ACK seq=${payloadSeq} pending=${this.gatewayRebootPendingSeq}`)
+          return
+        }
+        const ok = data['ok'] === true
+        const delayMs = typeof data['delayMs'] === 'number' ?
+          Math.max(0, Math.min(3000, data['delayMs'] as number)) : 500
+        this.clearGatewayRebootTimer()
+        this.gatewayRebootPendingSeq = -1
+        this.gatewayRebootBusy = false
+        this.provisioningPort.endReceiveBoost()
+        if (!ok) {
+          const message = typeof data['message'] === 'string' ? data['message'] as string : 'unknown_error'
+          this.gatewayRebootStatus = `网关拒绝重启：${message}`
+          this.addProvisioningDiagnosticLog(this.gatewayRebootStatus)
+          return
+        }
+        this.gatewayRebootStatus = `网关已确认重启 #${payloadSeq}`
+        this.addProvisioningDiagnosticLog(
+          `收到蓝牙网关重启 ACK #${payloadSeq}，${delayMs}ms 后重启`)
+        this.scheduleGatewayRebootRecovery(delayMs + GATEWAY_REBOOT_CLOSE_DELAY_MS)
+        return
+      }
       if (this.gatewayBleScanSeq > 0 && payloadSeq !== this.gatewayBleScanSeq) {
         this.addProvisioningDiagnosticLog(
           `蓝牙事件 seq=${payloadSeq}，当前扫描 seq=${this.gatewayBleScanSeq}，继续按事件内容处理`)
@@ -8253,6 +8475,11 @@ struct Index {
       if (eventType === 'device_hello' || eventType === 'ble_device_state') {
         this.upsertGatewayBleDevice(data, eventType)
         this.syncBleDebugKeyAfterDeviceEvent(data, eventType)
+        if (eventType === 'ble_device_state') {
+          const eventDeviceId = typeof data['deviceId'] === 'string' ? data['deviceId'] as string : 'unknown'
+          this.addProvisioningDiagnosticLog(
+            `BLE GATT 状态 device=${eventDeviceId} connected=${data['connected'] === true}`)
+        }
         const eventName = eventType === 'device_hello' ? '已读取设备能力' :
           eventType === 'ble_device_state' ? '设备连接状态已更新' : '发现蓝牙设备'
         this.gatewayBleStatus = `${eventName}，共 ${this.gatewayBleDevices.length} 台`
@@ -8267,6 +8494,7 @@ struct Index {
           this.bleDebugLightBusy && !this.bleDebugDoorBusy
         const doorResult = resultSeq > 0 ? resultSeq === this.bleDebugDoorGatewaySeq :
           this.bleDebugDoorBusy && !this.bleDebugLightBusy
+        const keyResult = resultSeq > 0 && resultSeq === this.bleDebugKeyGatewaySeq
         this.cryptoDebugText = data['ok'] === true ?
           `BLE 指令已写入 ${deviceId}` : `BLE 指令失败 ${message}`
         if (data['ok'] === true && lightResult) {
@@ -8274,6 +8502,45 @@ struct Index {
         }
         if (data['ok'] === true && doorResult) {
           this.bleDebugDoorGatewaySeq = 0
+        }
+        if (data['ok'] === true && keyResult) {
+          // GATT write succeeded; keep the handshake timer running until the
+          // peripheral public key and encrypted key ACK arrive.
+          this.bleDebugKeyGatewaySeq = 0
+        }
+        if (data['ok'] !== true && keyResult) {
+          this.clearBleKeyTimer()
+          this.clearBleKeyAutoTimer()
+          this.bleDebugKeyGatewaySeq = 0
+          this.bleDebugKeyBusy = false
+          this.bleKeyRetryByDevice.delete(deviceId)
+          clearDeviceDynamicCryptoKeys(this.bleCryptoSessionId(deviceId))
+          this.keyExchange.resetDevice(this.bleCryptoSessionId(deviceId))
+          const nextDevices = this.gatewayBleDevices.map((item: GatewayBleDeviceInfo): GatewayBleDeviceInfo => {
+            if (item.deviceId !== deviceId) {
+              return item
+            }
+            return {
+              deviceId: item.deviceId,
+              name: item.name,
+              room: item.room,
+              address: item.address,
+              rssi: item.rssi,
+              capabilities: item.capabilities,
+              connected: false,
+              transport: item.transport,
+              crypto: item.crypto,
+              epoch: item.epoch,
+              lastSeen: item.lastSeen
+            }
+          })
+          this.gatewayBleDevices = nextDevices
+          this.persistGatewayBleDevices()
+          this.bleDebugKeyStatus = message.toLowerCase().indexOf('not connected') >= 0 ?
+            '网关报告照明设备实际未连接，已停止重复协商' : `BLE 密钥协商写入失败：${message}`
+          this.gatewayBleStatus = message.toLowerCase().indexOf('not connected') >= 0 ?
+            '网关设备缓存与实际 GATT 连接不一致，请重新连接设备' : this.gatewayBleStatus
+          this.endBleControlReceiveBoostIfIdle()
         }
         if (data['ok'] !== true && lightResult && deviceId === this.bleDebugPendingDeviceId &&
           this.bleDebugPendingSeq > 0) {
@@ -8349,6 +8616,9 @@ struct Index {
         this.gatewayBleStatus = reconnectCount === detailCount ?
           `自动恢复完成，已连接 ${detailCount} 台家居设备` :
           `自动恢复完成：网关报告 ${reconnectCount} 台，大禹收到 ${detailCount} 台设备详情`
+        if (this.gatewayRebootStatus.indexOf('重启') >= 0) {
+          this.gatewayRebootStatus = `网关重启恢复完成，已连接 ${detailCount} 台设备`
+        }
         this.scheduleBleDebugKeyExchange()
         return
       }
@@ -9110,30 +9380,40 @@ struct Index {
     if (this.pendingProvisioningFrameLogs.length === 0) {
       return
     }
+    const scrollOffset = this.captureDebugInfoScrollOffset()
     const next = [...this.provisioningFrameLog, ...this.pendingProvisioningFrameLogs]
     this.pendingProvisioningFrameLogs = []
     this.provisioningFrameLog = next.slice(-200)
-    this.restoreDebugInfoScrollPosition()
+    this.restoreDebugInfoScrollPosition(scrollOffset)
   }
 
-  private restoreDebugInfoScrollPosition(): void {
+  private captureDebugInfoScrollOffset(): number {
+    if (!this.showDebugPanel) {
+      return this.debugInfoScrollOffset
+    }
+    try {
+      const offset = this.debugInfoScroller.currentOffset()
+      this.debugInfoScrollOffset = Math.max(0, offset.yOffset)
+    } catch (_) {
+      // The scroller may not be bound during the panel's first layout pass.
+    }
+    return this.debugInfoScrollOffset
+  }
+
+  private restoreDebugInfoScrollPosition(savedOffset: number): void {
     if (this.debugInfoScrollRestoreTimerId !== -1) {
       clearTimeout(this.debugInfoScrollRestoreTimerId)
     }
-    // ArkUI 4.1 may overwrite scrollTo during the same layout pass that
-    // rebuilds the message list. scrollEdge is applied after the list exists.
+    const targetOffset = Math.max(0, savedOffset)
+    // Reapply the user's current position after ArkUI rebuilds the log list.
+    // New messages must never force a user who is reading above back to bottom.
     this.debugInfoScrollRestoreTimerId = setTimeout(() => {
       this.debugInfoScrollRestoreTimerId = -1
       if (this.showDebugPanel) {
-        // On ArkUI 4.1 scrollEdge can run before the rebuilt Column has a
-        // measured content height. A large explicit offset is clamped to the
-        // actual bottom and is reliable after the list has been laid out.
-        this.debugInfoScroller.scrollTo({ xOffset: 0, yOffset: 1000000, animation: false })
-        this.debugInfoScroller.scrollEdge(Edge.Bottom)
+        this.debugInfoScroller.scrollTo({ xOffset: 0, yOffset: targetOffset, animation: false })
         setTimeout(() => {
           if (this.showDebugPanel) {
-            this.debugInfoScroller.scrollTo({ xOffset: 0, yOffset: 1000000, animation: false })
-            this.debugInfoScroller.scrollEdge(Edge.Bottom)
+            this.debugInfoScroller.scrollTo({ xOffset: 0, yOffset: targetOffset, animation: false })
           }
         }, 260)
       }
@@ -12617,6 +12897,32 @@ struct Index {
             .width('100%')
             .margin({ top: 10 })
 
+            Row() {
+              Button(this.gatewayRebootBusy ? '等待重启 ACK' : '重启蓝牙网关')
+                .layoutWeight(1)
+                .height(32)
+                .fontSize(11)
+                .fontColor('#FFFFFF')
+                .backgroundColor(this.gatewayRebootBusy ? '#7B8583' : this.warningRed())
+                .borderRadius(8)
+                .enabled(!this.gatewayRebootBusy)
+                .onClick(() => {
+                  this.sendGatewayReboot()
+                })
+            }
+            .width('100%')
+            .margin({ top: 8 })
+
+            Text(this.gatewayRebootStatus)
+              .width('100%')
+              .fontSize(10)
+              .fontColor(this.gatewayRebootStatus.indexOf('失败') >= 0 ||
+                this.gatewayRebootStatus.indexOf('超时') >= 0 ||
+                this.gatewayRebootStatus.indexOf('拒绝') >= 0 ? this.warningRed() : this.subTextColor())
+              .margin({ top: 6 })
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+
             Text(`最近 ACK：${this.gatewayUsbTestLastAck}`)
               .width('100%')
               .fontSize(10)
@@ -12753,9 +13059,6 @@ struct Index {
       .layoutWeight(1)
       .scrollBar(BarState.Auto)
       .margin({ top: 12 })
-      .onScroll((xOffset: number, yOffset: number) => {
-        this.debugInfoScrollOffset = yOffset
-      })
     }
     .width(520)
     .height(430)
