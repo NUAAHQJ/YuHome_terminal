@@ -339,6 +339,17 @@ export class UsbSerialProvisioningPort {
         Date.now() < waitDeadline) {
         await this.waitMs(2)
       }
+      // OpenHarmony can abort an outstanding bulk-IN transfer when the same
+      // pipe is used for bulk-OUT without ever settling the original Promise.
+      // In that case the old in-flight bit would permanently prevent the IN
+      // endpoint from being armed again after this write. Move to a new read
+      // generation atomically so late callbacks from the abandoned transfer
+      // cannot clear or re-arm the new generation's slot.
+      if (this.usbReadInFlightByEndpoint.some((inFlight: boolean) => inFlight)) {
+        this.readGeneration += 1
+        this.usbReadInFlightByEndpoint = this.usbReadEndpoints.map(() => false)
+        this.log(`[USB] abandoned stalled IN transfer; rearming generation=${this.readGeneration}`)
+      }
       while (this.usbWriteInProgress) {
         await this.waitMs(2)
       }
