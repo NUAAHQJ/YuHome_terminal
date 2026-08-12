@@ -53,7 +53,7 @@ const BLE_CRYPTO_SWITCH_TIMEOUT_MS: number = 12000
 const LIGHT_CONTROL_ACK_TIMEOUT_MS: number = 12000
 const NETWORK_CRYPTO_READY_WAIT_MS: number = 15000
 const IR_COMMAND_ACK_TIMEOUT_MS: number = 8000
-const IR_LEARN_STEP_ACK_TIMEOUT_MS: number = 90000
+const IR_LEARN_STEP_ACK_TIMEOUT_MS: number = 25000
 const IR_LEARN_KEY_LABELS: string[] = ['开机', '关机', '温度+', '温度-', '制冷', '制热']
 const VOICEPRINT_PHRASES: string[] = [
   '小禹小禹，打开客厅灯',
@@ -722,6 +722,7 @@ struct Index {
   private lastHttpSensorTimestamp: number = 0
   private lastSuccessfulDecryptAt: number = 0
   private lastSuccessfulDecryptAtByDevice: Map<string, number> = new Map()
+  private lastDynamicDecryptAtByDevice: Map<string, number> = new Map()
   private recentEncryptedPayloads: Map<string, number> = new Map()
   private processedHttpSensorPackets: Set<string> = new Set()
   private bridgeStateFailCount: number = 0
@@ -2054,6 +2055,9 @@ struct Index {
   }
 
   isBridgeActuallyConnected(): boolean {
+    if (this.bleBusinessDesired) {
+      return this.bleBusinessIsReady()
+    }
     return this.localMqtt.isConnected() || this.bridgeLinkConnected || this.bridgeConnected ||
       this.bridgeTlsConnected || this.bridgeTls.isConnected() || this.mqttConnected
   }
@@ -2278,9 +2282,30 @@ struct Index {
     this.networkCommandFailureCount = 0
   }
 
+  recoverFromStaticNetworkPayload(deviceId: string, source: string, keySource: string | undefined): void {
+    if (keySource !== 'static' || this.isIrLearningKeyExchangeLocked() ||
+      this.networkCryptoRecoveryDevices.has(deviceId)) {
+      return
+    }
+    const hasDynamicKeys = getDeviceDynamicAesKey(deviceId) !== null &&
+      getDeviceDynamicSm4Key(deviceId) !== null
+    if (!hasDynamicKeys) {
+      return
+    }
+    this.networkCryptoRecoveryDevices.add(deviceId)
+    console.info(`[ECDH][static-observed] ${source} device=${deviceId}; replacing stale dynamic session`)
+    this.switchDeviceToStaticCryptoSession(deviceId, `static-observed-${source}`,
+      this.cryptoModeForDevice(deviceId))
+    this.startKeyExchange(deviceId, `static-observed-${source}`).catch((err: Error) => {
+      console.info(`[ECDH][static-observed-fail] ${source} device=${deviceId} ${err.message}`)
+    }).finally(() => {
+      this.networkCryptoRecoveryDevices.delete(deviceId)
+    })
+  }
+
   async waitForNetworkCryptoSession(deviceId: string): Promise<void> {
     const requiredAt = this.networkCryptoValidationRequiredAt
-    const successfulAt = this.lastSuccessfulDecryptAtByDevice.get(deviceId) ?? 0
+    const successfulAt = this.lastDynamicDecryptAtByDevice.get(deviceId) ?? 0
     const installedAt = this.lastEcdhInstallTimeByDevice.get(deviceId) ?? 0
     if (successfulAt >= requiredAt || installedAt >= requiredAt) {
       return
@@ -2301,7 +2326,7 @@ struct Index {
     this.cryptoDebugText = `等待 WiFi 密钥确认 ${deviceId}`
     console.info(`[CMD][CRYPTO] wait for verified Wi-Fi session device=${deviceId}`)
     while (Date.now() - startedAt < NETWORK_CRYPTO_READY_WAIT_MS) {
-      const nextSuccessfulAt = this.lastSuccessfulDecryptAtByDevice.get(deviceId) ?? 0
+      const nextSuccessfulAt = this.lastDynamicDecryptAtByDevice.get(deviceId) ?? 0
       const nextInstalledAt = this.lastEcdhInstallTimeByDevice.get(deviceId) ?? 0
       if (nextSuccessfulAt >= requiredAt || nextInstalledAt >= requiredAt) {
         console.info(`[CMD][CRYPTO] Wi-Fi session ready device=${deviceId} waited=${Date.now() - startedAt}ms`)
@@ -2636,6 +2661,7 @@ struct Index {
     this.keyExchange.resetDevice(deviceId)
     this.lastKeyExchangeTimestampByTopic.delete(`key/ecdh/pub/${deviceId}`)
     this.lastSuccessfulDecryptAtByDevice.delete(deviceId)
+    this.lastDynamicDecryptAtByDevice.delete(deviceId)
     this.decryptFailCountByDevice.delete(deviceId)
     this.lastEcdhPendingTimeByDevice.delete(deviceId)
     this.lastEcdhInstallTimeByDevice.delete(deviceId)
@@ -4561,6 +4587,7 @@ struct Index {
   resetDeviceCryptoSession(deviceId: string, cryptoMode: string, transport: string): void {
     clearDeviceDynamicCryptoKeys(deviceId)
     this.lastSuccessfulDecryptAtByDevice.delete(deviceId)
+    this.lastDynamicDecryptAtByDevice.delete(deviceId)
     this.decryptFailCountByDevice.delete(deviceId)
     this.lastEcdhPendingTimeByDevice.delete(deviceId)
     this.lastEcdhInstallTimeByDevice.delete(deviceId)
@@ -4791,7 +4818,11 @@ struct Index {
       const decrypted = await this.decryptIncomingPayload(raw, 'MQTT', deviceId)
       const jsonStr = decrypted.plaintext
       const decryptedAt = Date.now()
+      this.recoverFromStaticNetworkPayload(deviceId, 'MQTT', decrypted.keySource)
       this.lastSuccessfulDecryptAtByDevice.set(deviceId, decryptedAt)
+      if (decrypted.keySource === 'device-dynamic') {
+        this.lastDynamicDecryptAtByDevice.set(deviceId, decryptedAt)
+      }
       this.markNetworkBusinessHealthy('MQTT', deviceId)
       this.decryptFailCountByDevice.delete(deviceId)
       if (deviceId === this.activeDeviceId) {
@@ -4867,7 +4898,13 @@ struct Index {
       const jsonStr = decrypted.plaintext
       const payloadSource = this.resolvePayloadSource(source, jsonStr)
       const decryptedAt = Date.now()
+      if (allowKeyRecovery && payloadSource !== 'BLE') {
+        this.recoverFromStaticNetworkPayload(deviceId, payloadSource, decrypted.keySource)
+      }
       this.lastSuccessfulDecryptAtByDevice.set(deviceId, decryptedAt)
+      if (decrypted.keySource === 'device-dynamic') {
+        this.lastDynamicDecryptAtByDevice.set(deviceId, decryptedAt)
+      }
       this.markNetworkBusinessHealthy(payloadSource, deviceId)
       this.decryptFailCountByDevice.delete(deviceId)
       if (deviceId === this.activeDeviceId) {
@@ -7691,7 +7728,7 @@ struct Index {
   }
 
   async sendBleEncryptedPayload(targetDeviceId: string, topic: string,
-    payloadBase64: string, bytes: number, cryptoMode: string): Promise<number> {
+    payloadBase64: string, bytes: number, cryptoMode: string, responseBudget: number = 2): Promise<number> {
     if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
       throw new Error('BLE 网关 USB 未连接')
     }
@@ -7719,6 +7756,7 @@ struct Index {
       topic,
       crypto: cryptoMode,
       bytes,
+      responseBudget,
       payloadBase64
     }))
     this.provisioningPort.boostReceive(GATEWAY_BLE_CONTROL_TIMEOUT_MS)
@@ -7734,7 +7772,7 @@ struct Index {
     return seq
   }
 
-  async sendBleBusinessJson(targetDeviceId: string, jsonCmd: string): Promise<number> {
+  async sendBleBusinessJson(targetDeviceId: string, jsonCmd: string, responseBudget: number = 2): Promise<number> {
     if (!this.bleDebugHasDynamicKey(targetDeviceId)) {
       throw new Error('BLE 动态密钥未就绪')
     }
@@ -7760,7 +7798,7 @@ struct Index {
     }
     return await this.sendBleEncryptedPayload(targetDeviceId,
       this.commandTopicForDevice('dayu/cmd', targetDeviceId),
-      this.uint8ArrayToBase64(envelope), envelope.length, this.bleDebugCryptoMode)
+      this.uint8ArrayToBase64(envelope), envelope.length, this.bleDebugCryptoMode, responseBudget)
   }
 
   /**
@@ -7768,12 +7806,12 @@ struct Index {
    * 流程: JSON → GCM 加密 → MQTT 直发或 HTTP bridge → ESP32
    */
   async sendEncryptedCommand(baseUrl: string, jsonCmd: string, topic: string = 'dayu/cmd',
-    targetDeviceId: string = this.activeDeviceId): Promise<void> {
+    targetDeviceId: string = this.activeDeviceId, bleResponseBudget: number = 2): Promise<void> {
     if (this.bleBusinessDesired) {
       if (!this.bleBusinessIsReady()) {
         throw new Error(this.bleBusinessStatus)
       }
-      await this.sendBleBusinessJson(targetDeviceId, jsonCmd)
+      await this.sendBleBusinessJson(targetDeviceId, jsonCmd, bleResponseBudget)
       return
     }
     await this.waitForNetworkCryptoSession(targetDeviceId)
@@ -10096,7 +10134,7 @@ struct Index {
       return this.irLearnActive ? '学习进行中' : '等待设备'
     }
     if (this.irLearnActive) {
-      return '学习进行中'
+      return `重试${this.irLearnCurrentLabel()}`
     }
     if (this.irLearnCompletedCount >= IR_LEARN_KEY_LABELS.length) {
       return '重新学习'
@@ -10107,7 +10145,7 @@ struct Index {
   countIrLearnResults(results: number[]): number {
     let count = 0
     for (let i = 0; i < results.length; i++) {
-      if (results[i] > 0) {
+      if (results[i] === 1) {
         count += 1
       }
     }
@@ -10115,7 +10153,12 @@ struct Index {
   }
 
   async runIrLearnPrimaryAction(): Promise<void> {
-    if (this.irLearnBusy || this.irLearnActive) {
+    if (this.irLearnBusy) {
+      return
+    }
+    if (this.irLearnActive) {
+      await this.sendIrCommand('learn', this.irLearnStep + 1, IR_LEARN_STEP_ACK_TIMEOUT_MS,
+        `“${this.irLearnCurrentLabel()}”学习超时，可以重试`)
       return
     }
     await this.startIrLearning()
@@ -10178,7 +10221,7 @@ struct Index {
     this.startIrLearnTimeout(timeoutMs, timeoutMessage)
     try {
       await this.sendEncryptedCommand(this.normalizeBridgeUrl(this.bridgeUrl), JSON.stringify(command), 'dayu/cmd',
-        this.deviceForCapability('ac'))
+        this.deviceForCapability('ac'), action === 'learn-all' ? 8 : 2)
       console.info(`[IR][sent] transport=${this.commandTransportText()} action=${action} index=${index} seq=${seq}`)
       return true
     } catch (err) {
@@ -10201,14 +10244,27 @@ struct Index {
       this.irLearnStatus = '当前加密通信未连接，请等待设备和服务上线'
       return
     }
+    const targetDeviceId = this.deviceForCapability('ac')
+    if (!this.bleBusinessDesired) {
+      this.irLearnBusy = true
+      this.irLearnStatus = '正在确认 WiFi 加密会话'
+      try {
+        await this.waitForNetworkCryptoSession(targetDeviceId)
+      } catch (err) {
+        this.irLearnBusy = false
+        this.irLearnStatus = `WiFi 加密会话未就绪：${(err as Error).message}`
+        console.info(`[IR][crypto-preflight-fail] device=${targetDeviceId} ${(err as Error).message}`)
+        return
+      }
+    }
     this.irLearnActive = true
     this.irLearnHandshakeConfirmed = false
     this.irLearnStep = 0
     this.irLearnCompletedCount = 0
     this.irLearnResults = [0, 0, 0, 0, 0, 0]
     this.irLearnStatus = `正在通过 ${this.commandTransportText()} 通知设备进入学习模式`
-    await this.sendIrCommand('learn-all', 0, IR_COMMAND_ACK_TIMEOUT_MS,
-      '设备未确认学习请求，请检查通信状态')
+    await this.sendIrCommand('learn', 1, IR_LEARN_STEP_ACK_TIMEOUT_MS,
+      '“开机”学习超时，可以重试')
   }
 
   async exitIrLearning(closePanel: boolean = true): Promise<void> {
@@ -10256,32 +10312,49 @@ struct Index {
     const msgValue = data['msg']
     const msg = typeof msgValue === 'string' ? msgValue : ''
 
-    const perKeyLearnAck = this.irLearnActive && this.irLearnExpectedAction === 'learn-all' &&
-      action === 'learn' && index >= 1 && index <= IR_LEARN_KEY_LABELS.length
+    const learnReadyAck = this.irLearnActive && this.irLearnExpectedAction === 'learn' &&
+      (action === 'ready' || (action === 'learn' && msg === 'learning')) &&
+      index === this.irLearnExpectedIndex &&
+      index >= 1 && index <= IR_LEARN_KEY_LABELS.length
+    if (learnReadyAck) {
+      if (seq > 0 && seq !== this.irLearnExpectedSeq) return
+      const label = IR_LEARN_KEY_LABELS[index - 1]
+      this.clearIrLearnTimer()
+      this.irLearnBusy = true
+      this.irLearnHandshakeConfirmed = true
+      this.irLearnStatus = `请将遥控器对准 ZJ-IR-V2，短按“${label}”键一次`
+      this.startIrLearnTimeout(IR_LEARN_STEP_ACK_TIMEOUT_MS,
+        `“${label}”学习超时，可以重试`)
+      console.info(`[IR][ready] index=${index} seq=${seq}`)
+      return
+    }
+
+    const perKeyLearnAck = this.irLearnActive && this.irLearnExpectedAction === 'learn' &&
+      action === 'learn' && index === this.irLearnExpectedIndex &&
+      index >= 1 && index <= IR_LEARN_KEY_LABELS.length
     if (perKeyLearnAck) {
-      if (this.irLearnResults[index - 1] > 0) {
-        console.info(`[IR][ack-duplicate] index=${index} seq=${seq}`)
+      const label = IR_LEARN_KEY_LABELS[index - 1]
+      if (seq > 0 && seq !== this.irLearnExpectedSeq) {
+        console.info(`[IR][ack-ignore] pending=${this.irLearnExpectedSeq} received=${seq} action=${action} index=${index}`)
         return
       }
-      if (seq > 0 && seq !== this.irLearnExpectedSeq) {
-        console.info(`[IR][ack-seq-note] session=${this.irLearnExpectedSeq} received=${seq} index=${index}; accepted by index`)
-      }
       this.clearIrLearnTimer()
-      const label = IR_LEARN_KEY_LABELS[index - 1]
+      this.irLearnBusy = false
+      this.irLearnExpectedSeq = -1
+      this.irLearnExpectedAction = ''
+      this.irLearnExpectedIndex = 0
       const results = this.irLearnResults.slice()
       results[index - 1] = ok ? 1 : 2
       this.irLearnResults = results
       const receivedCount = this.countIrLearnResults(results)
       this.irLearnCompletedCount = receivedCount
 
-      if (!ok && msg !== 'timeout') {
-        this.irLearnActive = false
-        this.irLearnBusy = false
-        this.irLearnHandshakeConfirmed = false
-        this.irLearnExpectedSeq = -1
-        this.irLearnExpectedAction = ''
-        this.irLearnStatus = `“${label}”进入学习失败：${msg.length > 0 ? msg : '红外模块异常'}，流程已停止`
-        console.info(`[IR][learn-stop] index=${index} seq=${seq} msg=${msg}`)
+      if (!ok) {
+        this.irLearnStep = index - 1
+        this.irLearnStatus = (msg === 't' || msg === 'timeout') ?
+          `“${label}”未识别到遥控器信号，请对准后重试` :
+          `“${label}”学习失败：${msg.length > 0 ? msg : '红外模块异常'}，请重试`
+        console.info(`[IR][learn-retry] index=${index} seq=${seq} msg=${msg}`)
         return
       }
 
@@ -10300,13 +10373,17 @@ struct Index {
         return
       }
 
-      this.irLearnStep = Math.max(this.irLearnStep, index)
+      this.irLearnStep = index
       this.irLearnBusy = true
-      this.irLearnStatus = ok ?
-        `“${label}”学习成功，3 秒后请按“${this.irLearnCurrentLabel()}”` :
-        `“${label}”等待超时，已跳过；3 秒后请按“${this.irLearnCurrentLabel()}”`
-      this.startIrLearnTimeout(IR_LEARN_STEP_ACK_TIMEOUT_MS,
-        `未收到“${this.irLearnCurrentLabel()}”的学习结果，请检查设备状态`)
+      this.irLearnStatus = `“${label}”学习成功，正在准备“${this.irLearnCurrentLabel()}”`
+      setTimeout(() => {
+        if (!this.irLearnActive || this.irLearnStep !== index) return
+        this.sendIrCommand('learn', index + 1, IR_LEARN_STEP_ACK_TIMEOUT_MS,
+          `“${this.irLearnCurrentLabel()}”学习超时，可以重试`).catch((err: Error) => {
+          this.irLearnBusy = false
+          this.irLearnStatus = `准备“${this.irLearnCurrentLabel()}”失败：${err.message}`
+        })
+      }, 3000)
       return
     }
 
