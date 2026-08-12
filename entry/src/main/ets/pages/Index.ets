@@ -49,8 +49,9 @@ const GATEWAY_REBOOT_ACK_TIMEOUT_MS: number = 5000
 const GATEWAY_REBOOT_CLOSE_DELAY_MS: number = 900
 const BLE_BUSINESS_START_TIMEOUT_MS: number = 120000
 const NETWORK_FAILOVER_START_GRACE_MS: number = 30000
-const NETWORK_BUSINESS_STALE_MS: number = 15000
 const BLE_CRYPTO_SWITCH_TIMEOUT_MS: number = 12000
+const LIGHT_CONTROL_ACK_TIMEOUT_MS: number = 12000
+const NETWORK_CRYPTO_READY_WAIT_MS: number = 15000
 const IR_COMMAND_ACK_TIMEOUT_MS: number = 8000
 const IR_LEARN_STEP_ACK_TIMEOUT_MS: number = 90000
 const IR_LEARN_KEY_LABELS: string[] = ['开机', '关机', '温度+', '温度-', '制冷', '制热']
@@ -647,6 +648,7 @@ struct Index {
   @State bleDebugKeyBusy: boolean = false
   // MQTT 消息记录（替代旧 UDP 列表）
   @State mqttMessages: MessageItem[] = []
+  private mqttMessageBuffer: MessageItem[] = []
   @State mqttLastMsgTime: string = '--:--:--'
   private debugPanelTapCount: number = 0
   private debugPanelLastTapAt: number = 0
@@ -687,8 +689,9 @@ struct Index {
   private bleBusinessCryptoAckDevices: Set<string> = new Set()
   private bleBusinessCryptoTimerId: number = -1
   private networkHealthMonitoringStartedAt: number = Date.now()
-  private networkBusinessAtByDevice: Map<string, number> = new Map()
   private networkCommandFailureCount: number = 0
+  private networkCryptoValidationRequiredAt: number = Date.now()
+  private networkCryptoRecoveryDevices: Set<string> = new Set()
 
   private timerId: number = -1
   private pollTimerId: number = -1
@@ -1348,7 +1351,9 @@ struct Index {
         return
       }
       if (this.bleBusinessDesired) {
-        console.info(`[PROTO] ignore HTTP_SENSOR ${topic} while BLE business mode is active`)
+        if (SENSOR_VERBOSE_LOG) {
+          console.info(`[PROTO] ignore HTTP_SENSOR ${topic} while BLE business mode is active`)
+        }
         return
       }
       if (looksEncrypted(raw)) {
@@ -1379,7 +1384,6 @@ struct Index {
     this.bleBusinessCryptoPendingMode = ''
     this.bleBusinessAwaitingGatewayReboot = false
     this.networkHealthMonitoringStartedAt = Date.now()
-    this.networkBusinessAtByDevice.clear()
     this.networkCommandFailureCount = 0
 
     const registry = this.loadDeviceRegistry()
@@ -2246,7 +2250,7 @@ struct Index {
       this.bleBusinessStatus = `蓝牙模式已关闭 · 当前 ${this.commandTransport}`
     }
     this.networkHealthMonitoringStartedAt = Date.now()
-    this.networkBusinessAtByDevice.clear()
+    this.networkCryptoValidationRequiredAt = Date.now()
     this.networkCommandFailureCount = 0
   }
 
@@ -2271,16 +2275,57 @@ struct Index {
     if (protocol === 'BLE' || protocol !== this.transportForDevice(deviceId)) {
       return
     }
-    this.networkBusinessAtByDevice.set(deviceId, Date.now())
     this.networkCommandFailureCount = 0
+  }
+
+  async waitForNetworkCryptoSession(deviceId: string): Promise<void> {
+    const requiredAt = this.networkCryptoValidationRequiredAt
+    const successfulAt = this.lastSuccessfulDecryptAtByDevice.get(deviceId) ?? 0
+    const installedAt = this.lastEcdhInstallTimeByDevice.get(deviceId) ?? 0
+    if (successfulAt >= requiredAt || installedAt >= requiredAt) {
+      return
+    }
+    let hasPendingKey = this.keyExchange.getPendingKeys(deviceId) !== null
+    if (!hasPendingKey && !this.networkCryptoRecoveryDevices.has(deviceId)) {
+      this.networkCryptoRecoveryDevices.add(deviceId)
+      this.switchDeviceToStaticCryptoSession(deviceId, 'command-session-validation',
+        this.cryptoModeForDevice(deviceId))
+      this.startKeyExchange(deviceId, 'command-session-validation').catch((err: Error) => {
+        console.info(`[CMD][CRYPTO] active ECDH failed device=${deviceId} ${err.message}`)
+      }).finally(() => {
+        this.networkCryptoRecoveryDevices.delete(deviceId)
+      })
+      hasPendingKey = true
+    }
+    const startedAt = Date.now()
+    this.cryptoDebugText = `等待 WiFi 密钥确认 ${deviceId}`
+    console.info(`[CMD][CRYPTO] wait for verified Wi-Fi session device=${deviceId}`)
+    while (Date.now() - startedAt < NETWORK_CRYPTO_READY_WAIT_MS) {
+      const nextSuccessfulAt = this.lastSuccessfulDecryptAtByDevice.get(deviceId) ?? 0
+      const nextInstalledAt = this.lastEcdhInstallTimeByDevice.get(deviceId) ?? 0
+      if (nextSuccessfulAt >= requiredAt || nextInstalledAt >= requiredAt) {
+        console.info(`[CMD][CRYPTO] Wi-Fi session ready device=${deviceId} waited=${Date.now() - startedAt}ms`)
+        return
+      }
+      await new Promise<void>((resolve: () => void) => setTimeout(resolve, 100))
+    }
+    throw new Error(`WiFi 密钥协商未完成：${deviceId}`)
   }
 
   monitorBusinessTransportHealth(): void {
     if (this.bleBusinessDesired) {
       if (this.bleBusinessState !== 'ready' && this.bleBusinessStartAt > 0 &&
         Date.now() - this.bleBusinessStartAt > BLE_BUSINESS_START_TIMEOUT_MS) {
-        this.bleBusinessState = 'error'
-        this.bleBusinessStatus = '蓝牙自动恢复超时，请检查网关和两台家居设备'
+        console.info('[BLE-MODE][timeout] BLE start failed; falling back to Wi-Fi business mode')
+        this.bleBusinessDesired = false
+        this.bleBusinessAutoFailover = false
+        this.bleBusinessAwaitingGatewayReboot = false
+        this.bleBusinessState = 'off'
+        this.bleBusinessStatus = `蓝牙启动超时，已恢复 ${this.commandTransport}`
+        this.bleBusinessStartAt = 0
+        this.networkHealthMonitoringStartedAt = Date.now()
+        this.networkCryptoValidationRequiredAt = Date.now()
+        this.networkCommandFailureCount = 0
       } else {
         this.refreshBleBusinessReadiness()
       }
@@ -2290,19 +2335,13 @@ struct Index {
     if (now - this.networkHealthMonitoringStartedAt < NETWORK_FAILOVER_START_GRACE_MS) {
       return
     }
-    const requiredIds: string[] = []
-    const lightId = this.deviceForCapability('light')
-    const acId = this.deviceForCapability('ac')
-    if (lightId.length > 0) requiredIds.push(lightId)
-    if (acId.length > 0 && requiredIds.indexOf(acId) < 0) requiredIds.push(acId)
-    if (requiredIds.length < 2) {
-      return
-    }
-    const stale = requiredIds.some((deviceId: string) => {
-      const lastAt = this.networkBusinessAtByDevice.get(deviceId) ?? 0
-      return lastAt <= 0 || now - lastAt > NETWORK_BUSINESS_STALE_MS
-    })
-    if (stale || this.networkCommandFailureCount >= 2) {
+    // Sensor/status packets are event driven and some devices can legitimately
+    // stay silent for a long time. Missing timestamps (especially immediately
+    // after manually leaving BLE mode) therefore do not prove Wi-Fi failure.
+    // Fail over only after two real command dispatch failures; any successful
+    // Wi-Fi business packet resets the counter in markNetworkBusinessHealthy().
+    if (this.networkCommandFailureCount >= 2) {
+      console.info(`[BLE-MODE][auto-failover] confirmed Wi-Fi command failures=${this.networkCommandFailureCount}`)
       this.enableBleBusinessMode(true).catch((err: Error) => {
         this.bleBusinessState = 'error'
         this.bleBusinessStatus = `自动切换蓝牙失败：${err.message}`
@@ -3769,7 +3808,9 @@ struct Index {
 
   applySensorData(data: SensorPacket, source: string = 'LIVE', deviceId: string = this.activeDeviceId): void {
     if ((source === 'MQTT' || source === 'DIRECT') && !this.isSensorCapableDevice(deviceId)) {
-      console.info(`[Sensor][ignore-non-sensor-device] source=${source} device=${deviceId}`)
+      if (SENSOR_VERBOSE_LOG) {
+        console.info(`[Sensor][ignore-non-sensor-device] source=${source} device=${deviceId}`)
+      }
       return
     }
     this.syncProtocolFromSensorData(data, source, deviceId)
@@ -3879,6 +3920,14 @@ struct Index {
     if (observed !== sourceProtocol) {
       console.info(`[PROTO][sensor-ignore-stale] declared=${observed} source=${sourceProtocol}/${source}`)
       return
+    }
+    // A successfully decrypted business packet carrying proto is authoritative
+    // for the device's current Wi-Fi command route. MQTT key exchange / hello
+    // traffic is only a maintenance channel and must not overwrite this route.
+    this.localGatewayTransportByDevice.set(deviceId, observed)
+    this.updateDeviceDescriptorModes(deviceId, observed, '')
+    if (deviceId === this.activeDeviceId && this.protocolPendingMode.length === 0) {
+      this.commandTransport = observed
     }
     if (deviceId !== this.activeDeviceId) {
       return
@@ -5151,9 +5200,6 @@ struct Index {
     const packetDeviceId = this.registerDeviceId(this.deviceIdFromScopedTopic(topic))
     if (fromLocalGateway) {
       this.localGatewayDeviceIds.add(packetDeviceId)
-      if (!this.keyExchange.isKeyExchangeTopic(topic) || !this.isRecentlySentEcdhPublicKey(payload)) {
-        this.localGatewayTransportByDevice.set(packetDeviceId, 'MQTT')
-      }
     }
 
     if (this.keyExchange.isKeyExchangeTopic(topic)) {
@@ -5161,11 +5207,15 @@ struct Index {
       return
     }
     if (this.bleBusinessDesired) {
-      console.info(`[PROTO] ignore MQTT ${topic} while BLE business mode is active`)
+      if (SENSOR_VERBOSE_LOG) {
+        console.info(`[PROTO] ignore MQTT ${topic} while BLE business mode is active`)
+      }
       return
     }
     if (packetDeviceId !== this.activeDeviceId) {
-      console.info(`[DEVICE] process background MQTT packet from ${packetDeviceId}; active=${this.activeDeviceId}`)
+      if (SENSOR_VERBOSE_LOG) {
+        console.info(`[DEVICE] process background MQTT packet from ${packetDeviceId}; active=${this.activeDeviceId}`)
+      }
     }
 
     const isStatusTopic = topic === 'esp32/status' || topic.endsWith('/status')
@@ -5588,15 +5638,16 @@ struct Index {
       this.lastSensorDebugMessageAt = now
     }
     const item: MessageItem = {
-      id: `${now}-${this.mqttMessages.length}`,
+      id: `${now}-${this.mqttMessageBuffer.length}`,
       time: new Date().toLocaleTimeString(),
       from: topic,
       text: text,
       deviceId: this.debugDeviceIdFromTopic(topic)
     }
-    const scrollOffset = this.captureDebugInfoScrollOffset()
-    this.mqttMessages = [...this.mqttMessages, item].slice(-MAX_MQTT_MESSAGES)
+    this.mqttMessageBuffer = [...this.mqttMessageBuffer, item].slice(-MAX_MQTT_MESSAGES)
     if (this.showDebugPanel) {
+      const scrollOffset = this.captureDebugInfoScrollOffset()
+      this.mqttMessages = this.mqttMessageBuffer.slice()
       this.restoreDebugInfoScrollPosition(scrollOffset)
     }
     if (CLOUD_SYNC_ENABLED) {
@@ -6482,8 +6533,12 @@ struct Index {
     this.addMqttMessage('dayu/cmd', `[CLICK] ${nextValue ? '开灯' : '关灯'} 准备发送`)
     this.livingLightAckText = `${this.livingLightOn ? 'ON' : 'OFF'} → ${nextValue ? 'ON' : 'OFF'}`
     this.livingLightOptimisticUntil = 0
-    this.startLivingLightControlTimer()
     this.sendLightControl('living', nextValue)
+      .then(() => {
+        if (this.livingLightPending) {
+          this.startLivingLightControlTimer()
+        }
+      })
       .catch((err: Error) => {
         console.info(`[LED][ui-send-fail] ${err.message}`)
         if (!preserveOptimisticOnFailure) {
@@ -6519,7 +6574,7 @@ struct Index {
         this.livingLightAckText = '发送超时'
       }
       this.livingLightControlTimerId = -1
-    }, 3500)
+    }, LIGHT_CONTROL_ACK_TIMEOUT_MS)
   }
 
   nextBleDebugLedSeq(): number {
@@ -7721,6 +7776,9 @@ struct Index {
       await this.sendBleBusinessJson(targetDeviceId, jsonCmd)
       return
     }
+    await this.waitForNetworkCryptoSession(targetDeviceId)
+    // ECDH may take several seconds. Resolve the route afterwards so a freshly
+    // decrypted business packet can correct an outdated MQTT/HTTP route.
     const protocol = this.protocolPendingMode.length > 0 && targetDeviceId === this.activeDeviceId ?
       this.protocolPendingMode : this.transportRouteForDevice(targetDeviceId)
     if (this.protocolPendingMode.length > 0 && targetDeviceId === this.activeDeviceId) {
@@ -8818,11 +8876,19 @@ struct Index {
     this.provisioningUsbDevices = devices
     this.provisioningSelectedDeviceIndex = targetIndex
     this.addProvisioningDiagnosticLog(`自动连接已找到已记住的 USB 网关：${devices[targetIndex].title}`)
-    if (!this.provisioningPort.hasDeviceAccessRight(devices[targetIndex])) {
-      this.gatewayUsbTestStatus = '检测到 USB 网关，请点击“连接网关”完成授权'
-      this.provisioningStatus = 'USB 网关需要重新授权'
-      this.addProvisioningDiagnosticLog('USB 地址已变化，等待用户点击“连接网关”完成系统授权')
-      return
+    const needsAccessRight = !this.provisioningPort.hasDeviceAccessRight(devices[targetIndex])
+    if (needsAccessRight) {
+      // A gateway reboot changes its USB bus address, so OpenHarmony treats it
+      // as a newly enumerated device. Continue the BLE-switch gesture through
+      // open(), which requests the new address permission, instead of waiting
+      // for a hidden debug-panel button that the user cannot see.
+      this.gatewayUsbTestStatus = '网关已重新枚举，正在续接 USB 权限'
+      this.provisioningStatus = '正在请求重新枚举后的 USB 网关权限'
+      if (this.bleBusinessDesired) {
+        this.bleBusinessState = 'recovering'
+        this.bleBusinessStatus = '网关已重启，正在重新连接 USB'
+      }
+      this.addProvisioningDiagnosticLog('USB 地址已变化，自动续接并请求新地址权限')
     }
     await this.connectProvisioningUsb()
     if (!this.provisioningConnected) {
@@ -8836,6 +8902,11 @@ struct Index {
       return
     }
 
+    // Persist the current bus address after every successful re-enumeration.
+    // Otherwise the next reboot always starts from the obsolete address.
+    this.gatewayUsbDeviceKey = this.provisioningDeviceKey(devices[targetIndex])
+    this.gatewayAutoConnectAttempt = 0
+    this.addProvisioningDiagnosticLog(`USB 网关已自动续接：${this.gatewayUsbDeviceKey}`)
     this.gatewayUsbTestStatus = 'USB 网关已自动连接'
     await this.beginGatewayRecoveryHandshake()
   }
@@ -10477,6 +10548,7 @@ struct Index {
     if (this.debugPanelTapCount >= 3) {
       this.debugPanelTapCount = 0
       this.debugShowAllDevices = false
+      this.mqttMessages = this.mqttMessageBuffer.slice()
       this.showDebugPanel = true
       setTimeout(() => {
         if (this.showDebugPanel) {
@@ -10497,8 +10569,33 @@ struct Index {
       $r('app.media.settings_aes_comic') : $r('app.media.settings_sm4_comic')
   }
 
+  settingsBluetoothIcon(): Resource {
+    return this.bleBusinessDesired ?
+      $r('app.media.settings_bluetooth_comic') : $r('app.media.settings_bluetooth_off')
+  }
+
   settingsCurrentCryptoMode(): string {
     return this.bleBusinessDesired ? this.bleDebugCryptoMode : this.cryptoModeForDevice(this.activeDeviceId)
+  }
+
+  sidebarTransportStatusText(): string {
+    if (this.bleBusinessDesired) {
+      return '蓝牙'
+    }
+    return this.transportForDevice(this.activeDeviceId) === 'HTTP' ? 'WiFi · HTTPS' : 'WiFi · MQTTS'
+  }
+
+  settingsFeatureDimmed(action: string): boolean {
+    if (action === 'protocol') {
+      return this.bleBusinessDesired || this.protocolPendingMode.length > 0
+    }
+    if (action === 'crypto') {
+      return this.cryptoPendingMode.length > 0 || this.bleBusinessCryptoPendingMode.length > 0
+    }
+    if (action === 'ble') {
+      return this.bleBusinessDesired && this.bleBusinessState !== 'ready'
+    }
+    return false
   }
 
   bleBusinessCardSubtitle(): string {
@@ -10769,9 +10866,6 @@ struct Index {
   }
 
   navTitle(): string {
-    if (this.activeNav === 'bluetooth') {
-      return '蓝牙调试'
-    }
     if (this.activeNav === 'devices') {
       return '设备'
     }
@@ -10782,9 +10876,6 @@ struct Index {
   }
 
   navSubtitle(): string {
-    if (this.activeNav === 'bluetooth') {
-      return '独立验证 BLE 网关与家居设备'
-    }
     if (this.activeNav === 'devices') {
       return '空调、照明、窗帘与扩展设备'
     }
@@ -11200,6 +11291,12 @@ struct Index {
           .fontColor(this.subTextColor())
           .margin({ top: 3 })
           .maxLines(1)
+        Text(this.sidebarTransportStatusText())
+          .fontSize(9)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.bleBusinessDesired ? this.accentBlue() : this.accentGreen())
+          .margin({ top: 3 })
+          .maxLines(1)
       }
       .alignItems(HorizontalAlign.Center)
       .margin({ top: 8 })
@@ -11248,7 +11345,6 @@ struct Index {
       this.BrandLogo()
       Column() {
         this.NavItem('overview', '总览', $r('app.media.nav_overview'))
-        this.NavItem('bluetooth', '蓝牙调试', $r('app.media.setting_debug'))
         this.NavItem('settings', '设置', $r('app.media.nav_settings'))
       }
       .width('100%')
@@ -12462,36 +12558,69 @@ struct Index {
       this.PageHeader()
       Grid() {
         GridItem() {
-          this.SettingsFeatureCard('设备状态', '点击图标查看设备状态',
-            $r('app.media.settings_device_status_comic'), 'status', this.accentGreen())
+          SettingsFeatureCardCell({
+            title: '设备状态', subtitle: '点击图标查看设备状态',
+            icon: $r('app.media.settings_device_status_comic'), dimmed: false,
+            textColor: this.textColor(), subTextColor: this.subTextColor(), cardBg: this.cardBg(),
+            cardBorderColor: this.accentGreen(), onTap: () => { this.handleSettingsFeature('status') }
+          })
         }
         GridItem() {
-          this.SettingsFeatureCard('设备接入', '点击图标开始接入设备',
-            $r('app.media.settings_device_access_comic'), 'provisioning', this.accentBlue())
+          SettingsFeatureCardCell({
+            title: '设备接入', subtitle: '点击图标开始接入设备',
+            icon: $r('app.media.settings_device_access_comic'), dimmed: false,
+            textColor: this.textColor(), subTextColor: this.subTextColor(), cardBg: this.cardBg(),
+            cardBorderColor: this.accentGreen(), onTap: () => { this.handleSettingsFeature('provisioning') }
+          })
         }
         GridItem() {
-          this.SettingsFeatureCard('空调万能适配', '点击图标试试我们的空调万能适配吧',
-            $r('app.media.settings_ir_adapter_comic'), 'ir', this.accentOrange())
+          SettingsFeatureCardCell({
+            title: '空调万能适配', subtitle: '点击图标试试我们的空调万能适配吧',
+            icon: $r('app.media.settings_ir_adapter_comic'), dimmed: false,
+            textColor: this.textColor(), subTextColor: this.subTextColor(), cardBg: this.cardBg(),
+            cardBorderColor: this.accentGreen(), onTap: () => { this.handleSettingsFeature('ir') }
+          })
         }
         GridItem() {
-          this.SettingsFeatureCard('声纹保护', '点击图标管理声纹',
-            $r('app.media.settings_voiceprint_comic'), 'voiceprint', this.accentBlue())
+          SettingsFeatureCardCell({
+            title: '声纹保护', subtitle: '点击图标管理声纹',
+            icon: $r('app.media.settings_voiceprint_comic'), dimmed: false,
+            textColor: this.textColor(), subTextColor: this.subTextColor(), cardBg: this.cardBg(),
+            cardBorderColor: this.accentGreen(), onTap: () => { this.handleSettingsFeature('voiceprint') }
+          })
         }
         GridItem() {
-          this.SettingsFeatureCard('设备绑定', '点击图标管理设备绑定',
-            $r('app.media.settings_device_binding_comic'), 'binding', this.accentGreen())
+          SettingsFeatureCardCell({
+            title: '设备绑定', subtitle: '点击图标管理设备绑定',
+            icon: $r('app.media.settings_device_binding_comic'), dimmed: false,
+            textColor: this.textColor(), subTextColor: this.subTextColor(), cardBg: this.cardBg(),
+            cardBorderColor: this.accentGreen(), onTap: () => { this.handleSettingsFeature('binding') }
+          })
         }
         GridItem() {
-          this.SettingsFeatureCard('蓝牙开关', this.bleBusinessCardSubtitle(),
-            $r('app.media.settings_bluetooth_comic'), 'ble', this.accentBlue())
+          SettingsFeatureCardCell({
+            title: '蓝牙开关', subtitle: this.bleBusinessCardSubtitle(),
+            icon: this.settingsBluetoothIcon(), dimmed: this.settingsFeatureDimmed('ble'), disabled: false,
+            textColor: this.textColor(), subTextColor: this.subTextColor(), cardBg: this.cardBg(),
+            cardBorderColor: this.accentGreen(), onTap: () => { this.handleSettingsFeature('ble') }
+          })
         }
         GridItem() {
-          this.SettingsFeatureCard('控制通道', '点击图标切换控制协议',
-            this.settingsProtocolIcon(), 'protocol', this.accentBlue())
+          SettingsFeatureCardCell({
+            title: '控制通道', subtitle: this.bleBusinessDesired ? '蓝牙模式下不可用' : '点击图标切换控制协议',
+            icon: this.settingsProtocolIcon(), dimmed: this.settingsFeatureDimmed('protocol'),
+            disabled: this.bleBusinessDesired,
+            textColor: this.textColor(), subTextColor: this.subTextColor(), cardBg: this.cardBg(),
+            cardBorderColor: this.accentGreen(), onTap: () => { this.handleSettingsFeature('protocol') }
+          })
         }
         GridItem() {
-          this.SettingsFeatureCard('加密算法', '点击图标切换加密方式',
-            this.settingsCryptoIcon(), 'crypto', this.accentGreen())
+          SettingsFeatureCardCell({
+            title: '加密算法', subtitle: '点击图标切换加密方式',
+            icon: this.settingsCryptoIcon(), dimmed: this.settingsFeatureDimmed('crypto'),
+            textColor: this.textColor(), subTextColor: this.subTextColor(), cardBg: this.cardBg(),
+            cardBorderColor: this.accentGreen(), onTap: () => { this.handleSettingsFeature('crypto') }
+          })
         }
       }
       .columnsTemplate('1fr 1fr 1fr 1fr')
@@ -12884,8 +13013,6 @@ struct Index {
   ActivePage() {
     if (this.activeNav === 'settings') {
       this.SettingsPage()
-    } else if (this.activeNav === 'bluetooth') {
-      this.BluetoothDebugPage()
     } else {
       this.OverviewPage()
     }
@@ -16294,6 +16421,74 @@ struct SettingsFeatureImageCell {
       .height(104)
       .objectFit(ImageFit.Contain)
       .opacity(this.dimmed ? 0.55 : 1)
+  }
+}
+
+/**
+ * 设置页八宫格功能卡片。
+ *
+ * 使用独立 @Component + @Prop 接收动态状态，避免 @Builder 按值参数在
+ * 蓝牙模式、协议或加密状态变化后仍显示旧内容，直到切换页面才重建。
+ */
+@Component
+struct SettingsFeatureCardCell {
+  @Prop title: string = ''
+  @Prop subtitle: string = ''
+  @Prop icon: Resource
+  @Prop dimmed: boolean = false
+  @Prop disabled: boolean = false
+  @Prop textColor: string = ''
+  @Prop subTextColor: string = ''
+  @Prop cardBg: string = ''
+  @Prop cardBorderColor: string = ''
+  onTap: () => void = () => {}
+
+  build() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column() {
+        Image(this.icon)
+          .width(124)
+          .height(104)
+          .objectFit(ImageFit.Contain)
+          .opacity(this.dimmed ? (this.disabled ? 0.28 : 0.55) : 1)
+        Text(this.title)
+          .fontSize(17)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(this.textColor)
+          .margin({ top: 3 })
+          .maxLines(1)
+          .opacity(this.disabled ? 0.55 : 1)
+        Text(this.subtitle)
+          .width('92%')
+          .height(38)
+          .fontSize(12)
+          .fontColor(this.subTextColor)
+          .textAlign(TextAlign.Center)
+          .margin({ top: 3 })
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .opacity(this.disabled ? 0.55 : 1)
+      }
+      .width('100%')
+      .height('100%')
+      .justifyContent(FlexAlign.Center)
+      .alignItems(HorizontalAlign.Center)
+      .backgroundColor(this.cardBg)
+      .border({ width: 1.5, color: this.cardBorderColor })
+      .borderRadius(14)
+
+      Row()
+        .width('100%')
+        .height('100%')
+        .backgroundColor('#01000000')
+        .onClick(() => {
+          if (!this.disabled) {
+            this.onTap()
+          }
+        })
+    }
+    .width('100%')
+    .height('100%')
   }
 }
 
