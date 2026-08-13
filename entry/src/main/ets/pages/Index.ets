@@ -226,7 +226,30 @@ interface GatewayBleDeviceInfo {
   transport: string
   crypto: string
   epoch: number
+  commissioning: boolean
+  claimed: boolean
   lastSeen: number
+}
+
+interface BleProvisionPendingAck {
+  deviceId: string
+  action: string
+  index: number
+  seq: number
+  timerId: number
+  resolve: (matched: boolean) => void
+}
+
+interface BleProvisionCommand {
+  cmd?: string
+  seq?: number
+  a?: string
+  s?: string
+  n?: number
+  q?: number
+  r?: string
+  i?: number
+  d?: string
 }
 
 interface BleLedControlCommand {
@@ -870,12 +893,20 @@ struct Index {
   @State gatewayBleReconnecting: boolean = false
   @State gatewayBleDevices: GatewayBleDeviceInfo[] = []
   @State gatewayBleCandidateCount: number = 0
+  @State bleProvisionSelectedDeviceId: string = ''
+  @State bleProvisionBusy: boolean = false
+  @State bleProvisionStatus: string = '扫描并选择待添加设备'
   private gatewayBleScanSeq: number = 0
   private gatewayBleScanTimerId: number = -1
   private gatewayBleReconnectSeq: number = 0
   private gatewayBleReconnectTimerId: number = -1
   private gatewayBleCandidateAddresses: string[] = []
   private gatewayBleControlSeq: number = 0
+  private bleProvisionCommandSeq: number = 0
+  private bleProvisionPendingAck: BleProvisionPendingAck | null = null
+  private bleClaimPendingSeq: number = -1
+  private bleClaimPendingResolve: ((matched: boolean) => void) | null = null
+  private bleClaimPendingTimerId: number = -1
   private bleDebugLightGatewaySeq: number = 0
   private bleDebugDoorGatewaySeq: number = 0
   private bleDebugKeyGatewaySeq: number = 0
@@ -4629,6 +4660,10 @@ struct Index {
   handleDeviceAck(data: Record<string, Object>, deviceId: string = this.activeDeviceId): void {
     const rawCmd = data['cmd'] as string
     const cmd = typeof rawCmd === 'string' ? rawCmd.toLowerCase() : ''
+    if (cmd === 'provision') {
+      this.handleBleProvisionAck(data, deviceId)
+      return
+    }
     if (cmd === 'alarm') {
       this.handleAlarmAck(data, deviceId)
       return
@@ -6975,7 +7010,7 @@ struct Index {
 
   processBleBusinessJson(jsonStr: string, topic: string, deviceId: string): void {
     console.info(`[BLE][business] device=${deviceId} topic=${topic} ${jsonStr.substring(0, 180)}`)
-    if (!this.bleBusinessDesired && this.activeNav !== 'bluetooth') {
+    if (!this.bleBusinessDesired && this.activeNav !== 'bluetooth' && !this.bleProvisionBusy) {
       console.info(`[BLE][business-ignore] network mode active device=${deviceId}`)
       return
     }
@@ -7799,6 +7834,189 @@ struct Index {
     return await this.sendBleEncryptedPayload(targetDeviceId,
       this.commandTopicForDevice('dayu/cmd', targetDeviceId),
       this.uint8ArrayToBase64(envelope), envelope.length, this.bleDebugCryptoMode, responseBudget)
+  }
+
+  nextBleProvisionCommandSeq(): number {
+    this.bleProvisionCommandSeq = (this.bleProvisionCommandSeq % 999999) + 1
+    return this.bleProvisionCommandSeq
+  }
+
+  crc32Hex(data: Uint8Array): string {
+    let crc = 0xFFFFFFFF
+    for (let i = 0; i < data.length; i += 1) {
+      crc = (crc ^ data[i]) >>> 0
+      for (let bit = 0; bit < 8; bit += 1) {
+        crc = ((crc >>> 1) ^ ((crc & 1) !== 0 ? 0xEDB88320 : 0)) >>> 0
+      }
+    }
+    return ((crc ^ 0xFFFFFFFF) >>> 0).toString(16).toUpperCase().padStart(8, '0')
+  }
+
+  clearBleProvisionPendingAck(matched: boolean = false): void {
+    const pending = this.bleProvisionPendingAck
+    this.bleProvisionPendingAck = null
+    if (pending === null) {
+      return
+    }
+    clearTimeout(pending.timerId)
+    pending.resolve(matched)
+  }
+
+  handleBleProvisionAck(data: Record<string, Object>, deviceId: string): void {
+    const pending = this.bleProvisionPendingAck
+    if (pending === null || pending.deviceId !== deviceId) {
+      return
+    }
+    const action = typeof data['a'] === 'string' ? data['a'] as string : ''
+    const index = typeof data['i'] === 'number' ? data['i'] as number : -1
+    const seq = typeof data['seq'] === 'number' ? data['seq'] as number : 0
+    if (action !== pending.action || seq !== pending.seq ||
+      (action === 'k' && index !== pending.index)) {
+      return
+    }
+    this.clearBleProvisionPendingAck(data['ok'] === true)
+  }
+
+  async sendBleProvisionCommand(deviceId: string, command: BleProvisionCommand,
+    action: string, index: number = 0): Promise<void> {
+    const seq = this.nextBleProvisionCommandSeq()
+    command.cmd = 'provision'
+    command.seq = seq
+    const waitAck = new Promise<boolean>((resolve: (matched: boolean) => void) => {
+      const timerId = setTimeout(() => {
+        const pending = this.bleProvisionPendingAck
+        if (pending !== null && pending.seq === seq) {
+          this.clearBleProvisionPendingAck(false)
+        }
+      }, 10000)
+      this.bleProvisionPendingAck = { deviceId, action, index, seq, timerId, resolve }
+    })
+    try {
+      await this.sendBleBusinessJson(deviceId, JSON.stringify(command), 1)
+    } catch (err) {
+      this.clearBleProvisionPendingAck(false)
+      throw new Error((err as Error).message)
+    }
+    if (!await waitAck) {
+      throw new Error(`设备未确认配网步骤 ${action}${action === 'k' ? `-${index + 1}` : ''}`)
+    }
+  }
+
+  clearBleClaimPending(matched: boolean = false): void {
+    if (this.bleClaimPendingTimerId !== -1) {
+      clearTimeout(this.bleClaimPendingTimerId)
+      this.bleClaimPendingTimerId = -1
+    }
+    const resolve = this.bleClaimPendingResolve
+    this.bleClaimPendingResolve = null
+    this.bleClaimPendingSeq = -1
+    if (resolve !== null) {
+      resolve(matched)
+    }
+  }
+
+  async claimGatewayBleDevice(deviceId: string): Promise<void> {
+    const seq = this.nextProvisioningSeq()
+    const waitClaim = new Promise<boolean>((resolve: (matched: boolean) => void) => {
+      this.bleClaimPendingSeq = seq
+      this.bleClaimPendingResolve = resolve
+      this.bleClaimPendingTimerId = setTimeout(() => this.clearBleClaimPending(false), 5000)
+    })
+    const payload = utf8Encode(JSON.stringify({
+      type: 'gateway_ble_command', cmd: 'ble', action: 'claim', seq, deviceId
+    }))
+    const sent = await this.sendProvisioningFrameWithSeq(
+      ProvisioningFrameType.GATEWAY_BLE_COMMAND, seq, payload)
+    if (!sent) {
+      this.clearBleClaimPending(false)
+      throw new Error('网关认领命令发送失败')
+    }
+    if (!await waitClaim) {
+      throw new Error('网关未确认设备认领')
+    }
+  }
+
+  async provisionDeviceOverBle(deviceId: string): Promise<void> {
+    if (this.bleProvisionBusy) {
+      return
+    }
+    const device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+    if (device === undefined || !device.connected) {
+      this.bleProvisionStatus = '请先扫描并等待设备连接'
+      return
+    }
+    if (!this.bleDebugHasDynamicKey(deviceId)) {
+      this.bleProvisionStatus = '设备安全通道尚未就绪，请稍候'
+      this.scheduleBleDebugKeyExchange(0)
+      return
+    }
+    if (this.provisioningWifiSsid.trim().length === 0 || this.provisioningBrokerUrl.trim().length === 0) {
+      this.bleProvisionStatus = '请填写 Wi-Fi SSID 和 MQTT 地址'
+      return
+    }
+    const config: ProvisioningConfig = {
+      ssid: this.provisioningWifiSsid.trim(),
+      password: this.provisioningWifiPassword,
+      brokerUrl: this.provisioningBrokerUrl.trim(),
+      httpBridge: this.provisioningHttpBridge.trim(),
+      deviceId: deviceId,
+      crypto: this.provisioningCrypto,
+      transport: this.provisioningTransport
+    }
+    const configPayload = buildProvisioningConfigPayload(config)
+    const chunkBytes = 18
+    const chunks = Math.ceil(configPayload.length / chunkBytes)
+    const session = `p${Date.now().toString(36).slice(-10)}`
+    this.bleProvisionSelectedDeviceId = deviceId
+    this.bleProvisionBusy = true
+    this.bleProvisionStatus = '正在建立加密配网会话'
+    try {
+      await this.sendBleProvisionCommand(deviceId, {
+        a: 'b', s: session, n: configPayload.length, q: chunks, r: this.crc32Hex(configPayload)
+      }, 'b')
+      for (let index = 0; index < chunks; index += 1) {
+        const start = index * chunkBytes
+        const chunk = configPayload.slice(start, Math.min(configPayload.length, start + chunkBytes))
+        this.bleProvisionStatus = `正在加密发送网络配置 ${index + 1}/${chunks}`
+        await this.sendBleProvisionCommand(deviceId, {
+          a: 'k', s: session, i: index, d: this.uint8ArrayToBase64(chunk)
+        }, 'k', index)
+      }
+      this.bleProvisionStatus = '正在保存配置'
+      await this.sendBleProvisionCommand(deviceId, { a: 'c', s: session }, 'c')
+      this.bleProvisionStatus = '正在将设备添加到家庭'
+      await this.claimGatewayBleDevice(deviceId)
+      this.bleProvisionStatus = '设备已保存配置并重启，等待 Wi-Fi 上线'
+      const next = this.gatewayBleDevices.map((item: GatewayBleDeviceInfo): GatewayBleDeviceInfo => {
+        if (item.deviceId !== deviceId) {
+          return item
+        }
+        return {
+          deviceId: item.deviceId,
+          name: item.name,
+          room: item.room,
+          address: item.address,
+          rssi: item.rssi,
+          capabilities: item.capabilities,
+          connected: item.connected,
+          transport: item.transport,
+          crypto: item.crypto,
+          epoch: item.epoch,
+          commissioning: false,
+          claimed: true,
+          lastSeen: item.lastSeen
+        }
+      })
+      this.gatewayBleDevices = next
+      this.persistGatewayBleDevices()
+    } catch (err) {
+      this.bleProvisionStatus = `蓝牙添加失败：${(err as Error).message}`
+      this.addProvisioningDiagnosticLog(this.bleProvisionStatus)
+    } finally {
+      this.clearBleProvisionPendingAck(false)
+      this.clearBleClaimPending(false)
+      this.bleProvisionBusy = false
+    }
   }
 
   /**
@@ -9283,6 +9501,8 @@ struct Index {
             transport: device.transport || 'ble',
             crypto: device.crypto || '',
             epoch: device.epoch || 0,
+            commissioning: device.commissioning === true,
+            claimed: device.claimed !== false,
             lastSeen: device.lastSeen || 0
           })
         }
@@ -9309,6 +9529,8 @@ struct Index {
       transport: device.transport,
       crypto: device.crypto,
       epoch: device.epoch,
+      commissioning: device.commissioning,
+      claimed: device.claimed,
       lastSeen: device.lastSeen
     }))
     this.gatewayBleDevicesJson = JSON.stringify(stored)
@@ -9360,6 +9582,10 @@ struct Index {
         (existing !== null ? existing.crypto : ''),
       epoch: typeof data['epoch'] === 'number' ? data['epoch'] as number :
         (existing !== null ? existing.epoch : 0),
+      commissioning: typeof data['commissioning'] === 'boolean' ? data['commissioning'] as boolean :
+        (existing !== null ? existing.commissioning : true),
+      claimed: typeof data['claimed'] === 'boolean' ? data['claimed'] as boolean :
+        (existing !== null ? existing.claimed : false),
       lastSeen: Date.now()
     }
 
@@ -9392,6 +9618,8 @@ struct Index {
       transport: current.transport,
       crypto: current.crypto,
       epoch: current.epoch,
+      commissioning: current.commissioning,
+      claimed: current.claimed,
       lastSeen: Date.now()
     }
     this.gatewayBleDevices = next
@@ -9522,7 +9750,7 @@ struct Index {
         this.recordGatewayBleCandidate(address)
         // 扫描阶段也入库，让界面立即显示发现的设备（没有 device_hello 时用 BLE 地址作为临时 id）
         this.upsertGatewayBleDevice(data, eventType)
-        this.gatewayBleStatus = `本轮扫描到 ${this.gatewayBleCandidateCount} 个广播，已保存 ${this.gatewayBleDevices.length} 台家居设备`
+        this.gatewayBleStatus = `本轮扫描到 ${this.gatewayBleCandidateCount} 个广播，等待选择设备`
         return
       }
       if (eventType === 'device_hello' || eventType === 'ble_device_state' || eventType === 'ble_ready') {
@@ -9536,6 +9764,35 @@ struct Index {
         const eventName = eventType === 'device_hello' ? '已读取设备能力' :
           eventType === 'ble_ready' ? '设备蓝牙通道已就绪' : '设备连接状态已更新'
         this.gatewayBleStatus = `${eventName}，共 ${this.gatewayBleDevices.length} 台`
+        return
+      }
+      if (eventType === 'ble_claim_result') {
+        const ok = data['ok'] === true && payloadSeq === this.bleClaimPendingSeq
+        const deviceId = typeof data['deviceId'] === 'string' ? data['deviceId'] as string : ''
+        if (ok) {
+          this.gatewayBleDevices = this.gatewayBleDevices.map((item: GatewayBleDeviceInfo): GatewayBleDeviceInfo => {
+            if (item.deviceId !== deviceId) {
+              return item
+            }
+            return {
+              deviceId: item.deviceId,
+              name: item.name,
+              room: item.room,
+              address: item.address,
+              rssi: item.rssi,
+              capabilities: item.capabilities,
+              connected: item.connected,
+              transport: item.transport,
+              crypto: item.crypto,
+              epoch: item.epoch,
+              commissioning: item.commissioning,
+              claimed: true,
+              lastSeen: item.lastSeen
+            }
+          })
+          this.persistGatewayBleDevices()
+        }
+        this.clearBleClaimPending(ok)
         return
       }
       if (eventType === 'ble_control_result') {
@@ -9600,6 +9857,8 @@ struct Index {
               transport: item.transport,
               crypto: item.crypto,
               epoch: item.epoch,
+              commissioning: item.commissioning,
+              claimed: item.claimed,
               lastSeen: item.lastSeen
             }
           })
@@ -14322,7 +14581,7 @@ struct Index {
           Column() {
             Row() {
               Column() {
-                Text('蓝牙家居设备联调')
+                Text('蓝牙添加设备')
                   .fontSize(14)
                   .fontWeight(FontWeight.Bold)
                   .fontColor(this.textColor())
@@ -14374,6 +14633,15 @@ struct Index {
             .width('100%')
             .margin({ top: 10 })
 
+            Text(this.bleProvisionStatus)
+              .width('100%')
+              .fontSize(11)
+              .fontColor(this.bleProvisionStatus.indexOf('失败') >= 0 ?
+                this.warningRed() : this.subTextColor())
+              .margin({ top: 8 })
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+
             if (this.gatewayBleDevices.length === 0) {
               Text('尚未发现蓝牙家居设备')
                 .width('100%')
@@ -14392,9 +14660,11 @@ struct Index {
                       .layoutWeight(1)
                       .maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    Text(device.connected ? '已连接' : '已发现')
+                    Text(device.claimed && !device.commissioning ? '已接入' :
+                      (device.connected ? '待添加' : '已发现'))
                       .fontSize(10)
-                      .fontColor(device.connected ? this.accentGreen() : this.accentOrange())
+                      .fontColor(device.claimed && !device.commissioning ?
+                        this.accentGreen() : this.accentOrange())
                   }
                   .width('100%')
                   Text(this.deviceIdDisplayText(device.deviceId))
@@ -14417,6 +14687,31 @@ struct Index {
                   }
                   .width('100%')
                   .margin({ top: 4 })
+                  Row() {
+                    Text(this.bleDebugHasDynamicKey(device.deviceId) ? '安全通道已就绪' :
+                      (device.connected ? '正在建立安全通道' : '等待连接'))
+                      .layoutWeight(1)
+                      .fontSize(10)
+                      .fontColor(this.bleDebugHasDynamicKey(device.deviceId) ?
+                        this.accentGreen() : this.subTextColor())
+                    Button(this.bleProvisionBusy && this.bleProvisionSelectedDeviceId === device.deviceId ?
+                      '添加中' : (this.bleProvisionSelectedDeviceId === device.deviceId ? '已选择' : '选择'))
+                      .width(68)
+                      .height(28)
+                      .fontSize(10)
+                      .fontColor('#FFFFFF')
+                      .backgroundColor(this.bleProvisionSelectedDeviceId === device.deviceId ?
+                        this.accentGreen() : this.accentBlue())
+                      .borderRadius(8)
+                      .enabled(device.connected && !this.bleProvisionBusy)
+                      .onClick(() => {
+                        this.bleProvisionSelectedDeviceId = device.deviceId
+                        this.bleProvisionStatus = this.bleDebugHasDynamicKey(device.deviceId) ?
+                          '设备已选择，可以发送网络配置' : '设备已选择，等待安全通道就绪'
+                      })
+                  }
+                  .width('100%')
+                  .margin({ top: 7 })
                 }
                 .width('100%')
                 .padding({ left: 10, right: 10, top: 8, bottom: 8 })
@@ -14426,6 +14721,19 @@ struct Index {
                 .borderRadius(8)
               }, (device: GatewayBleDeviceInfo) => device.deviceId)
             }
+
+            Button(this.bleProvisionBusy ? '正在添加设备' : '通过蓝牙添加到家庭')
+              .width('100%')
+              .height(36)
+              .fontSize(12)
+              .fontColor('#FFFFFF')
+              .backgroundColor(this.accentGreen())
+              .borderRadius(8)
+              .margin({ top: 10 })
+              .enabled(this.bleProvisionSelectedDeviceId.length > 0 && !this.bleProvisionBusy)
+              .onClick(() => {
+                this.provisionDeviceOverBle(this.bleProvisionSelectedDeviceId)
+              })
           }
           .width('100%')
           .padding(12)
@@ -15050,11 +15358,11 @@ struct Index {
     Column() {
       Row() {
         Column() {
-          Text('串口接入设备')
+          Text('设备接入')
             .fontSize(24)
             .fontWeight(FontWeight.Bold)
             .fontColor(this.textColor())
-          Text('请通过 USB Type-C 数据线将设备连接大禹，添加成功后即可无线使用')
+          Text('优先通过蓝牙添加家居设备；USB 串口保留用于维护和兼容配网')
             .fontSize(12)
             .fontColor(this.subTextColor())
             .margin({ top: 4 })
@@ -15075,6 +15383,134 @@ struct Index {
           })
       }
       .width('100%')
+
+      Column() {
+        Row() {
+          Column() {
+            Text('蓝牙添加')
+              .fontSize(15)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(this.textColor())
+            Text(this.gatewayBleStatus)
+              .fontSize(11)
+              .fontColor(this.subTextColor())
+              .margin({ top: 3 })
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+          Button(this.gatewayBleScanning ? '扫描中' : '扫描设备')
+            .width(88)
+            .height(34)
+            .fontSize(12)
+            .fontColor('#FFFFFF')
+            .backgroundColor(this.accentBlue())
+            .borderRadius(8)
+            .enabled(this.provisioningConnected && !this.gatewayBleScanning && !this.bleProvisionBusy)
+            .onClick(() => {
+              this.startGatewayBleScan()
+            })
+        }
+        .width('100%')
+
+        if (this.gatewayBleDevices.length === 0) {
+          Text('尚未发现设备')
+            .width('100%')
+            .height(44)
+            .fontSize(12)
+            .fontColor(this.subTextColor())
+            .textAlign(TextAlign.Center)
+        } else {
+          List({ space: 8 }) {
+            ForEach(this.gatewayBleDevices, (device: GatewayBleDeviceInfo) => {
+              ListItem() {
+                Row() {
+                  Column() {
+                    Row() {
+                      Text(device.name)
+                        .fontSize(12)
+                        .fontWeight(FontWeight.Bold)
+                        .fontColor(this.textColor())
+                        .layoutWeight(1)
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      Text(device.claimed && !device.commissioning ? '已接入' :
+                        (device.connected ? '待添加' : '已发现'))
+                        .fontSize(10)
+                        .fontColor(device.claimed && !device.commissioning ?
+                          this.accentGreen() : this.accentOrange())
+                    }
+                    .width('100%')
+                    Text(`${this.deviceIdDisplayText(device.deviceId)} · ${this.gatewayBleCapabilitiesText(device)}`)
+                      .width('100%')
+                      .fontSize(10)
+                      .fontColor(this.subTextColor())
+                      .margin({ top: 3 })
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }
+                  .layoutWeight(1)
+                  .alignItems(HorizontalAlign.Start)
+                  Button(this.bleProvisionSelectedDeviceId === device.deviceId ? '已选择' : '选择')
+                    .width(66)
+                    .height(30)
+                    .fontSize(11)
+                    .fontColor('#FFFFFF')
+                    .backgroundColor(this.bleProvisionSelectedDeviceId === device.deviceId ?
+                      this.accentGreen() : this.accentBlue())
+                    .borderRadius(8)
+                    .margin({ left: 10 })
+                    .enabled(device.connected && !this.bleProvisionBusy)
+                    .onClick(() => {
+                      this.bleProvisionSelectedDeviceId = device.deviceId
+                      this.bleProvisionStatus = this.bleDebugHasDynamicKey(device.deviceId) ?
+                        '设备已选择，可以添加' : '设备已选择，正在建立安全通道'
+                    })
+                }
+                .width('100%')
+                .padding({ left: 10, right: 10, top: 7, bottom: 7 })
+                .backgroundColor(this.cardBg())
+                .border({ width: 1, color: this.bleProvisionSelectedDeviceId === device.deviceId ?
+                  this.accentGreen() : this.hairlineColor() })
+                .borderRadius(8)
+              }
+            }, (device: GatewayBleDeviceInfo) => device.deviceId)
+          }
+          .width('100%')
+          .height(Math.min(116, this.gatewayBleDevices.length * 58))
+          .margin({ top: 8 })
+        }
+
+        Row() {
+          Text(this.bleProvisionStatus)
+            .layoutWeight(1)
+            .fontSize(11)
+            .fontColor(this.bleProvisionStatus.indexOf('失败') >= 0 ? this.warningRed() : this.subTextColor())
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Button(this.bleProvisionBusy ? '添加中' : '添加')
+            .width(76)
+            .height(34)
+            .fontSize(12)
+            .fontColor('#FFFFFF')
+            .backgroundColor(this.accentGreen())
+            .borderRadius(8)
+            .margin({ left: 10 })
+            .enabled(this.bleProvisionSelectedDeviceId.length > 0 && !this.bleProvisionBusy)
+            .onClick(() => {
+              this.provisionDeviceOverBle(this.bleProvisionSelectedDeviceId)
+            })
+        }
+        .width('100%')
+        .margin({ top: 8 })
+      }
+      .width('100%')
+      .padding(12)
+      .margin({ top: 12 })
+      .backgroundColor(this.softPanelBg())
+      .border({ width: 1, color: this.hairlineColor() })
+      .borderRadius(8)
 
       Text(this.provisioningStatus)
         .width('100%')
