@@ -1,6 +1,7 @@
 ﻿import http from '@ohos.net.http'
 import socket from '@ohos.net.socket'
 import wifiManager from '@ohos.wifiManager'
+import preferences from '@ohos.data.preferences'
 import { common } from '@kit.AbilityKit'
 import { util } from '@kit.ArkTS'
 import { CryptoDecryptResult, clearDeviceDynamicCryptoKeys, clearDynamicCryptoKeys, decryptWithExpectedMode, decryptWithExpectedModeForDevice, decryptWithMode, decryptWithProvidedKey, decryptWithStaticExpectedMode, encryptWithMode, encryptWithModeForDevice, getDeviceDynamicAesKey, getDeviceDynamicSm4Key, getDynamicAesKey, getDynamicSm4Key, looksEncrypted, selfTest, currentCryptoMode, setCryptoMode, setDeviceDynamicCryptoKeys, setDynamicCryptoKeys } from '../crypto/CryptoLayer'
@@ -49,6 +50,7 @@ const GATEWAY_REBOOT_ACK_TIMEOUT_MS: number = 5000
 const GATEWAY_REBOOT_CLOSE_DELAY_MS: number = 900
 const BLE_BUSINESS_START_TIMEOUT_MS: number = 120000
 const NETWORK_FAILOVER_START_GRACE_MS: number = 30000
+const NETWORK_STATIC_PACKET_AFTER_ECDH_GRACE_MS: number = 10000
 const BLE_CRYPTO_SWITCH_TIMEOUT_MS: number = 12000
 const LIGHT_CONTROL_ACK_TIMEOUT_MS: number = 12000
 const NETWORK_CRYPTO_READY_WAIT_MS: number = 15000
@@ -432,6 +434,8 @@ const GATEWAY_USB_DEVICE_STORAGE_KEY: string = 'gatewayUsbDeviceKey'
 const GATEWAY_BLE_DEVICES_STORAGE_KEY: string = 'gatewayBleDevices'
 const DEVICE_KEYS_STORAGE_KEY: string = 'deviceCryptoKeys'
 const DEVICE_REGISTRY_STORAGE_KEY: string = 'esp32DeviceRegistry'
+const REMOVED_DEVICE_IDS_STORAGE_KEY: string = 'removedEsp32DeviceIds'
+const DEVICE_ACCESS_PREFERENCES_NAME: string = 'device_access_state'
 const LIGHT_DEVICE_STORAGE_KEY: string = 'lightDeviceId'
 const AC_DEVICE_STORAGE_KEY: string = 'acDeviceId'
 const CURTAIN_DEVICE_STORAGE_KEY: string = 'curtainDeviceId'
@@ -632,6 +636,7 @@ struct Index {
   @StorageLink(DYNAMIC_SM4_STORAGE_KEY) dynamicSm4KeyBase64: string = ''
   @StorageLink(DEVICE_KEYS_STORAGE_KEY) deviceCryptoKeysJson: string = ''
   @StorageLink(DEVICE_REGISTRY_STORAGE_KEY) deviceRegistryJson: string = ''
+  @State removedDeviceIdsJson: string = ''
   @StorageLink(LIGHT_DEVICE_STORAGE_KEY) lightDeviceId: string = 'auto'
   @StorageLink(AC_DEVICE_STORAGE_KEY) acDeviceId: string = 'auto'
   @StorageLink(CURTAIN_DEVICE_STORAGE_KEY) curtainDeviceId: string = 'auto'
@@ -862,6 +867,7 @@ struct Index {
   private pendingProvisioningFrameLogs: string[] = []
   @State showProvisioningPanel: boolean = false
   @State showProvisioningOutputPanel: boolean = false
+  @State showUsbProvisioningSection: boolean = false
   @State showDeviceBindingPanel: boolean = false
   @State provisioningUsbDevices: UsbSerialDeviceInfo[] = []
   @State provisioningSelectedDeviceIndex: number = 0
@@ -883,6 +889,8 @@ struct Index {
   private gatewayUsbTestPendingSeq: number = -1
   private gatewayUsbTestTimerId: number = -1
   private gatewayUsbTestStartedAt: number = 0
+  private gatewayUsbWriteRecoveryBusy: boolean = false
+  private bleGatewayRecoveryTimerId: number = -1
   @State gatewayRebootStatus: string = '网关运行中'
   @State gatewayRebootBusy: boolean = false
   private gatewayRebootPendingSeq: number = -1
@@ -896,17 +904,31 @@ struct Index {
   @State bleProvisionSelectedDeviceId: string = ''
   @State bleProvisionBusy: boolean = false
   @State bleProvisionStatus: string = '扫描并选择待添加设备'
+  @State showBleRemoveConfirm: boolean = false
+  @State bleRemoveDeviceId: string = ''
+  @State bleRemovePendingDeviceId: string = ''
+  @State bleRemoveBusy: boolean = false
+  @State bleRemoveStatus: string = ''
   private gatewayBleScanSeq: number = 0
+  private gatewayBleConnectionEventSeq: number = 0
   private gatewayBleScanTimerId: number = -1
   private gatewayBleReconnectSeq: number = 0
   private gatewayBleReconnectTimerId: number = -1
+  private gatewayBleSuspendPendingSeq: number = -1
+  private postProvisionBleRecoverySeq: number = 0
   private gatewayBleCandidateAddresses: string[] = []
   private gatewayBleControlSeq: number = 0
   private bleProvisionCommandSeq: number = 0
   private bleProvisionPendingAck: BleProvisionPendingAck | null = null
   private bleClaimPendingSeq: number = -1
+  private bleClaimPendingDeviceId: string = ''
   private bleClaimPendingResolve: ((matched: boolean) => void) | null = null
   private bleClaimPendingTimerId: number = -1
+  private bleGatewayClaimRecoveryIds: Set<string> = new Set()
+  private bleForgetPendingSeq: number = -1
+  private bleForgetPendingResolve: ((matched: boolean) => void) | null = null
+  private bleForgetPendingTimerId: number = -1
+  private bleDeviceResetConfirmedIds: Set<string> = new Set()
   private bleDebugLightGatewaySeq: number = 0
   private bleDebugDoorGatewaySeq: number = 0
   private bleDebugKeyGatewaySeq: number = 0
@@ -921,6 +943,7 @@ struct Index {
   private irLearnExpectedAction: string = ''
   private irLearnExpectedIndex: number = 0
   private irLearnHandshakeConfirmed: boolean = false
+  private removedDevicePreferences: preferences.Preferences | null = null
   @State showIrLearnPanel: boolean = false
   @State irLearnActive: boolean = false
   @State irLearnBusy: boolean = false
@@ -930,6 +953,7 @@ struct Index {
   @State irLearnStatus: string = '只需一个遥控器，就可以学习控制你的任何品牌空调'
 
   aboutToAppear(): void {
+    this.restoreRemovedDeviceIds()
     try {
       this.getUIContext().getFont().registerFont({
         familyName: 'YouSheTitle',
@@ -1078,6 +1102,7 @@ struct Index {
     this.clearBleKeyTimer()
     this.clearBleKeyAutoTimer()
     this.clearBleBusinessCryptoTimer()
+    this.clearBleGatewayRecoveryTimer()
     this.bleDebugPendingSeq = 0
     this.bleDebugPendingDeviceId = ''
     this.bleDebugPendingLightOn = false
@@ -1374,7 +1399,6 @@ struct Index {
       const deviceId = typeof rawDeviceId === 'string' ? this.normalizeDeviceId(rawDeviceId) :
         this.deviceIdFromScopedTopic(topic)
       this.localGatewayDeviceIds.add(deviceId)
-      this.localGatewayTransportByDevice.set(deviceId, 'HTTP')
       this.registerDeviceId(deviceId)
       this.observeDeviceTransport(deviceId, 'HTTP_SENSOR')
       const raw = this.base64ToUint8Array(payloadBase64)
@@ -1417,6 +1441,7 @@ struct Index {
     this.bleBusinessAwaitingGatewayReboot = false
     this.networkHealthMonitoringStartedAt = Date.now()
     this.networkCommandFailureCount = 0
+    this.localGatewayTransportByDevice.clear()
 
     const registry = this.loadDeviceRegistry()
     Object.keys(registry).forEach((deviceId: string) => {
@@ -1453,6 +1478,9 @@ struct Index {
 
   registerDeviceId(deviceId: string): string {
     const normalized = this.normalizeDeviceId(deviceId)
+    if (this.isDeviceRemoved(normalized)) {
+      return normalized
+    }
     if (this.knownDeviceIds.indexOf(normalized) < 0) {
       this.knownDeviceIds = this.knownDeviceIds.concat([normalized])
       console.info(`[DEVICE] discovered ${normalized}`)
@@ -1711,9 +1739,89 @@ struct Index {
       return {}
     }
     try {
-      return JSON.parse(this.deviceRegistryJson) as Record<string, DeviceDescriptor>
+      const stored = JSON.parse(this.deviceRegistryJson) as Record<string, DeviceDescriptor>
+      const removed = this.loadRemovedDeviceIds()
+      const registry: Record<string, DeviceDescriptor> = {}
+      Object.keys(stored).forEach((deviceId: string) => {
+        if (removed.indexOf(deviceId) < 0) {
+          registry[deviceId] = stored[deviceId]
+        }
+      })
+      return registry
     } catch (_) {
       return {}
+    }
+  }
+
+  restoreRemovedDeviceIds(): void {
+    try {
+      const context = getContext(this) as common.UIAbilityContext
+      this.removedDevicePreferences = preferences.getPreferencesSync(context, {
+        name: DEVICE_ACCESS_PREFERENCES_NAME
+      })
+      const storedValue = this.removedDevicePreferences.getSync(REMOVED_DEVICE_IDS_STORAGE_KEY, '')
+      this.removedDeviceIdsJson = typeof storedValue === 'string' ? storedValue : ''
+      console.info(`[DEVICE][removed-restore] ids=${this.removedDeviceIdsJson.length > 0 ? this.removedDeviceIdsJson : '[]'}`)
+    } catch (err) {
+      this.removedDevicePreferences = null
+      this.removedDeviceIdsJson = ''
+      console.error(`[DEVICE][removed-restore-fail] ${(err as Error).message}`)
+    }
+  }
+
+  persistRemovedDeviceIds(storedJson: string): boolean {
+    try {
+      if (this.removedDevicePreferences === null) {
+        const context = getContext(this) as common.UIAbilityContext
+        this.removedDevicePreferences = preferences.getPreferencesSync(context, {
+          name: DEVICE_ACCESS_PREFERENCES_NAME
+        })
+      }
+      this.removedDevicePreferences.putSync(REMOVED_DEVICE_IDS_STORAGE_KEY, storedJson)
+      this.removedDevicePreferences.flushSync()
+      return true
+    } catch (err) {
+      console.error(`[DEVICE][removed-persist-fail] ${(err as Error).message}`)
+      return false
+    }
+  }
+
+  loadRemovedDeviceIds(): string[] {
+    const storedJson = this.removedDeviceIdsJson
+    if (storedJson.length === 0) {
+      return []
+    }
+    try {
+      const stored = JSON.parse(storedJson) as Object[]
+      return Array.isArray(stored) ? stored.filter((item: Object): boolean => typeof item === 'string') as string[] : []
+    } catch (_) {
+      return []
+    }
+  }
+
+  isDeviceRemoved(deviceId: string): boolean {
+    return this.loadRemovedDeviceIds().indexOf(this.normalizeDeviceId(deviceId)) >= 0
+  }
+
+  markDeviceRemoved(deviceId: string): void {
+    const normalized = this.normalizeDeviceId(deviceId)
+    const removed = this.loadRemovedDeviceIds()
+    if (removed.indexOf(normalized) < 0) {
+      const storedJson = JSON.stringify(removed.concat([normalized]))
+      this.removedDeviceIdsJson = storedJson
+      const updated = this.persistRemovedDeviceIds(storedJson)
+      console.info(`[DEVICE][removed-mark] id=${normalized} persisted=${updated}`)
+    }
+  }
+
+  clearDeviceRemoved(deviceId: string): void {
+    const normalized = this.normalizeDeviceId(deviceId)
+    const removed = this.loadRemovedDeviceIds()
+    if (removed.indexOf(normalized) >= 0) {
+      const storedJson = JSON.stringify(removed.filter((item: string): boolean => item !== normalized))
+      this.removedDeviceIdsJson = storedJson
+      const updated = this.persistRemovedDeviceIds(storedJson)
+      console.info(`[DEVICE][removed-clear] id=${normalized} persisted=${updated}`)
     }
   }
 
@@ -1727,6 +1835,10 @@ struct Index {
       const announcedId = this.normalizeDeviceId((data['deviceId'] as string) ?? sourceDeviceId)
       if (announcedId !== sourceDeviceId) {
         console.info(`[DEVICE][hello-reject] source=${sourceDeviceId} announced=${announcedId}`)
+        return true
+      }
+      if (this.isDeviceRemoved(announcedId)) {
+        console.info(`[DEVICE][hello-ignore-removed] id=${announcedId} source=${sourceDeviceId}`)
         return true
       }
       const rawCapabilities = data['capabilities'] as Object[]
@@ -1759,6 +1871,7 @@ struct Index {
       const registry = this.loadDeviceRegistry()
       registry[announcedId] = descriptor
       this.deviceRegistryJson = JSON.stringify(registry)
+      this.localGatewayTransportByDevice.set(announcedId, configuredTransport)
       this.registerDeviceId(announcedId)
       if (registry[this.activeDeviceId] === undefined && announcedId !== 'esp32') {
         this.selectActiveDevice(announcedId)
@@ -2128,7 +2241,8 @@ struct Index {
         await this.handleEcdhPublicKey(httpTopic, this.base64ToUint8Array(packet.payloadBase64), packet.timestamp)
       } else {
         const isLivePacket = Date.now() - packet.timestamp <= HTTP_SENSOR_LIVE_RECOVERY_MAX_AGE_MS
-        await this.handleEncryptedPayload(packet.payloadBase64, 'HTTP_SENSOR', httpTopic, packetDeviceId, isLivePacket)
+        const packetSource = isLivePacket ? 'HTTP_SENSOR' : 'HTTP_BOOT'
+        await this.handleEncryptedPayload(packet.payloadBase64, packetSource, httpTopic, packetDeviceId, isLivePacket)
       }
     } else {
       console.info(`[PROTO] ignore HTTP_SENSOR while active=${this.commandTransport} pending=${this.protocolPendingMode}`)
@@ -2239,13 +2353,17 @@ struct Index {
       return
     }
     this.bleBusinessDesired = true
+    // A disconnect-all ACK can arrive after the user has already enabled BLE.
+    // Cancel its ownership here; the ACK handler will recover the gateway if
+    // the command was already executed on the wire.
+    this.gatewayBleSuspendPendingSeq = -1
     this.bleBusinessAutoFailover = automatic
     this.bleBusinessState = 'connecting'
     this.bleBusinessStatus = automatic ? '网络异常，正在连接蓝牙网关' : '正在连接蓝牙网关'
     this.bleBusinessStartAt = Date.now()
     this.bleDebugCryptoMode = 'SM4'
     this.bleBusinessCryptoPendingMode = ''
-    this.bleBusinessAwaitingGatewayReboot = true
+    this.bleBusinessAwaitingGatewayReboot = false
     this.clearBleBusinessCryptoTimer()
 
     try {
@@ -2256,12 +2374,17 @@ struct Index {
       if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
         throw new Error('未能连接蓝牙 USB 网关')
       }
-      this.bleBusinessState = 'rebooting'
-      this.bleBusinessStatus = '网关已连接，正在重启蓝牙网关'
-      await this.sendGatewayReboot()
-      if (!this.gatewayRebootBusy && this.gatewayRebootStatus.indexOf('失败') >= 0) {
-        throw new Error(this.gatewayRebootStatus)
+
+      // A transport switch does not require a gateway reboot. Reuse the open
+      // USB session, verify it, then let the normal recovery handshake reconnect
+      // both peripherals and negotiate fresh BLE keys.
+      this.bleBusinessState = 'recovering'
+      this.bleBusinessStatus = '蓝牙网关已连接，正在恢复两台家居设备'
+      if (this.gatewayBleReconnecting || this.gatewayBleScanning) {
+        this.refreshBleBusinessReadiness()
+        return
       }
+      await this.beginGatewayRecoveryHandshake()
     } catch (err) {
       this.bleBusinessAwaitingGatewayReboot = false
       this.bleBusinessState = 'error'
@@ -2277,6 +2400,11 @@ struct Index {
     this.bleBusinessStatus = `正在恢复 ${this.commandTransport} / ${this.cryptoModeForDevice(this.activeDeviceId)}`
     this.bleBusinessAwaitingGatewayReboot = false
     this.clearBleBusinessCryptoTimer()
+    this.clearBleGatewayRecoveryTimer()
+    this.clearGatewayBleReconnectTimer()
+    this.gatewayBleReconnecting = false
+    this.gatewayBleReconnectSeq = 0
+    this.gatewayBleConnectionEventSeq = 0
     this.bleBusinessCryptoPendingMode = ''
     if (this.provisioningConnected && this.provisioningPort.isOpen()) {
       await this.requestGatewayBleSuspend()
@@ -2285,21 +2413,26 @@ struct Index {
       this.bleBusinessStatus = `蓝牙模式已关闭 · 当前 ${this.commandTransport}`
     }
     this.networkHealthMonitoringStartedAt = Date.now()
-    this.networkCryptoValidationRequiredAt = Date.now()
     this.networkCommandFailureCount = 0
   }
 
   async requestGatewayBleSuspend(): Promise<void> {
-    if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+    if (this.bleBusinessDesired || this.gatewayBleSuspendPendingSeq >= 0 ||
+      !this.provisioningConnected || !this.provisioningPort.isOpen()) {
       return
     }
     const seq = this.nextProvisioningSeq()
+    this.gatewayBleSuspendPendingSeq = seq
+    this.gatewayBleConnectionEventSeq = 0
     const payload = utf8Encode(JSON.stringify({
       type: 'gateway_ble_command', cmd: 'ble', action: 'disconnect-all', seq
     }))
     const sent = await this.sendProvisioningFrameWithSeq(
       ProvisioningFrameType.GATEWAY_BLE_COMMAND, seq, payload)
     if (!sent) {
+      if (this.gatewayBleSuspendPendingSeq === seq) {
+        this.gatewayBleSuspendPendingSeq = -1
+      }
       this.bleBusinessState = 'error'
       this.bleBusinessStatus = `关闭蓝牙失败：${this.provisioningStatus}`
     }
@@ -2321,6 +2454,11 @@ struct Index {
     const hasDynamicKeys = getDeviceDynamicAesKey(deviceId) !== null &&
       getDeviceDynamicSm4Key(deviceId) !== null
     if (!hasDynamicKeys) {
+      return
+    }
+    const installedAt = this.lastEcdhInstallTimeByDevice.get(deviceId) ?? 0
+    if (installedAt > 0 && Date.now() - installedAt < NETWORK_STATIC_PACKET_AFTER_ECDH_GRACE_MS) {
+      console.info(`[ECDH][static-delayed] ${source} device=${deviceId}; keep newly confirmed dynamic session`)
       return
     }
     this.networkCryptoRecoveryDevices.add(deviceId)
@@ -2380,8 +2518,10 @@ struct Index {
         this.bleBusinessStatus = `蓝牙启动超时，已恢复 ${this.commandTransport}`
         this.bleBusinessStartAt = 0
         this.networkHealthMonitoringStartedAt = Date.now()
-        this.networkCryptoValidationRequiredAt = Date.now()
         this.networkCommandFailureCount = 0
+        this.requestGatewayBleSuspend().catch((err: Error) => {
+          console.info(`[BLE-MODE][timeout-suspend-fail] ${err.message}`)
+        })
       } else {
         this.refreshBleBusinessReadiness()
       }
@@ -3085,6 +3225,7 @@ struct Index {
     }
     this.commandTransport = this.normalizeProtocolMode(mode)
     this.updateDeviceDescriptorModes(this.activeDeviceId, mode, '')
+    this.localGatewayTransportByDevice.set(this.activeDeviceId, this.commandTransport)
     this.protocolPendingMode = ''
     this.protocolPendingSeq = 0
     this.decryptFailCount = 0
@@ -4932,18 +5073,21 @@ struct Index {
       const decrypted = await this.decryptIncomingPayload(raw, source, deviceId)
       const jsonStr = decrypted.plaintext
       const payloadSource = this.resolvePayloadSource(source, jsonStr)
+      const isCachedBridgeState = payloadSource === 'HTTP_BOOT' || payloadSource === 'TLS_BOOT'
       const decryptedAt = Date.now()
-      if (allowKeyRecovery && payloadSource !== 'BLE') {
-        this.recoverFromStaticNetworkPayload(deviceId, payloadSource, decrypted.keySource)
-      }
-      this.lastSuccessfulDecryptAtByDevice.set(deviceId, decryptedAt)
-      if (decrypted.keySource === 'device-dynamic') {
-        this.lastDynamicDecryptAtByDevice.set(deviceId, decryptedAt)
-      }
-      this.markNetworkBusinessHealthy(payloadSource, deviceId)
-      this.decryptFailCountByDevice.delete(deviceId)
-      if (deviceId === this.activeDeviceId) {
-        this.lastSuccessfulDecryptAt = decryptedAt
+      if (!isCachedBridgeState) {
+        if (allowKeyRecovery && payloadSource !== 'BLE') {
+          this.recoverFromStaticNetworkPayload(deviceId, payloadSource, decrypted.keySource)
+        }
+        this.lastSuccessfulDecryptAtByDevice.set(deviceId, decryptedAt)
+        if (decrypted.keySource === 'device-dynamic') {
+          this.lastDynamicDecryptAtByDevice.set(deviceId, decryptedAt)
+        }
+        this.markNetworkBusinessHealthy(payloadSource, deviceId)
+        this.decryptFailCountByDevice.delete(deviceId)
+        if (deviceId === this.activeDeviceId) {
+          this.lastSuccessfulDecryptAt = decryptedAt
+        }
       }
       console.info(`[Crypto] decrypted: ${jsonStr.substring(0, 80)}...`)
       if (decrypted.keySource === 'provided' && this.isKeyExchangeAck(jsonStr)) {
@@ -4959,10 +5103,11 @@ struct Index {
         this.cryptoDebugText = `${payloadSource}解密OK ${decrypted.mode} ${jsonStr.substring(0, 24)}`
       }
 
-      if (deviceId === this.activeDeviceId && this.tryCompleteProtocolSwitchFromJson(jsonStr, payloadSource)) {
+      if (!isCachedBridgeState && deviceId === this.activeDeviceId &&
+        this.tryCompleteProtocolSwitchFromJson(jsonStr, payloadSource)) {
         return
       }
-      if (deviceId === this.activeDeviceId) {
+      if (!isCachedBridgeState && deviceId === this.activeDeviceId) {
         this.tryCompleteProtocolSwitchFromObservedPayload(payloadSource)
       }
       if (this.protocolPendingMode.length > 0) {
@@ -4971,7 +5116,7 @@ struct Index {
       }
 
       this.addMqttMessage(topic, jsonStr)
-      if (this.handleDeviceStatusJson(jsonStr, deviceId)) {
+      if (!isCachedBridgeState && this.handleDeviceStatusJson(jsonStr, deviceId)) {
         return
       }
       this.applySensorJson(jsonStr, payloadSource, deviceId)
@@ -6782,8 +6927,8 @@ struct Index {
     this.bleDebugCurtainStatus = `BLE 加密方式已选择 ${mode}-GCM`
   }
 
-  scheduleBleDebugKeyExchange(delayMs: number = 350): void {
-    const device = this.nextBleDeviceNeedingKey()
+  scheduleBleDebugKeyExchange(delayMs: number = 350, requestedDeviceId: string = ''): void {
+    const device = this.nextBleDeviceNeedingKey(requestedDeviceId)
     if (device === undefined || this.bleDebugKeyBusy) {
       return
     }
@@ -6961,8 +7106,17 @@ struct Index {
       this.bleDebugKeyGatewaySeq = 0
       this.bleDebugKeyBusy = false
       this.bleDebugKeyTargetDeviceId = ''
-      this.bleDebugKeyStatus = `BLE 密钥协商失败：${(err as Error).message}`
-      this.scheduleBleDebugKeyExchange(350)
+      const message = (err as Error).message
+      const retry = (this.bleKeyRetryByDevice.get(deviceId) ?? 0) + 1
+      this.bleKeyRetryByDevice.set(deviceId, retry)
+      console.info(`[BLE-ECDH][start-fail] device=${deviceId} attempt=${retry}/3 ${message}`)
+      if (retry < 3 && this.nextBleDeviceNeedingKey(deviceId) !== undefined) {
+        this.bleDebugKeyStatus = `BLE 密钥协商失败，准备重试 ${retry}/3：${message}`
+        this.scheduleBleDebugKeyExchange(1200, deviceId)
+      } else {
+        this.bleDebugKeyStatus = `BLE 密钥协商失败，已停止重试：${message}`
+        this.scheduleBleDebugKeyExchange(350)
+      }
     }
   }
 
@@ -7010,6 +7164,15 @@ struct Index {
 
   processBleBusinessJson(jsonStr: string, topic: string, deviceId: string): void {
     console.info(`[BLE][business] device=${deviceId} topic=${topic} ${jsonStr.substring(0, 180)}`)
+    try {
+      const data = JSON.parse(jsonStr) as Record<string, Object>
+      const cmd = typeof data['cmd'] === 'string' ? (data['cmd'] as string).toLowerCase() : ''
+      if (cmd === 'provision') {
+        this.handleBleProvisionAck(data, deviceId)
+        return
+      }
+    } catch (_) {
+    }
     if (!this.bleBusinessDesired && this.activeNav !== 'bluetooth' && !this.bleProvisionBusy) {
       console.info(`[BLE][business-ignore] network mode active device=${deviceId}`)
       return
@@ -7807,7 +7970,8 @@ struct Index {
     return seq
   }
 
-  async sendBleBusinessJson(targetDeviceId: string, jsonCmd: string, responseBudget: number = 2): Promise<number> {
+  async sendBleBusinessJson(targetDeviceId: string, jsonCmd: string, responseBudget: number = 2,
+    diagnosticLabel: string = ''): Promise<number> {
     if (!this.bleDebugHasDynamicKey(targetDeviceId)) {
       throw new Error('BLE 动态密钥未就绪')
     }
@@ -7828,8 +7992,13 @@ struct Index {
       epoch,
       payloadBase64: this.uint8ArrayToBase64(encrypted)
     }))
+    if (diagnosticLabel.length > 0) {
+      this.addProvisioningDiagnosticLog(
+        `BLE 配网封包 ${diagnosticLabel} plaintext=${plaintext.length}B envelope=${envelope.length}B`)
+    }
     if (envelope.length > BLE_GATT_PAYLOAD_MAX_BYTES) {
-      throw new Error(`BLE 加密封包过大 ${envelope.length}B，最大 ${BLE_GATT_PAYLOAD_MAX_BYTES}B`)
+      const label = diagnosticLabel.length > 0 ? ` ${diagnosticLabel}` : ''
+      throw new Error(`BLE 加密封包${label}过大 ${envelope.length}B，最大 ${BLE_GATT_PAYLOAD_MAX_BYTES}B`)
     }
     return await this.sendBleEncryptedPayload(targetDeviceId,
       this.commandTopicForDevice('dayu/cmd', targetDeviceId),
@@ -7874,7 +8043,34 @@ struct Index {
       (action === 'k' && index !== pending.index)) {
       return
     }
-    this.clearBleProvisionPendingAck(data['ok'] === true)
+    const ok = data['ok'] === true
+    if (ok && action === 'r') {
+      this.bleDeviceResetConfirmedIds.add(deviceId)
+      this.gatewayBleDevices = this.gatewayBleDevices.map((item: GatewayBleDeviceInfo): GatewayBleDeviceInfo => {
+        if (item.deviceId !== deviceId) {
+          return item
+        }
+        return {
+          deviceId: item.deviceId,
+          name: item.name,
+          room: item.room,
+          address: item.address,
+          rssi: item.rssi,
+          capabilities: item.capabilities,
+          connected: item.connected,
+          transport: item.transport,
+          crypto: item.crypto,
+          epoch: item.epoch,
+          commissioning: true,
+          claimed: false,
+          lastSeen: item.lastSeen
+        }
+      })
+      this.persistGatewayBleDevices()
+      this.bleRemoveStatus = '设备已确认清除配置，正在从网关移除'
+      this.addProvisioningDiagnosticLog(`设备重置 ACK 已确认 device=${deviceId} seq=${seq}`)
+    }
+    this.clearBleProvisionPendingAck(ok)
   }
 
   async sendBleProvisionCommand(deviceId: string, command: BleProvisionCommand,
@@ -7892,7 +8088,9 @@ struct Index {
       this.bleProvisionPendingAck = { deviceId, action, index, seq, timerId, resolve }
     })
     try {
-      await this.sendBleBusinessJson(deviceId, JSON.stringify(command), 1)
+      const commandJson = JSON.stringify(command)
+      await this.sendBleBusinessJson(deviceId, commandJson, action === 'r' ? 3 : 1,
+        `${action}${action === 'k' ? `-${index + 1}` : ''} seq=${seq}`)
     } catch (err) {
       this.clearBleProvisionPendingAck(false)
       throw new Error((err as Error).message)
@@ -7910,48 +8108,514 @@ struct Index {
     const resolve = this.bleClaimPendingResolve
     this.bleClaimPendingResolve = null
     this.bleClaimPendingSeq = -1
+    this.bleClaimPendingDeviceId = ''
     if (resolve !== null) {
       resolve(matched)
     }
   }
 
-  async claimGatewayBleDevice(deviceId: string): Promise<void> {
-    const seq = this.nextProvisioningSeq()
-    const waitClaim = new Promise<boolean>((resolve: (matched: boolean) => void) => {
-      this.bleClaimPendingSeq = seq
-      this.bleClaimPendingResolve = resolve
-      this.bleClaimPendingTimerId = setTimeout(() => this.clearBleClaimPending(false), 5000)
+  async claimGatewayBleDevice(deviceId: string, forceGatewayWrite: boolean = false): Promise<void> {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const current = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+      if (!forceGatewayWrite && current !== undefined && current.claimed && !current.commissioning) {
+        return
+      }
+      const seq = this.nextProvisioningSeq()
+      const waitClaim = new Promise<boolean>((resolve: (matched: boolean) => void) => {
+        this.bleClaimPendingSeq = seq
+        this.bleClaimPendingDeviceId = deviceId
+        this.bleClaimPendingResolve = resolve
+        this.bleClaimPendingTimerId = setTimeout(() => this.clearBleClaimPending(false), 7000)
+      })
+      const payload = utf8Encode(JSON.stringify({
+        type: 'gateway_ble_command', cmd: 'ble', action: 'claim', seq, deviceId
+      }))
+      this.provisioningPort.boostReceive(9000)
+      const sent = await this.sendProvisioningFrameWithSeq(
+        ProvisioningFrameType.GATEWAY_BLE_COMMAND, seq, payload)
+      if (!sent) {
+        this.clearBleClaimPending(false)
+      } else if (await waitClaim) {
+        return
+      }
+      this.addProvisioningDiagnosticLog(
+        `网关认领未确认，准备重试 ${attempt}/3 device=${deviceId} seq=${seq}`)
+      await this.waitProvisioningMs(400)
+    }
+    throw new Error('网关连续 3 次未确认设备认领')
+  }
+
+  scheduleGatewayBleClaimRecovery(deviceId: string, delayMs: number = 300): void {
+    if (this.bleGatewayClaimRecoveryIds.has(deviceId)) {
+      return
+    }
+    this.bleGatewayClaimRecoveryIds.add(deviceId)
+    setTimeout(() => {
+      if (this.bleProvisionBusy || this.bleRemoveBusy || this.bleClaimPendingSeq >= 0) {
+        this.bleGatewayClaimRecoveryIds.delete(deviceId)
+        this.scheduleGatewayBleClaimRecovery(deviceId, 1000)
+        return
+      }
+      this.claimGatewayBleDevice(deviceId, true).then(() => {
+        this.addProvisioningDiagnosticLog(`已恢复网关设备认领记录 device=${deviceId}`)
+      }).catch((err: Error) => {
+        this.addProvisioningDiagnosticLog(`恢复网关设备认领失败 device=${deviceId}: ${err.message}`)
+      }).finally(() => {
+        this.bleGatewayClaimRecoveryIds.delete(deviceId)
+      })
+    }, Math.max(0, delayMs))
+  }
+
+  clearBleForgetPending(matched: boolean = false): void {
+    if (this.bleForgetPendingTimerId !== -1) {
+      clearTimeout(this.bleForgetPendingTimerId)
+      this.bleForgetPendingTimerId = -1
+    }
+    const resolve = this.bleForgetPendingResolve
+    this.bleForgetPendingResolve = null
+    this.bleForgetPendingSeq = -1
+    if (resolve !== null) {
+      resolve(matched)
+    }
+  }
+
+  async forgetGatewayBleDevice(deviceId: string): Promise<void> {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const seq = this.nextProvisioningSeq()
+      const waitForget = new Promise<boolean>((resolve: (matched: boolean) => void) => {
+        this.bleForgetPendingSeq = seq
+        this.bleForgetPendingResolve = resolve
+        this.bleForgetPendingTimerId = setTimeout(() => this.clearBleForgetPending(false), 7000)
+      })
+      const payload = utf8Encode(JSON.stringify({
+        type: 'gateway_ble_command', cmd: 'ble', action: 'forget', seq, deviceId
+      }))
+      this.provisioningPort.boostReceive(9000)
+      const sent = await this.sendProvisioningFrameWithSeq(
+        ProvisioningFrameType.GATEWAY_BLE_COMMAND, seq, payload)
+      if (!sent) {
+        this.clearBleForgetPending(false)
+      } else if (await waitForget) {
+        return
+      }
+      this.addProvisioningDiagnosticLog(
+        `网关移除未确认，准备重试 ${attempt}/3 device=${deviceId} seq=${seq}`)
+      await this.waitProvisioningMs(400)
+    }
+    throw new Error('网关连续 3 次未确认设备移除')
+  }
+
+  requestRemoveBleDevice(deviceId: string): void {
+    if (this.bleProvisionBusy || this.bleRemoveBusy) {
+      return
+    }
+    if (this.bleRemovePendingDeviceId === deviceId) {
+      this.bleRemoveStatus = '正在恢复设备安全通道，请稍候'
+      this.showBleRemoveConfirm = true
+      return
+    }
+    this.bleRemoveDeviceId = deviceId
+    this.bleRemovePendingDeviceId = ''
+    this.bleRemoveStatus = ''
+    this.showBleRemoveConfirm = true
+  }
+
+  gatewayBleDeviceOperational(device: GatewayBleDeviceInfo): boolean {
+    return device.connected || this.bleDebugHasDynamicKey(device.deviceId)
+  }
+
+  clearLocalRemovedDevice(deviceId: string): void {
+    this.markDeviceRemoved(deviceId)
+    this.gatewayBleDevices = this.gatewayBleDevices.filter((item: GatewayBleDeviceInfo) =>
+      item.deviceId !== deviceId)
+    this.persistGatewayBleDevices()
+
+    const currentRegistry = this.loadDeviceRegistry()
+    const registry: Record<string, DeviceDescriptor> = {}
+    Object.keys(currentRegistry).forEach((registeredId: string) => {
+      if (registeredId !== deviceId) {
+        registry[registeredId] = currentRegistry[registeredId]
+      }
     })
-    const payload = utf8Encode(JSON.stringify({
-      type: 'gateway_ble_command', cmd: 'ble', action: 'claim', seq, deviceId
-    }))
-    const sent = await this.sendProvisioningFrameWithSeq(
-      ProvisioningFrameType.GATEWAY_BLE_COMMAND, seq, payload)
-    if (!sent) {
-      this.clearBleClaimPending(false)
-      throw new Error('网关认领命令发送失败')
+    this.deviceRegistryJson = JSON.stringify(registry)
+    this.knownDeviceIds = this.knownDeviceIds.filter((knownId: string) => knownId !== deviceId)
+    this.localGatewayDeviceIds.delete(deviceId)
+    this.localGatewayTransportByDevice.delete(deviceId)
+
+    if (this.lightDeviceId === deviceId) this.lightDeviceId = 'auto'
+    if (this.acDeviceId === deviceId) this.acDeviceId = 'auto'
+    if (this.curtainDeviceId === deviceId) this.curtainDeviceId = 'auto'
+    if (this.doorDeviceId === deviceId) this.doorDeviceId = 'auto'
+
+    clearDeviceDynamicCryptoKeys(deviceId)
+    this.removePersistedDeviceKeys(deviceId)
+    this.keyExchange.resetDevice(deviceId)
+    this.lastKeyExchangeTimestampByTopic.delete(`key/ecdh/pub/${deviceId}`)
+    this.lastSuccessfulDecryptAtByDevice.delete(deviceId)
+    this.lastDynamicDecryptAtByDevice.delete(deviceId)
+    this.decryptFailCountByDevice.delete(deviceId)
+    this.ecdhRecoveryDevices.delete(deviceId)
+    this.lastEcdhRecoveryTimeByDevice.delete(deviceId)
+    this.lastEcdhPendingTimeByDevice.delete(deviceId)
+    this.lastEcdhInstallTimeByDevice.delete(deviceId)
+    this.invalidateBleDebugKey(deviceId)
+    this.bleKeyEpochByDevice.delete(deviceId)
+    this.bleKeyDecryptFailuresByDevice.delete(deviceId)
+
+    if (this.bleProvisionSelectedDeviceId === deviceId) {
+      this.bleProvisionSelectedDeviceId = ''
     }
-    if (!await waitClaim) {
-      throw new Error('网关未确认设备认领')
+    if (this.activeDeviceId === deviceId) {
+      const remainingIds = Object.keys(registry)
+      if (remainingIds.length > 0) {
+        this.selectActiveDevice(remainingIds[0])
+      } else {
+        this.activeDeviceId = 'esp32'
+        clearDynamicCryptoKeys()
+        this.dynamicAesKeyBase64 = ''
+        this.dynamicSm4KeyBase64 = ''
+        this.deviceEpoch = 0
+        this.deviceKeySource = 'static'
+      }
     }
+  }
+
+  restoreProvisionedDeviceFromBle(device: GatewayBleDeviceInfo, config: ProvisioningConfig): void {
+    this.clearDeviceRemoved(device.deviceId)
+    const registry = this.loadDeviceRegistry()
+    const descriptor: DeviceDescriptor = {
+      deviceId: device.deviceId,
+      name: device.name,
+      room: device.room,
+      capabilities: device.capabilities.slice(),
+      transport: this.normalizeProtocolMode(config.transport.toUpperCase()).toLowerCase(),
+      crypto: this.normalizeCryptoMode(config.crypto.toUpperCase()).toLowerCase(),
+      lastSeen: Date.now()
+    }
+    registry[device.deviceId] = descriptor
+    this.deviceRegistryJson = JSON.stringify(registry)
+    this.localGatewayTransportByDevice.set(
+      device.deviceId, this.normalizeProtocolMode(config.transport.toUpperCase()))
+    this.registerDeviceId(device.deviceId)
+    if (registry[this.activeDeviceId] === undefined || this.activeDeviceId === 'esp32') {
+      this.selectActiveDevice(device.deviceId)
+    }
+    if (device.capabilities.indexOf('light') >= 0 &&
+      this.bindingNeedsCapabilityDevice(this.lightDeviceId, 'light', registry)) {
+      this.lightDeviceId = device.deviceId
+    }
+    if ((device.capabilities.indexOf('ac') >= 0 || device.capabilities.indexOf('ir_learning') >= 0) &&
+      this.bindingNeedsCapabilityDevice(this.acDeviceId, 'ac', registry)) {
+      this.acDeviceId = device.deviceId
+    }
+    if (device.capabilities.indexOf('curtain') >= 0 &&
+      this.bindingNeedsCapabilityDevice(this.curtainDeviceId, 'curtain', registry)) {
+      this.curtainDeviceId = device.deviceId
+    }
+    if (device.capabilities.indexOf('door') >= 0 &&
+      this.bindingNeedsCapabilityDevice(this.doorDeviceId, 'door', registry)) {
+      this.doorDeviceId = device.deviceId
+    }
+    console.info(`[DEVICE][provisioned] id=${device.deviceId} caps=${device.capabilities.join(',')}`)
+  }
+
+  prepareProvisionedDeviceRestart(deviceId: string): void {
+    const recoverySeq = ++this.postProvisionBleRecoverySeq
+    this.invalidateBleDebugKey(deviceId)
+    this.bleKeyEpochByDevice.delete(deviceId)
+    this.bleKeyDecryptFailuresByDevice.delete(deviceId)
+    this.gatewayBleDevices = this.gatewayBleDevices.map((item: GatewayBleDeviceInfo): GatewayBleDeviceInfo => {
+      if (item.deviceId !== deviceId) {
+        return item
+      }
+      return {
+        deviceId: item.deviceId,
+        name: item.name,
+        room: item.room,
+        address: item.address,
+        rssi: item.rssi,
+        capabilities: item.capabilities,
+        connected: false,
+        transport: item.transport,
+        crypto: item.crypto,
+        epoch: 0,
+        commissioning: false,
+        claimed: true,
+        lastSeen: item.lastSeen
+      }
+    })
+    this.persistGatewayBleDevices()
+
+    // Provisioning uses BLE only as a secure setup channel. In network mode,
+    // release every GATT connection after claim so both ESP32 boards can resume
+    // Wi-Fi business traffic. BLE business mode owns its own reconnect flow.
+    if (!this.bleBusinessDesired) {
+      setTimeout((): void => {
+        if (recoverySeq !== this.postProvisionBleRecoverySeq || this.bleBusinessDesired ||
+          !this.provisioningConnected || !this.provisioningPort.isOpen()) {
+          return
+        }
+        this.requestGatewayBleSuspend().catch((err: Error) => {
+          this.addProvisioningDiagnosticLog(`配网完成后释放 BLE 连接失败：${err.message}`)
+        })
+      }, 500)
+      return
+    }
+
+    const reconnect = (): void => {
+      if (recoverySeq !== this.postProvisionBleRecoverySeq || !this.bleBusinessDesired ||
+        !this.provisioningConnected || !this.provisioningPort.isOpen()) {
+        return
+      }
+      const current = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+      if (current !== undefined && current.connected && this.bleDebugHasDynamicKey(deviceId)) {
+        return
+      }
+      if (!this.gatewayBleReconnecting && !this.gatewayBleScanning) {
+        this.requestGatewayBleReconnect().catch((err: Error) => {
+          this.addProvisioningDiagnosticLog(`重加设备 BLE 恢复失败 device=${deviceId}: ${err.message}`)
+        })
+      }
+    }
+    setTimeout(reconnect, 2500)
+    setTimeout(reconnect, 7000)
+    setTimeout(reconnect, 14000)
+  }
+
+  async removeDeviceOverBle(deviceId: string): Promise<void> {
+    if (this.bleRemoveBusy) {
+      return
+    }
+    let device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+    if (device === undefined) {
+      this.bleRemoveStatus = '未找到设备，无法移除'
+      return
+    }
+    this.bleRemoveBusy = true
+    this.bleRemovePendingDeviceId = deviceId
+    try {
+      if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+        this.bleRemoveStatus = '正在恢复蓝牙网关连接'
+        if (!await this.recoverGatewayUsbWriteChannel()) {
+          throw new Error('蓝牙网关恢复失败，请确认网关仍通过 USB 连接大禹')
+        }
+      }
+
+      let alreadyReset = this.bleDeviceResetConfirmedIds.has(deviceId) ||
+        (device.commissioning && !device.claimed)
+      if (!alreadyReset && !device.connected) {
+        this.bleRemoveStatus = '设备当前离线，正在扫描并恢复连接'
+        if (!this.gatewayBleScanning && !this.gatewayBleReconnecting) {
+          await this.startGatewayBleScan()
+        }
+        const connected = await this.waitForBleRemoveDeviceConnection(deviceId, 45000)
+        if (!connected) {
+          device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+          alreadyReset = this.bleDeviceResetConfirmedIds.has(deviceId) ||
+            (device !== undefined && device.commissioning && !device.claimed)
+          if (!alreadyReset) {
+            throw new Error('未能连接设备，请确认设备已上电并靠近网关后重试')
+          }
+        }
+      }
+
+      device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+      alreadyReset = this.bleDeviceResetConfirmedIds.has(deviceId) ||
+        (device !== undefined && device.commissioning && !device.claimed)
+      if (!alreadyReset) {
+        if (device === undefined || !device.connected) {
+          throw new Error('设备连接状态已失效，请重试')
+        }
+        if (!this.bleDebugHasDynamicKey(deviceId)) {
+          this.bleRemoveStatus = '正在建立设备安全通道'
+          const ready = await this.waitForBleDebugKey(deviceId, 30000, (status: string) => {
+            this.bleRemoveStatus = status
+          })
+          if (!ready) {
+            throw new Error('设备安全通道建立超时，请确认设备仍在线后重试')
+          }
+        }
+        this.bleRemoveStatus = '正在清除设备网络和家庭配置'
+        await this.sendBleProvisionCommand(deviceId, { a: 'r' }, 'r')
+      } else {
+        this.bleRemoveStatus = '设备已重置，正在完成网关和本地清理'
+      }
+
+      this.bleRemoveStatus = '正在从蓝牙网关移除设备'
+      await this.forgetGatewayBleDevice(deviceId)
+      this.bleRemoveStatus = '正在清理本地绑定和密钥'
+      this.clearLocalRemovedDevice(deviceId)
+      this.bleDeviceResetConfirmedIds.delete(deviceId)
+      this.showBleRemoveConfirm = false
+      this.bleRemoveDeviceId = ''
+      this.bleRemovePendingDeviceId = ''
+      this.bleProvisionStatus = '设备已移除，正在重新发现'
+      this.gatewayBleStatus = '设备已真正移除，正在扫描待添加设备'
+      this.addProvisioningDiagnosticLog(`设备已移除 device=${deviceId}`)
+      if (!this.bleBusinessDesired) {
+        // Removal can connect every known peripheral while recovering the
+        // target. Release them so untouched devices resume Wi-Fi traffic.
+        setTimeout((): void => {
+          if (!this.bleBusinessDesired && this.provisioningConnected && this.provisioningPort.isOpen()) {
+            this.requestGatewayBleSuspend().catch((suspendErr: Error) => {
+              this.addProvisioningDiagnosticLog(`移除完成后释放 BLE 连接失败：${suspendErr.message}`)
+            })
+          }
+        }, 300)
+      }
+      // The peripheral acknowledges removal before its delayed reboot. Wait
+      // until it is advertising as an unclaimed device before scanning again.
+      setTimeout(() => {
+        if (this.showProvisioningPanel && this.provisioningConnected && !this.gatewayBleScanning) {
+          this.startGatewayBleScan()
+        }
+      }, 5500)
+    } catch (err) {
+      this.bleRemoveStatus = `移除失败：${(err as Error).message}`
+      this.addProvisioningDiagnosticLog(this.bleRemoveStatus)
+    } finally {
+      this.clearBleProvisionPendingAck(false)
+      this.clearBleForgetPending(false)
+      this.bleRemoveBusy = false
+    }
+  }
+
+  async waitForBleRemoveDeviceConnection(deviceId: string, timeoutMs: number): Promise<boolean> {
+    const startedAt = Date.now()
+    let scanAttempted = this.gatewayBleScanning
+    while (Date.now() - startedAt < timeoutMs) {
+      const device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
+        item.deviceId === deviceId)
+      if (device !== undefined && device.connected) {
+        return true
+      }
+      if (device !== undefined && device.commissioning && !device.claimed) {
+        return false
+      }
+      if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+        return false
+      }
+      if (!scanAttempted && !this.gatewayBleScanning && !this.gatewayBleReconnecting) {
+        scanAttempted = true
+        await this.startGatewayBleScan()
+      }
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+      this.bleRemoveStatus = `正在扫描并连接待移除设备 · ${elapsed}s`
+      await this.waitProvisioningMs(250)
+    }
+    const device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
+      item.deviceId === deviceId)
+    return device !== undefined && device.connected
+  }
+
+  async waitForBleDebugKey(deviceId: string, timeoutMs: number,
+    onStatus: (status: string) => void): Promise<boolean> {
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      const device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+      if (device === undefined || !device.connected) {
+        return false
+      }
+      if (this.bleDebugHasDynamicKey(deviceId)) {
+        return true
+      }
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+      onStatus(this.bleDebugKeyBusy && this.bleDebugKeyTargetDeviceId !== deviceId ?
+        `等待其他设备完成安全通道 · ${elapsed}s` : `正在建立设备安全通道 · ${elapsed}s`)
+      this.scheduleBleDebugKeyExchange(0, deviceId)
+      await new Promise<void>((resolve: () => void) => setTimeout(resolve, 250))
+    }
+    return this.bleDebugHasDynamicKey(deviceId)
+  }
+
+  async waitForBleProvisionDeviceConnection(deviceId: string, timeoutMs: number): Promise<boolean> {
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      const device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
+        item.deviceId === deviceId)
+      if (device !== undefined && device.connected) {
+        return true
+      }
+      if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+        return false
+      }
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+      this.bleProvisionStatus = `正在扫描并连接所选设备 · ${elapsed}s`
+      await this.waitProvisioningMs(250)
+    }
+    const device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
+      item.deviceId === deviceId)
+    return device !== undefined && device.connected
   }
 
   async provisionDeviceOverBle(deviceId: string): Promise<void> {
     if (this.bleProvisionBusy) {
       return
     }
-    const device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+    let device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
     if (device === undefined || !device.connected) {
-      this.bleProvisionStatus = '请先扫描并等待设备连接'
+      if (device === undefined) {
+        this.bleProvisionStatus = '所选设备已不在列表中，请重新选择'
+        return
+      }
+    }
+    if (device.claimed && !device.commissioning) {
+      this.bleProvisionSelectedDeviceId = ''
+      this.bleProvisionStatus = '该设备已经接入家庭，无需重复添加'
       return
+    }
+    this.bleProvisionBusy = true
+    if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
+      this.bleProvisionStatus = '正在恢复蓝牙网关连接'
+      if (!await this.recoverGatewayUsbWriteChannel()) {
+        this.bleProvisionBusy = false
+        this.bleProvisionStatus = '蓝牙网关恢复失败，请确认网关仍通过 USB 连接大禹'
+        return
+      }
+    }
+    if (!device.connected) {
+      this.bleProvisionStatus = '正在启动蓝牙扫描并连接所选设备'
+      if (!this.gatewayBleScanning && !this.gatewayBleReconnecting) {
+        await this.startGatewayBleScan()
+      }
+      if (!this.gatewayBleScanning && !this.gatewayBleReconnecting) {
+        this.bleProvisionBusy = false
+        this.bleProvisionStatus = `蓝牙扫描启动失败：${this.provisioningStatus}`
+        return
+      }
+      const connected = await this.waitForBleProvisionDeviceConnection(deviceId, 45000)
+      if (!connected) {
+        this.bleProvisionBusy = false
+        this.bleProvisionStatus = '未能连接所选设备，请确认设备已上电并靠近网关后重试'
+        return
+      }
+      device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+      if (device === undefined || !device.connected) {
+        this.bleProvisionBusy = false
+        this.bleProvisionStatus = '所选设备连接状态已失效，请重试'
+        return
+      }
     }
     if (!this.bleDebugHasDynamicKey(deviceId)) {
-      this.bleProvisionStatus = '设备安全通道尚未就绪，请稍候'
-      this.scheduleBleDebugKeyExchange(0)
-      return
+      const ready = await this.waitForBleDebugKey(deviceId, 30000, (status: string) => {
+        this.bleProvisionStatus = status
+      })
+      if (!ready) {
+        this.bleProvisionBusy = false
+        this.bleProvisionStatus = '设备安全通道建立超时，请确认设备仍在线后重试'
+        return
+      }
     }
     if (this.provisioningWifiSsid.trim().length === 0 || this.provisioningBrokerUrl.trim().length === 0) {
+      this.bleProvisionBusy = false
       this.bleProvisionStatus = '请填写 Wi-Fi SSID 和 MQTT 地址'
+      return
+    }
+    const passwordBytes = utf8Encode(this.provisioningWifiPassword)
+    const isHexPsk = passwordBytes.length === 64 && /^[0-9a-fA-F]+$/.test(this.provisioningWifiPassword)
+    if ((passwordBytes.length < 8 || passwordBytes.length > 63) && !isHexPsk) {
+      this.bleProvisionBusy = false
+      this.bleProvisionStatus = 'Wi-Fi 密码应为 8-63 字节，或 64 位十六进制密钥'
       return
     }
     const config: ProvisioningConfig = {
@@ -7966,7 +8630,9 @@ struct Index {
     const configPayload = buildProvisioningConfigPayload(config)
     const chunkBytes = 18
     const chunks = Math.ceil(configPayload.length / chunkBytes)
-    const session = `p${Date.now().toString(36).slice(-10)}`
+    // Keep provisioning metadata compact enough for an encrypted 18-byte chunk to fit one ATT write.
+    const session = `p${Date.now().toString(36).slice(-4)}`
+    this.bleProvisionCommandSeq = 0
     this.bleProvisionSelectedDeviceId = deviceId
     this.bleProvisionBusy = true
     this.bleProvisionStatus = '正在建立加密配网会话'
@@ -8009,6 +8675,15 @@ struct Index {
       })
       this.gatewayBleDevices = next
       this.persistGatewayBleDevices()
+      const provisionedDevice = next.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+      if (provisionedDevice !== undefined) {
+        this.restoreProvisionedDeviceFromBle(provisionedDevice, config)
+      }
+      this.prepareProvisionedDeviceRestart(deviceId)
+      this.bleProvisionStatus = this.bleBusinessDesired ?
+        '设备已添加，正在等待 Wi-Fi 上线并重建 BLE 安全通道' :
+        '设备已添加，正在等待 Wi-Fi 上线并释放配网蓝牙连接'
+      this.bleProvisionSelectedDeviceId = ''
     } catch (err) {
       this.bleProvisionStatus = `蓝牙添加失败：${(err as Error).message}`
       this.addProvisioningDiagnosticLog(this.bleProvisionStatus)
@@ -8683,10 +9358,11 @@ struct Index {
 
   openProvisioningPanel(): void {
     this.showProvisioningPanel = true
+    this.showUsbProvisioningSection = false
+    this.provisioningStatus = 'BLE 无线配网就绪，请扫描并选择待添加设备'
     this.refreshProvisioningDefaults()
     setTimeout(() => {
       if (this.showProvisioningPanel) {
-        this.refreshProvisioningUsbDevices()
         this.refreshProvisioningWifiInfo()
       }
     }, 0)
@@ -8699,6 +9375,12 @@ struct Index {
     this.cancelProvisioningAutoProbe()
     this.clearProvisioningPendingFrame(false)
     this.provisioningBusy = false
+    if (this.bleBusinessDesired) {
+      // The gateway USB session carries all BLE business traffic. Closing the
+      // device-access overlay must not tear it down while BLE mode is active.
+      this.provisioningConnected = this.provisioningPort.isOpen()
+      return
+    }
     this.provisioningPort.close().catch((err: Error) => {
       console.info(`[Provisioning][close-fail] ${err.message}`)
     })
@@ -8885,16 +9567,95 @@ struct Index {
       this.provisioningStatus = `已发送 ${typeName} #${seq}`
       return true
     } catch (err) {
-      const failureStatus = `发送 ${typeName} 失败: ${this.describeProvisioningError(err)}`
       if (type === ProvisioningFrameType.GATEWAY_TEST ||
         type === ProvisioningFrameType.GATEWAY_BLE_COMMAND) {
+        const firstError = this.describeProvisioningError(err)
+        this.addProvisioningDiagnosticLog(
+          `发送 ${typeName} 首次失败: ${firstError}，正在恢复 USB 写通道`)
+        if (await this.recoverGatewayUsbWriteChannel()) {
+          try {
+            await this.provisioningPort.writeFrame(type, seq, payload)
+            this.provisioningStatus = `USB 写通道已恢复，已重发 ${typeName} #${seq}`
+            this.addProvisioningDiagnosticLog(this.provisioningStatus)
+            return true
+          } catch (retryErr) {
+            err = retryErr
+          }
+        }
+        const failureStatus = `发送 ${typeName} 失败: ${this.describeProvisioningError(err)}`
         await this.disconnectGatewayUsb()
         this.gatewayUsbTestStatus = 'USB 网关连接已失效，请重新连接'
         this.gatewayBleStatus = 'USB 网关连接已失效，请重新连接'
+        this.provisioningStatus = failureStatus
+        this.addProvisioningDiagnosticLog(this.provisioningStatus)
+        return false
       }
+      const failureStatus = `发送 ${typeName} 失败: ${this.describeProvisioningError(err)}`
       this.provisioningStatus = failureStatus
       this.addProvisioningDiagnosticLog(this.provisioningStatus)
       return false
+    }
+  }
+
+  async recoverGatewayUsbWriteChannel(): Promise<boolean> {
+    if (this.gatewayUsbWriteRecoveryBusy) {
+      const deadline = Date.now() + 4000
+      while (this.gatewayUsbWriteRecoveryBusy && Date.now() < deadline) {
+        await this.waitProvisioningMs(50)
+      }
+      return this.provisioningConnected && this.provisioningPort.isOpen()
+    }
+    if (this.gatewayUsbDeviceKey.length === 0) {
+      return false
+    }
+
+    this.gatewayUsbWriteRecoveryBusy = true
+    try {
+      await this.provisioningPort.close()
+      this.provisioningConnected = false
+      await this.waitProvisioningMs(120)
+
+      const devices = this.provisioningPort.listDevices()
+      const matcherKey = this.storedGatewayMatcherKey()
+      const targetIndex = devices.findIndex((device: UsbSerialDeviceInfo) =>
+        this.provisioningDeviceKey(device) === this.gatewayUsbDeviceKey ||
+        this.gatewayDeviceMatcherKey(device) === matcherKey)
+      if (targetIndex < 0) {
+        this.addProvisioningDiagnosticLog('USB 写通道恢复失败：未找到已记住的网关')
+        return false
+      }
+
+      this.provisioningUsbDevices = devices
+      this.provisioningSelectedDeviceIndex = targetIndex
+      const result = await this.provisioningPort.open(
+        targetIndex,
+        (frame: ProvisioningFrame) => {
+          this.handleProvisioningFrame(frame)
+        },
+        (message: string) => {
+          this.handleProvisioningPortLog(message)
+        }
+      )
+      this.provisioningConnected = result.ok
+      if (!result.ok) {
+        this.addProvisioningDiagnosticLog(`USB 写通道恢复失败：${result.message}`)
+        return false
+      }
+
+      this.gatewayUsbDeviceKey = this.provisioningDeviceKey(devices[targetIndex])
+      this.gatewayAutoConnectAttempt = 0
+      this.gatewayUsbTestStatus = 'USB 网关写通道已自动恢复'
+      this.addProvisioningDiagnosticLog(`USB 写通道已恢复：${this.gatewayUsbDeviceKey}`)
+      this.recoverBleGatewaySession('USB 写通道已重新打开')
+      await this.waitProvisioningMs(80)
+      return true
+    } catch (recoverErr) {
+      this.provisioningConnected = false
+      this.addProvisioningDiagnosticLog(
+        `USB 写通道恢复异常：${this.describeProvisioningError(recoverErr)}`)
+      return false
+    } finally {
+      this.gatewayUsbWriteRecoveryBusy = false
     }
   }
 
@@ -9176,6 +9937,78 @@ struct Index {
     await this.sendGatewayUsbTest()
   }
 
+  clearBleGatewayRecoveryTimer(): void {
+    if (this.bleGatewayRecoveryTimerId !== -1) {
+      clearTimeout(this.bleGatewayRecoveryTimerId)
+      this.bleGatewayRecoveryTimerId = -1
+    }
+  }
+
+  recoverBleGatewaySession(reason: string): void {
+    if (!this.bleBusinessDesired) {
+      return
+    }
+    if (this.bleBusinessState === 'recovering' &&
+      (this.bleGatewayRecoveryTimerId !== -1 || this.gatewayUsbTestBusy ||
+        this.gatewayReconnectAfterUsbTest || this.gatewayBleReconnecting || this.gatewayBleScanning)) {
+      this.addProvisioningDiagnosticLog(`BLE 网关会话已在恢复，忽略重复触发：${reason}`)
+      return
+    }
+    this.clearGatewayBleReconnectTimer()
+    this.gatewayBleReconnecting = false
+    this.clearGatewayBleScanTimer()
+    this.gatewayBleScanning = false
+    this.clearBleKeyTimer()
+    this.clearBleKeyAutoTimer()
+    this.bleDebugKeyGatewaySeq = 0
+    this.bleDebugKeyBusy = false
+    this.bleDebugKeyTargetDeviceId = ''
+    this.bleDebugKeyReadyDeviceId = ''
+    this.gatewayBleDevices.forEach((device: GatewayBleDeviceInfo) => {
+      const sessionId = this.bleCryptoSessionId(device.deviceId)
+      this.removeBleDebugKeyReady(device.deviceId)
+      this.bleKeyRetryByDevice.delete(device.deviceId)
+      this.bleKeyDecryptFailuresByDevice.delete(device.deviceId)
+      clearDeviceDynamicCryptoKeys(sessionId)
+      this.keyExchange.resetDevice(sessionId)
+      this.bleCryptoReceiveChains.delete(device.deviceId)
+      this.blePublicKeyFingerprintByDevice.delete(device.deviceId)
+    })
+    this.gatewayBleDevices = this.gatewayBleDevices.map((device: GatewayBleDeviceInfo): GatewayBleDeviceInfo => ({
+      deviceId: device.deviceId,
+      name: device.name,
+      room: device.room,
+      address: device.address,
+      rssi: device.rssi,
+      capabilities: device.capabilities,
+      connected: false,
+      transport: device.transport,
+      crypto: device.crypto,
+      epoch: device.epoch,
+      commissioning: device.commissioning,
+      claimed: device.claimed,
+      lastSeen: device.lastSeen
+    }))
+    this.persistGatewayBleDevices()
+    this.bleBusinessState = 'recovering'
+    this.bleBusinessStartAt = Date.now()
+    this.bleBusinessStatus = '蓝牙网关已重连，正在恢复两台家居设备'
+    this.gatewayBleStatus = `BLE 会话已失效，正在重新连接 · ${reason}`
+    this.addProvisioningDiagnosticLog(`BLE 网关会话恢复：${reason}`)
+    this.clearBleGatewayRecoveryTimer()
+    this.bleGatewayRecoveryTimerId = setTimeout(() => {
+      this.bleGatewayRecoveryTimerId = -1
+      if (!this.bleBusinessDesired || !this.provisioningConnected || !this.provisioningPort.isOpen() ||
+        this.gatewayBleReconnecting || this.gatewayBleScanning || this.gatewayUsbTestBusy) {
+        return
+      }
+      this.beginGatewayRecoveryHandshake().catch((err: Error) => {
+        this.bleBusinessState = 'error'
+        this.bleBusinessStatus = `蓝牙网关恢复失败：${err.message}`
+      })
+    }, 250)
+  }
+
   async requestGatewayBleReconnect(): Promise<void> {
     if (!this.provisioningConnected || !this.provisioningPort.isOpen() || this.gatewayBleReconnecting) {
       return
@@ -9195,6 +10028,8 @@ struct Index {
     )
     if (sent) {
       this.gatewayBleReconnectSeq = seq
+      this.gatewayBleConnectionEventSeq = seq
+      this.gatewayBleSuspendPendingSeq = -1
       this.gatewayBleReconnecting = true
       this.clearGatewayBleReconnectTimer()
       this.gatewayBleReconnectTimerId = setTimeout(() => {
@@ -9383,6 +10218,8 @@ struct Index {
     }
 
     this.gatewayBleScanSeq = this.nextProvisioningSeq()
+    this.gatewayBleConnectionEventSeq = this.gatewayBleScanSeq
+    this.gatewayBleSuspendPendingSeq = -1
     this.gatewayBleScanning = true
     // Keep verified devices across scans. BLE and Wi-Fi share the ESP32-S3
     // radio, so one scan may only rediscover one of the household boards.
@@ -9419,6 +10256,9 @@ struct Index {
     if (!sent) {
       this.clearGatewayBleScanTimer()
       this.gatewayBleScanning = false
+      if (this.gatewayBleConnectionEventSeq === this.gatewayBleScanSeq) {
+        this.gatewayBleConnectionEventSeq = 0
+      }
       this.provisioningPort.endReceiveBoost()
       this.gatewayBleStatus = this.provisioningStatus
     }
@@ -9490,6 +10330,7 @@ struct Index {
       const restored: GatewayBleDeviceInfo[] = []
       stored.forEach((device: GatewayBleDeviceInfo) => {
         if (device.address && device.address.length > 0) {
+          const removed = this.isDeviceRemoved(device.deviceId)
           restored.push({
             deviceId: device.deviceId,
             name: device.name,
@@ -9501,8 +10342,8 @@ struct Index {
             transport: device.transport || 'ble',
             crypto: device.crypto || '',
             epoch: device.epoch || 0,
-            commissioning: device.commissioning === true,
-            claimed: device.claimed !== false,
+            commissioning: removed || device.commissioning === true,
+            claimed: removed ? false : device.claimed !== false,
             lastSeen: device.lastSeen || 0
           })
         }
@@ -9564,6 +10405,25 @@ struct Index {
     const name = !this.isGatewayBlePlaceholder(rawName) ? rawName.trim() :
       (existing !== null ? existing.name : '蓝牙家居设备')
     const rawRoom = typeof data['room'] === 'string' ? (data['room'] as string).trim() : ''
+    const hasReportedCommissioning = typeof data['commissioning'] === 'boolean'
+    const hasReportedClaimed = typeof data['claimed'] === 'boolean'
+    const reportedCommissioning = hasReportedCommissioning ? data['commissioning'] as boolean :
+      (existing !== null ? existing.commissioning : true)
+    const reportedClaimed = hasReportedClaimed ? data['claimed'] as boolean :
+      (existing !== null ? existing.claimed : false)
+    const locallyRemoved = this.isDeviceRemoved(deviceId)
+    const addressMatchesLocalClaim = existing !== null && existing.address.length > 0 && address.length > 0 &&
+      existing.address.toUpperCase() === address && existing.deviceId === announcedId
+    const shouldRecoverGatewayClaim = !locallyRemoved && eventType === 'device_hello' && addressMatchesLocalClaim &&
+      existing !== null && existing.claimed && !existing.commissioning && connectedFromEvent &&
+      hasReportedCommissioning && !reportedCommissioning && hasReportedClaimed && !reportedClaimed
+    // An explicit commissioning=true comes from the peripheral's GATT hello
+    // and always revokes stale local/gateway ownership. A scan-time claimed=false
+    // alone is only a gateway cache miss, so keep an existing local claim.
+    const commissioning = locallyRemoved ? true : (hasReportedCommissioning ? reportedCommissioning :
+      (existing !== null ? existing.commissioning : true))
+    const claimed = locallyRemoved || commissioning ? false :
+      (reportedClaimed || (existing !== null && existing.claimed))
     const device: GatewayBleDeviceInfo = {
       deviceId,
       name,
@@ -9582,10 +10442,8 @@ struct Index {
         (existing !== null ? existing.crypto : ''),
       epoch: typeof data['epoch'] === 'number' ? data['epoch'] as number :
         (existing !== null ? existing.epoch : 0),
-      commissioning: typeof data['commissioning'] === 'boolean' ? data['commissioning'] as boolean :
-        (existing !== null ? existing.commissioning : true),
-      claimed: typeof data['claimed'] === 'boolean' ? data['claimed'] as boolean :
-        (existing !== null ? existing.claimed : false),
+      commissioning,
+      claimed,
       lastSeen: Date.now()
     }
 
@@ -9597,6 +10455,21 @@ struct Index {
       this.gatewayBleDevices = [...this.gatewayBleDevices, device]
     }
     this.persistGatewayBleDevices()
+    // A peripheral hello with commissioning=true proves the device-side reset
+    // completed. Keep the remove transaction alive so it can still forget the
+    // gateway record and clear local bindings.
+    if (commissioning && !claimed && this.bleRemovePendingDeviceId === deviceId) {
+      this.bleRemoveStatus = '设备已重置，正在完成网关和本地清理'
+    }
+    if (hasReportedCommissioning || hasReportedClaimed) {
+      console.info(`[BLE][membership] event=${eventType} device=${deviceId} ` +
+        `commissioning=${commissioning} claimed=${claimed}`)
+    }
+    if (shouldRecoverGatewayClaim) {
+      this.addProvisioningDiagnosticLog(
+        `设备端和本地认领一致，正在恢复网关记录 device=${deviceId}`)
+      this.scheduleGatewayBleClaimRecovery(deviceId)
+    }
   }
 
   markGatewayBleDeviceConnectedFromMessage(deviceId: string): boolean {
@@ -9640,7 +10513,7 @@ struct Index {
     }
     if (device.connected && eventType === 'ble_ready') {
       this.bleKeyRetryByDevice.delete(device.deviceId)
-      this.scheduleBleDebugKeyExchange(250)
+      this.scheduleBleDebugKeyExchange(250, device.deviceId)
     } else if (!device.connected && eventType === 'ble_device_state') {
       this.invalidateBleDebugKey(device.deviceId)
     }
@@ -9734,6 +10607,22 @@ struct Index {
         this.scheduleGatewayRebootRecovery(delayMs + GATEWAY_REBOOT_CLOSE_DELAY_MS)
         return
       }
+      // Each GATT connection keeps the sequence of the scan/reconnect batch that
+      // created it. With two peripherals connected in parallel, valid device
+      // messages can therefore carry different sequence values. Only lifecycle
+      // events belong to one global transaction; device hello/state/data events
+      // are authenticated and matched by deviceId further below.
+      const staleScanLifecycle = (eventType === 'ble_scan_started' || eventType === 'ble_scan_finished') &&
+        this.gatewayBleScanning && this.gatewayBleScanSeq > 0 && payloadSeq !== this.gatewayBleScanSeq
+      const staleReconnectLifecycle = (eventType === 'ble_reconnect_started' ||
+        eventType === 'ble_reconnect_finished') && this.gatewayBleReconnecting &&
+        this.gatewayBleReconnectSeq > 0 && payloadSeq !== this.gatewayBleReconnectSeq
+      if (staleScanLifecycle || staleReconnectLifecycle) {
+        this.addProvisioningDiagnosticLog(
+          `忽略过期 BLE 生命周期事件 type=${eventType} seq=${payloadSeq} ` +
+          `scan=${this.gatewayBleScanSeq} reconnect=${this.gatewayBleReconnectSeq}`)
+        return
+      }
       if (this.gatewayBleScanSeq > 0 && payloadSeq !== this.gatewayBleScanSeq) {
         this.addProvisioningDiagnosticLog(
           `蓝牙事件 seq=${payloadSeq}，当前扫描 seq=${this.gatewayBleScanSeq}，继续按事件内容处理`)
@@ -9756,6 +10645,17 @@ struct Index {
       if (eventType === 'device_hello' || eventType === 'ble_device_state' || eventType === 'ble_ready') {
         this.upsertGatewayBleDevice(data, eventType)
         this.syncBleDebugKeyAfterDeviceEvent(data, eventType)
+        if (eventType === 'ble_device_state' && data['connected'] === true) {
+          const connectedDeviceId = typeof data['deviceId'] === 'string' ?
+            this.normalizeDeviceId(data['deviceId'] as string) : ''
+          const connectedDevice = this.gatewayBleDevices.find((device: GatewayBleDeviceInfo) =>
+            device.deviceId === connectedDeviceId)
+          if (connectedDevice !== undefined && this.isBleSecureBusinessDevice(connectedDevice) &&
+            !this.bleDebugHasDynamicKey(connectedDeviceId)) {
+            this.bleKeyRetryByDevice.delete(connectedDeviceId)
+            this.scheduleBleDebugKeyExchange(250, connectedDeviceId)
+          }
+        }
         if (eventType === 'ble_device_state') {
           const eventDeviceId = typeof data['deviceId'] === 'string' ? data['deviceId'] as string : 'unknown'
           this.addProvisioningDiagnosticLog(
@@ -9767,8 +10667,13 @@ struct Index {
         return
       }
       if (eventType === 'ble_claim_result') {
-        const ok = data['ok'] === true && payloadSeq === this.bleClaimPendingSeq
         const deviceId = typeof data['deviceId'] === 'string' ? data['deviceId'] as string : ''
+        if (payloadSeq !== this.bleClaimPendingSeq || deviceId !== this.bleClaimPendingDeviceId) {
+          this.addProvisioningDiagnosticLog(
+            `忽略非当前认领结果 device=${deviceId} seq=${payloadSeq} pending=${this.bleClaimPendingSeq}`)
+          return
+        }
+        const ok = data['ok'] === true
         if (ok) {
           this.gatewayBleDevices = this.gatewayBleDevices.map((item: GatewayBleDeviceInfo): GatewayBleDeviceInfo => {
             if (item.deviceId !== deviceId) {
@@ -9785,7 +10690,7 @@ struct Index {
               transport: item.transport,
               crypto: item.crypto,
               epoch: item.epoch,
-              commissioning: item.commissioning,
+              commissioning: false,
               claimed: true,
               lastSeen: item.lastSeen
             }
@@ -9795,11 +10700,26 @@ struct Index {
         this.clearBleClaimPending(ok)
         return
       }
+      if (eventType === 'ble_forget_result') {
+        const deviceId = typeof data['deviceId'] === 'string' ? data['deviceId'] as string : ''
+        if (payloadSeq !== this.bleForgetPendingSeq || deviceId !== this.bleRemoveDeviceId) {
+          this.addProvisioningDiagnosticLog(
+            `忽略非当前移除结果 device=${deviceId} seq=${payloadSeq} pending=${this.bleForgetPendingSeq}`)
+          return
+        }
+        const message = typeof data['message'] === 'string' ? data['message'] as string : ''
+        const forgotten = data['ok'] === true || message === 'device_not_found'
+        this.clearBleForgetPending(forgotten)
+        return
+      }
       if (eventType === 'ble_control_result') {
         const deviceId = typeof data['deviceId'] === 'string' ?
           this.normalizeDeviceId(data['deviceId'] as string) : ''
         const resultSeq = typeof data['seq'] === 'number' ? data['seq'] as number : 0
         const message = typeof data['message'] === 'string' ? data['message'] as string : ''
+        if (data['ok'] !== true && message.toLowerCase().indexOf('not connected') >= 0) {
+          this.recoverBleGatewaySession(`网关报告设备未连接 ${deviceId}`)
+        }
         const lightResult = resultSeq > 0 ? resultSeq === this.bleDebugLightGatewaySeq :
           this.bleDebugLightBusy && !this.bleDebugDoorBusy
         const doorResult = resultSeq > 0 ? resultSeq === this.bleDebugDoorGatewaySeq :
@@ -9956,6 +10876,11 @@ struct Index {
         return
       }
       if (eventType === 'ble_reconnect_finished') {
+        if (!this.gatewayBleReconnecting || payloadSeq !== this.gatewayBleReconnectSeq) {
+          this.addProvisioningDiagnosticLog(
+            `忽略非当前 BLE 重连完成事件 seq=${payloadSeq} pending=${this.gatewayBleReconnectSeq}`)
+          return
+        }
         this.clearGatewayBleReconnectTimer()
         this.gatewayBleReconnecting = false
         this.provisioningPort.endReceiveBoost()
@@ -9999,6 +10924,37 @@ struct Index {
         return
       }
       if (eventType === 'ble_suspend_ack') {
+        if (payloadSeq !== this.gatewayBleSuspendPendingSeq || this.bleBusinessDesired) {
+        this.addProvisioningDiagnosticLog(
+          `忽略过期 BLE 挂起 ACK seq=${payloadSeq} pending=${this.gatewayBleSuspendPendingSeq} desired=${this.bleBusinessDesired}`)
+        if (this.bleBusinessDesired) {
+          // The gateway has already executed disconnect-all even though this
+          // ACK no longer owns the UI state. Abort any recovery generation
+          // that the suspend just invalidated, then start a fresh handshake.
+          this.gatewayBleSuspendPendingSeq = -1
+          this.gatewayBleConnectionEventSeq = 0
+          this.clearGatewayUsbTestTimer()
+          this.gatewayUsbTestPendingSeq = -1
+          this.gatewayUsbTestBusy = false
+          this.gatewayReconnectAfterUsbTest = false
+          this.clearGatewayBleReconnectTimer()
+          this.gatewayBleReconnectSeq = 0
+          this.gatewayBleReconnecting = false
+          this.clearGatewayBleScanTimer()
+          this.gatewayBleScanning = false
+          this.recoverBleGatewaySession(`挂起 ACK #${payloadSeq} 到达时 BLE 已重新开启`)
+        }
+          return
+        }
+        this.gatewayBleSuspendPendingSeq = -1
+        this.gatewayBleConnectionEventSeq = 0
+        this.clearGatewayBleScanTimer()
+        this.clearGatewayBleReconnectTimer()
+        this.gatewayBleScanning = false
+        this.gatewayBleReconnecting = false
+        this.gatewayBleScanSeq = 0
+        this.gatewayBleReconnectSeq = 0
+        this.provisioningPort.endReceiveBoost()
         this.gatewayBleDevices.forEach((device: GatewayBleDeviceInfo) => {
           if (this.isBleSecureBusinessDevice(device)) {
             this.invalidateBleDebugKey(device.deviceId)
@@ -10031,6 +10987,22 @@ struct Index {
 
   gatewayBleCapabilitiesText(device: GatewayBleDeviceInfo): string {
     return device.capabilities.length > 0 ? device.capabilities.join(' / ') : '等待读取设备能力'
+  }
+
+  selectedBleProvisioningDevice(): GatewayBleDeviceInfo | undefined {
+    if (this.bleProvisionSelectedDeviceId.length === 0) {
+      return undefined
+    }
+    return this.gatewayBleDevices.find((device: GatewayBleDeviceInfo) =>
+      device.deviceId === this.bleProvisionSelectedDeviceId)
+  }
+
+  selectedBleProvisioningDeviceText(): string {
+    const device = this.selectedBleProvisioningDevice()
+    if (device === undefined) {
+      return '请先从上方选择一个待添加设备'
+    }
+    return `${device.name} · ${this.deviceIdDisplayText(device.deviceId)}`
   }
 
   describeProvisioningError(err: Object | string | number | boolean | null | undefined): string {
@@ -12248,7 +13220,7 @@ struct Index {
         .fontColor(this.textColor())
         .margin({ top: 5 })
         .maxLines(1)
-      Text('通过 USB 数据线接入')
+      Text('通过蓝牙无线接入')
         .fontSize(11)
         .fontColor(this.subTextColor())
         .margin({ top: 3 })
@@ -14660,8 +15632,7 @@ struct Index {
                       .layoutWeight(1)
                       .maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    Text(device.claimed && !device.commissioning ? '已接入' :
-                      (device.connected ? '待添加' : '已发现'))
+                    Text(device.claimed && !device.commissioning ? '家庭已接入' : '家庭未接入')
                       .fontSize(10)
                       .fontColor(device.claimed && !device.commissioning ?
                         this.accentGreen() : this.accentOrange())
@@ -14688,8 +15659,9 @@ struct Index {
                   .width('100%')
                   .margin({ top: 4 })
                   Row() {
-                    Text(this.bleDebugHasDynamicKey(device.deviceId) ? '安全通道已就绪' :
-                      (device.connected ? '正在建立安全通道' : '等待连接'))
+                    Text(`${device.connected ? '蓝牙已连接' : '蓝牙未连接'} · ${
+                      this.bleDebugHasDynamicKey(device.deviceId) ? '安全通道已就绪' :
+                        (device.connected ? '正在建立安全通道' : '等待连接')}`)
                       .layoutWeight(1)
                       .fontSize(10)
                       .fontColor(this.bleDebugHasDynamicKey(device.deviceId) ?
@@ -15384,14 +16356,17 @@ struct Index {
       }
       .width('100%')
 
-      Column() {
+      Scroll() {
+        Column() {
+        Column() {
         Row() {
           Column() {
             Text('蓝牙添加')
               .fontSize(15)
               .fontWeight(FontWeight.Bold)
               .fontColor(this.textColor())
-            Text(this.gatewayBleStatus)
+            Text(this.provisioningConnected ? `蓝牙网关在线 · ${this.gatewayBleStatus}` :
+              '蓝牙网关未连接，暂时无法扫描设备')
               .fontSize(11)
               .fontColor(this.subTextColor())
               .margin({ top: 3 })
@@ -15435,8 +16410,8 @@ struct Index {
                         .layoutWeight(1)
                         .maxLines(1)
                         .textOverflow({ overflow: TextOverflow.Ellipsis })
-                      Text(device.claimed && !device.commissioning ? '已接入' :
-                        (device.connected ? '待添加' : '已发现'))
+                      Text(`${device.claimed && !device.commissioning ? '家庭已接入' : '家庭未接入'} · ${
+                        device.connected ? '蓝牙已连接' : '蓝牙未连接'}`)
                         .fontSize(10)
                         .fontColor(device.claimed && !device.commissioning ?
                           this.accentGreen() : this.accentOrange())
@@ -15452,20 +16427,32 @@ struct Index {
                   }
                   .layoutWeight(1)
                   .alignItems(HorizontalAlign.Start)
-                  Button(this.bleProvisionSelectedDeviceId === device.deviceId ? '已选择' : '选择')
+                  Button(device.claimed && !device.commissioning ? '移除' :
+                    (this.bleProvisionSelectedDeviceId === device.deviceId ? '已选择' : '选择'))
                     .width(66)
                     .height(30)
                     .fontSize(11)
                     .fontColor('#FFFFFF')
-                    .backgroundColor(this.bleProvisionSelectedDeviceId === device.deviceId ?
-                      this.accentGreen() : this.accentBlue())
+                    .backgroundColor(device.claimed && !device.commissioning ? this.warningRed() :
+                      (this.bleProvisionSelectedDeviceId === device.deviceId ?
+                        this.accentGreen() : this.accentBlue()))
                     .borderRadius(8)
                     .margin({ left: 10 })
-                    .enabled(device.connected && !this.bleProvisionBusy)
+                    .enabled(!this.bleProvisionBusy && !this.bleRemoveBusy)
                     .onClick(() => {
+                      if (device.claimed && !device.commissioning) {
+                        this.requestRemoveBleDevice(device.deviceId)
+                        return
+                      }
                       this.bleProvisionSelectedDeviceId = device.deviceId
-                      this.bleProvisionStatus = this.bleDebugHasDynamicKey(device.deviceId) ?
-                        '设备已选择，可以添加' : '设备已选择，正在建立安全通道'
+                      if (this.bleDebugHasDynamicKey(device.deviceId)) {
+                        this.bleProvisionStatus = '设备已选择，可以添加'
+                      } else if (device.connected) {
+                        this.bleProvisionStatus = '设备已选择，正在建立安全通道'
+                        this.scheduleBleDebugKeyExchange(0, device.deviceId)
+                      } else {
+                        this.bleProvisionStatus = '设备已选择，添加时将自动扫描并连接'
+                      }
                     })
                 }
                 .width('100%')
@@ -15475,35 +16462,22 @@ struct Index {
                   this.accentGreen() : this.hairlineColor() })
                 .borderRadius(8)
               }
-            }, (device: GatewayBleDeviceInfo) => device.deviceId)
+            }, (device: GatewayBleDeviceInfo) =>
+              `${device.deviceId}:${device.commissioning ? 'commissioning' : 'configured'}:` +
+              `${device.claimed ? 'claimed' : 'unclaimed'}:${device.connected ? 'online' : 'offline'}`)
           }
           .width('100%')
           .height(Math.min(116, this.gatewayBleDevices.length * 58))
           .margin({ top: 8 })
         }
 
-        Row() {
-          Text(this.bleProvisionStatus)
-            .layoutWeight(1)
-            .fontSize(11)
-            .fontColor(this.bleProvisionStatus.indexOf('失败') >= 0 ? this.warningRed() : this.subTextColor())
-            .maxLines(2)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Button(this.bleProvisionBusy ? '添加中' : '添加')
-            .width(76)
-            .height(34)
-            .fontSize(12)
-            .fontColor('#FFFFFF')
-            .backgroundColor(this.accentGreen())
-            .borderRadius(8)
-            .margin({ left: 10 })
-            .enabled(this.bleProvisionSelectedDeviceId.length > 0 && !this.bleProvisionBusy)
-            .onClick(() => {
-              this.provisionDeviceOverBle(this.bleProvisionSelectedDeviceId)
-            })
-        }
-        .width('100%')
-        .margin({ top: 8 })
+        Text(this.bleProvisionStatus)
+          .width('100%')
+          .fontSize(11)
+          .fontColor(this.bleProvisionStatus.indexOf('失败') >= 0 ? this.warningRed() : this.subTextColor())
+          .margin({ top: 8 })
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
       }
       .width('100%')
       .padding(12)
@@ -15512,77 +16486,61 @@ struct Index {
       .border({ width: 1, color: this.hairlineColor() })
       .borderRadius(8)
 
-      Text(this.provisioningStatus)
-        .width('100%')
-        .fontSize(13)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.provisioningConnected ? this.accentGreen() : this.accentOrange())
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .margin({ top: 10 })
+      Row() {
+        Column() {
+          Text('当前添加目标')
+            .fontSize(12)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.accentGreen())
+          Text(this.selectedBleProvisioningDeviceText())
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.textColor())
+            .margin({ top: 5 })
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (this.selectedBleProvisioningDevice() !== undefined) {
+            Text(`能力：${this.gatewayBleCapabilitiesText(this.selectedBleProvisioningDevice() as GatewayBleDeviceInfo)}`)
+              .fontSize(11)
+              .fontColor(this.subTextColor())
+              .margin({ top: 3 })
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        Text('BLE 安全通道')
+          .fontSize(11)
+          .fontColor(this.selectedBleProvisioningDevice() !== undefined &&
+            this.bleDebugHasDynamicKey(this.bleProvisionSelectedDeviceId) ?
+            this.accentGreen() : this.subTextColor())
+      }
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+      .margin({ top: 12 })
+      .backgroundColor(this.softPanelBg())
+      .border({ width: 1, color: this.hairlineColor() })
+      .borderRadius(8)
 
       Row() {
-        Text(this.selectedProvisioningDeviceText())
-          .layoutWeight(1)
-          .height(38)
-          .fontSize(12)
-          .fontColor(this.textColor())
-          .padding({ left: 12, right: 12 })
-          .backgroundColor(this.softPanelBg())
-          .border({ width: 1, color: this.hairlineColor() })
-          .borderRadius(8)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Button('扫描')
-          .width(66)
-          .height(38)
-          .fontSize(13)
-          .fontColor('#FFFFFF')
-          .backgroundColor(this.accentBlue())
-          .borderRadius(8)
-          .margin({ left: 8 })
-          .onClick(() => {
-            this.refreshProvisioningUsbDevices()
-          })
-        Button('<')
-          .width(42)
-          .height(38)
-          .fontSize(15)
-          .fontColor(this.textColor())
-          .backgroundColor(this.softPanelBg())
-          .border({ width: 1, color: this.hairlineColor() })
-          .borderRadius(8)
-          .margin({ left: 8 })
-          .onClick(() => {
-            this.selectProvisioningDevice(-1)
-          })
-        Button('>')
-          .width(42)
-          .height(38)
-          .fontSize(15)
-          .fontColor(this.textColor())
-          .backgroundColor(this.softPanelBg())
-          .border({ width: 1, color: this.hairlineColor() })
-          .borderRadius(8)
-          .margin({ left: 6 })
-          .onClick(() => {
-            this.selectProvisioningDevice(1)
-          })
-        Button(this.provisioningConnected ? '断开' : '连接')
-          .width(70)
-          .height(38)
-          .fontSize(13)
-          .fontColor('#FFFFFF')
-          .backgroundColor(this.provisioningConnected ? this.warningRed() : this.accentGreen())
-          .borderRadius(8)
-          .margin({ left: 8 })
-          .onClick(() => {
-            if (this.provisioningConnected) {
-              this.disconnectProvisioningUsb()
-            } else {
-              this.connectProvisioningUsb()
-            }
-          })
+        Column() {
+          Text('BLE 无线配网参数')
+            .fontSize(15)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.textColor())
+          Text('以下 Wi-Fi 和网关配置将通过蓝牙安全通道发送给当前添加目标，无需连接该设备的 USB 串口')
+            .fontSize(11)
+            .fontColor(this.subTextColor())
+            .margin({ top: 4 })
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        Text(this.provisioningTransport.toUpperCase())
+          .fontSize(11)
+          .fontColor(this.accentBlue())
       }
       .width('100%')
       .margin({ top: 14 })
@@ -15719,64 +16677,217 @@ struct Index {
       .margin({ top: 8 })
 
       Row() {
-        Button('自动探测')
+        Text(this.bleProvisionStatus)
           .layoutWeight(1)
-          .height(40)
-          .fontSize(13)
-          .fontColor('#FFFFFF')
-          .backgroundColor(this.accentOrange())
-          .borderRadius(8)
-          .onClick(() => {
-            this.autoProbeProvisioningUsb()
-          })
-        Button('发送配置')
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(13)
-          .fontColor('#FFFFFF')
-          .backgroundColor(this.accentBlue())
-          .borderRadius(8)
-          .margin({ left: 8 })
-          .onClick(() => {
-            this.sendProvisioningConfig()
-          })
-        Button('保存重启')
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(13)
+          .fontSize(11)
+          .fontColor(this.bleProvisionStatus.indexOf('失败') >= 0 ? this.warningRed() : this.subTextColor())
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Button(this.bleProvisionBusy ? '正在添加' : '通过 BLE 添加设备')
+          .width(160)
+          .height(36)
+          .fontSize(12)
           .fontColor('#FFFFFF')
           .backgroundColor(this.accentGreen())
           .borderRadius(8)
-          .margin({ left: 8 })
+          .margin({ left: 10 })
+          .enabled(this.bleProvisionSelectedDeviceId.length > 0 && !this.bleProvisionBusy && !this.bleRemoveBusy)
           .onClick(() => {
-            this.saveProvisioningConfig()
+            this.provisionDeviceOverBle(this.bleProvisionSelectedDeviceId)
           })
       }
       .width('100%')
-      .margin({ top: 12 })
+      .padding({ top: 8, bottom: 8 })
+      .margin({ top: 10 })
+      .backgroundColor(this.softPanelBg())
+      .border({ width: 1, color: this.hairlineColor() })
+      .borderRadius(8)
 
       Row() {
-        Button('设备输出')
-          .width(112)
-          .height(34)
+        Column() {
+          Text('USB 串口维护配网')
+            .fontSize(14)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.textColor())
+          Text('仅用于旧设备兼容、串口调试和维护，不参与 BLE 添加设备')
+            .fontSize(11)
+            .fontColor(this.subTextColor())
+            .margin({ top: 3 })
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        Text(this.showUsbProvisioningSection ? '收起' : '展开')
           .fontSize(12)
-          .fontColor(this.textColor())
-          .backgroundColor(this.softPanelBg())
-          .border({ width: 1, color: this.hairlineColor() })
-          .borderRadius(8)
-          .onClick(() => {
-            this.showProvisioningOutputPanel = true
-          })
-        Text('点击“自动探测”，进入配网模式之后点击“发送配置”，上方状态显示收到之后点击“保存重启”，完成设备接入')
-          .fontSize(11)
-          .fontColor(this.subTextColor())
-          .layoutWeight(1)
-          .margin({ left: 10 })
-          .maxLines(2)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .fontColor(this.accentBlue())
       }
       .width('100%')
-      .margin({ top: 8 })
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+      .margin({ top: 12 })
+      .backgroundColor(this.softPanelBg())
+      .border({ width: 1, color: this.hairlineColor() })
+      .borderRadius(8)
+      .onClick(() => {
+        this.showUsbProvisioningSection = !this.showUsbProvisioningSection
+        if (this.showUsbProvisioningSection) {
+          this.refreshProvisioningUsbDevices()
+        }
+      })
+
+      if (this.showUsbProvisioningSection) {
+        Column() {
+          Text(this.provisioningStatus)
+            .width('100%')
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.provisioningConnected ? this.accentGreen() : this.accentOrange())
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .margin({ top: 10 })
+
+          Row() {
+            Text(this.selectedProvisioningDeviceText())
+              .layoutWeight(1)
+              .height(38)
+              .fontSize(12)
+              .fontColor(this.textColor())
+              .padding({ left: 12, right: 12 })
+              .backgroundColor(this.softPanelBg())
+              .border({ width: 1, color: this.hairlineColor() })
+              .borderRadius(8)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Button('扫描')
+              .width(66)
+              .height(38)
+              .fontSize(13)
+              .fontColor('#FFFFFF')
+              .backgroundColor(this.accentBlue())
+              .borderRadius(8)
+              .margin({ left: 8 })
+              .onClick(() => {
+                this.refreshProvisioningUsbDevices()
+              })
+            Button('<')
+              .width(42)
+              .height(38)
+              .fontSize(15)
+              .fontColor(this.textColor())
+              .backgroundColor(this.softPanelBg())
+              .border({ width: 1, color: this.hairlineColor() })
+              .borderRadius(8)
+              .margin({ left: 8 })
+              .onClick(() => {
+                this.selectProvisioningDevice(-1)
+              })
+            Button('>')
+              .width(42)
+              .height(38)
+              .fontSize(15)
+              .fontColor(this.textColor())
+              .backgroundColor(this.softPanelBg())
+              .border({ width: 1, color: this.hairlineColor() })
+              .borderRadius(8)
+              .margin({ left: 6 })
+              .onClick(() => {
+                this.selectProvisioningDevice(1)
+              })
+            Button(this.provisioningConnected ? '断开' : '连接')
+              .width(70)
+              .height(38)
+              .fontSize(13)
+              .fontColor('#FFFFFF')
+              .backgroundColor(this.provisioningConnected ? this.warningRed() : this.accentGreen())
+              .borderRadius(8)
+              .margin({ left: 8 })
+              .onClick(() => {
+                if (this.provisioningConnected) {
+                  this.disconnectProvisioningUsb()
+                } else {
+                  this.connectProvisioningUsb()
+                }
+              })
+          }
+          .width('100%')
+          .margin({ top: 12 })
+
+          Row() {
+            Button('自动探测')
+              .layoutWeight(1)
+              .height(40)
+              .fontSize(13)
+              .fontColor('#FFFFFF')
+              .backgroundColor(this.accentOrange())
+              .borderRadius(8)
+              .onClick(() => {
+                this.autoProbeProvisioningUsb()
+              })
+            Button('发送配置')
+              .layoutWeight(1)
+              .height(40)
+              .fontSize(13)
+              .fontColor('#FFFFFF')
+              .backgroundColor(this.accentBlue())
+              .borderRadius(8)
+              .margin({ left: 8 })
+              .onClick(() => {
+                this.sendProvisioningConfig()
+              })
+            Button('保存重启')
+              .layoutWeight(1)
+              .height(40)
+              .fontSize(13)
+              .fontColor('#FFFFFF')
+              .backgroundColor(this.accentGreen())
+              .borderRadius(8)
+              .margin({ left: 8 })
+              .onClick(() => {
+                this.saveProvisioningConfig()
+              })
+          }
+          .width('100%')
+          .margin({ top: 12 })
+
+          Row() {
+            Button('设备输出')
+              .width(112)
+              .height(34)
+              .fontSize(12)
+              .fontColor(this.textColor())
+              .backgroundColor(this.softPanelBg())
+              .border({ width: 1, color: this.hairlineColor() })
+              .borderRadius(8)
+              .onClick(() => {
+                this.showProvisioningOutputPanel = true
+              })
+            Text('点击“自动探测”，进入配网模式之后点击“发送配置”，上方状态显示收到之后点击“保存重启”，完成设备接入')
+              .fontSize(11)
+              .fontColor(this.subTextColor())
+              .layoutWeight(1)
+              .margin({ left: 10 })
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          .width('100%')
+          .margin({ top: 8 })
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, bottom: 12 })
+        .backgroundColor(this.softPanelBg())
+        .border({ width: 1, color: this.hairlineColor() })
+        .borderRadius(8)
+      }
+
+        }
+        .width('100%')
+        .padding({ bottom: 8 })
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .scrollable(ScrollDirection.Vertical)
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring)
     }
     .width(780)
     .height(560)
@@ -15784,6 +16895,83 @@ struct Index {
     .borderRadius(20)
     .backgroundColor(this.cardBg())
     .border({ width: 1, color: this.hairlineColor() })
+  }
+
+  @Builder
+  BleRemoveConfirmPanel() {
+    Column() {
+      Text('移除设备')
+        .width('100%')
+        .fontSize(22)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(this.textColor())
+
+      Text(this.deviceIdDisplayText(this.bleRemoveDeviceId))
+        .width('100%')
+        .fontSize(12)
+        .fontColor(this.subTextColor())
+        .margin({ top: 6 })
+
+      Text('移除后设备将断开 Wi-Fi 和家庭连接，需要重新添加才能使用。')
+        .width('100%')
+        .fontSize(14)
+        .fontColor(this.textColor())
+        .margin({ top: 18 })
+        .maxLines(3)
+
+      Text('空调遥控学习数据等本地功能数据会保留。')
+        .width('100%')
+        .fontSize(12)
+        .fontColor(this.accentGreen())
+        .margin({ top: 10 })
+
+      if (this.bleRemoveStatus.length > 0) {
+        Text(this.bleRemoveStatus)
+          .width('100%')
+          .fontSize(12)
+          .fontColor(this.bleRemoveStatus.indexOf('失败') >= 0 ? this.warningRed() : this.accentOrange())
+          .margin({ top: 14 })
+          .maxLines(2)
+      }
+
+      Row() {
+        Button('取消')
+          .layoutWeight(1)
+          .height(40)
+          .fontSize(13)
+          .fontColor(this.textColor())
+          .backgroundColor(this.softPanelBg())
+          .border({ width: 1, color: this.hairlineColor() })
+          .borderRadius(8)
+          .enabled(!this.bleRemoveBusy)
+          .onClick(() => {
+            this.showBleRemoveConfirm = false
+            this.bleRemoveDeviceId = ''
+            this.bleRemovePendingDeviceId = ''
+            this.bleRemoveStatus = ''
+          })
+        Button(this.bleRemoveBusy ? '正在移除' : '确认移除')
+          .layoutWeight(1)
+          .height(40)
+          .fontSize(13)
+          .fontColor('#FFFFFF')
+          .backgroundColor(this.warningRed())
+          .borderRadius(8)
+          .margin({ left: 10 })
+          .enabled(!this.bleRemoveBusy)
+          .onClick(() => {
+            this.removeDeviceOverBle(this.bleRemoveDeviceId)
+          })
+      }
+      .width('100%')
+      .margin({ top: 22 })
+    }
+    .width(430)
+    .padding(22)
+    .backgroundColor(this.cardBg())
+    .border({ width: 1, color: this.hairlineColor() })
+    .borderRadius(8)
+    .alignItems(HorizontalAlign.Start)
   }
 
   @Builder
@@ -16663,6 +17851,15 @@ struct Index {
         .width('100%')
         .height('100%')
         .backgroundColor('rgba(32, 36, 42, 0.52)')
+      }
+
+      if (this.showBleRemoveConfirm) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.BleRemoveConfirmPanel()
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.68)')
       }
 
       if (this.showProvisioningOutputPanel) {

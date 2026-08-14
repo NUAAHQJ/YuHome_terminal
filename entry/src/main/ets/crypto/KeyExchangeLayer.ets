@@ -339,6 +339,7 @@ async function hkdfSha256(ikm: Uint8Array, infoText: string, length: number): Pr
 export class KeyExchangeLayer {
   private states: Map<string, DeviceKeyState> = new Map()
   private localIdentities: Map<string, LocalKeyIdentity> = new Map()
+  private localIdentityTasks: Map<string, Promise<LocalKeyIdentity>> = new Map()
   private identityBySession: Map<string, string> = new Map()
   private hkdfDomainBySession: Map<string, string> = new Map()
 
@@ -386,6 +387,21 @@ export class KeyExchangeLayer {
     }
   }
 
+  private async generateLocalIdentity(): Promise<LocalKeyIdentity> {
+    const curve = getCurveChoice()
+    const generator = cryptoFramework.createAsyKeyGeneratorBySpec(curve.params)
+    const keyPair = await generator.generateKeyPair()
+    const publicPoint: cryptoFramework.Point = {
+      x: keyPair.pubKey.getAsyKeySpec(cryptoFramework.AsyKeySpecItem.ECC_PK_X_BN) as bigint,
+      y: keyPair.pubKey.getAsyKeySpec(cryptoFramework.AsyKeySpecItem.ECC_PK_Y_BN) as bigint
+    }
+    return {
+      keyPair,
+      publicKeyRaw: pointToRawPublicKey(publicPoint),
+      curveName: curve.name
+    }
+  }
+
   private async ensureLocalIdentity(state: DeviceKeyState): Promise<void> {
     const cached = this.localIdentities.get(state.localIdentityId)
     if (cached !== undefined) {
@@ -394,19 +410,22 @@ export class KeyExchangeLayer {
       state.curveName = cached.curveName
       return
     }
-    const curve = getCurveChoice()
-    const generator = cryptoFramework.createAsyKeyGeneratorBySpec(curve.params)
-    const keyPair = await generator.generateKeyPair()
-    const publicPoint: cryptoFramework.Point = {
-      x: keyPair.pubKey.getAsyKeySpec(cryptoFramework.AsyKeySpecItem.ECC_PK_X_BN) as bigint,
-      y: keyPair.pubKey.getAsyKeySpec(cryptoFramework.AsyKeySpecItem.ECC_PK_Y_BN) as bigint
+
+    let task = this.localIdentityTasks.get(state.localIdentityId)
+    if (task === undefined) {
+      task = this.generateLocalIdentity()
+      this.localIdentityTasks.set(state.localIdentityId, task)
     }
-    const identity: LocalKeyIdentity = {
-      keyPair,
-      publicKeyRaw: pointToRawPublicKey(publicPoint),
-      curveName: curve.name
+
+    let identity: LocalKeyIdentity
+    try {
+      identity = await task
+    } catch (err) {
+      this.localIdentityTasks.delete(state.localIdentityId)
+      throw new Error((err as Error).message)
     }
     this.localIdentities.set(state.localIdentityId, identity)
+    this.localIdentityTasks.delete(state.localIdentityId)
     state.keyPair = identity.keyPair
     state.publicKeyRaw = identity.publicKeyRaw
     state.curveName = identity.curveName
@@ -435,6 +454,10 @@ export class KeyExchangeLayer {
     try {
       if (state.keyPair === null) {
         throw new Error('local key pair missing')
+      }
+      if (state.pendingRemotePublicKeyRaw !== null && bytesEqual(payload, state.pendingRemotePublicKeyRaw)) {
+        console.info(`[ECDH] skip repeated pending key ${deviceId}`)
+        return false
       }
       if (state.established && state.remotePublicKeyRaw !== null && bytesEqual(payload, state.remotePublicKeyRaw)) {
         console.info(`[ECDH] skip repeated key install ${deviceId}`)
@@ -536,6 +559,9 @@ export class KeyExchangeLayer {
 
     if (state.established && state.remotePublicKeyRaw !== null && bytesEqual(payload, state.remotePublicKeyRaw)) {
       return buildResult(true, `ECDH ignored repeated remote key ${deviceId}`, deviceId, undefined, undefined, true)
+    }
+    if (state.pendingRemotePublicKeyRaw !== null && bytesEqual(payload, state.pendingRemotePublicKeyRaw)) {
+      return buildResult(true, `ECDH ignored repeated pending key ${deviceId}`, deviceId, undefined, undefined, false)
     }
 
     if (state.keyPair === null || state.publicKeyRaw === null) {
