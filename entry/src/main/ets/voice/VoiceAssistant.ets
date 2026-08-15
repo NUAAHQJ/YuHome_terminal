@@ -9,6 +9,12 @@ import { createPerformanceTrace, emitPerformanceEvent } from '../performance/Per
 const COMMAND_TIMEOUT_MS: number = 7000
 const EARLY_INTENT_STABLE_MS: number = 700
 const WAKE_AUDIO_SECONDS: number = 2
+const WAKE_VAD_PRE_ROLL_SECONDS: number = 0.72
+const WAKE_VAD_HANGOVER_MS: number = 1200
+const WAKE_VAD_MIN_RMS: number = 100
+const WAKE_VAD_MIN_PEAK: number = 900
+const WAKE_VAD_NOISE_MULTIPLIER: number = 2.4
+const WAKE_VAD_PEAK_MULTIPLIER: number = 7
 const ENROLLMENT_MIN_SPEECH_SECONDS: number = 0.7
 const PROMPT_AWAKE: string = 'voice/prompts/generated/fixed/awake.wav'
 const PROMPT_SUCCESS: string = 'voice/prompts/generated/fixed/generic_success.wav'
@@ -94,6 +100,10 @@ export class VoiceAssistant {
   private wakeDecodeQueuedSamples: number = 0
   private wakeDecodeInFlight: boolean = false
   private wakeDecodeGeneration: number = 0
+  private wakeVadPreRoll: ArrayBuffer[] = []
+  private wakeVadPreRollSamples: number = 0
+  private wakeVadActiveUntil: number = 0
+  private wakeVadNoiseFloor: number = 30
   private enrollmentActive: boolean = false
   private enrollmentTimerId: number = -1
   private enrollmentResolve: ((embedding: number[]) => void) | null = null
@@ -321,16 +331,80 @@ export class VoiceAssistant {
 
   private processWakeAudio(samples: ArrayBuffer, sampleRate: number): void {
     this.rememberWakeAudio(samples, sampleRate)
+    const now = Date.now()
+    const energy = this.calculatePcm16Energy(samples)
+    const wasActive = now < this.wakeVadActiveUntil
+    const rmsThreshold = Math.max(WAKE_VAD_MIN_RMS,
+      this.wakeVadNoiseFloor * WAKE_VAD_NOISE_MULTIPLIER)
+    const peakThreshold = Math.max(WAKE_VAD_MIN_PEAK,
+      this.wakeVadNoiseFloor * WAKE_VAD_PEAK_MULTIPLIER)
+    const speechDetected = energy[0] >= rmsThreshold || energy[1] >= peakThreshold
+
+    if (!wasActive) {
+      this.rememberWakeVadPreRoll(samples, sampleRate)
+      if (!speechDetected) {
+        this.wakeVadNoiseFloor = this.wakeVadNoiseFloor * 0.92 + energy[0] * 0.08
+        return
+      }
+      this.wakeVadActiveUntil = now + WAKE_VAD_HANGOVER_MS
+      console.info(`[VoiceAssistant][wake-vad] active rms=${Math.round(energy[0])} peak=${energy[1]} ` +
+        `noise=${Math.round(this.wakeVadNoiseFloor)}`)
+      this.wakeVadPreRoll.forEach((chunk: ArrayBuffer) => {
+        this.enqueueWakeDecodeAudio(chunk)
+      })
+      this.wakeVadPreRoll = []
+      this.wakeVadPreRollSamples = 0
+    } else {
+      this.enqueueWakeDecodeAudio(samples)
+      if (speechDetected) {
+        this.wakeVadActiveUntil = now + WAKE_VAD_HANGOVER_MS
+      }
+    }
+    this.drainWakeDecodeQueue(sampleRate)
+  }
+
+  private enqueueWakeDecodeAudio(samples: ArrayBuffer): void {
     this.wakeDecodeQueue.push(samples)
     this.wakeDecodeQueuedSamples += Math.floor(samples.byteLength / 2)
-    const maxQueuedSamples = sampleRate * 2
+    const maxQueuedSamples = this.wakeAudioSampleRate * 2
     while (this.wakeDecodeQueuedSamples > maxQueuedSamples && this.wakeDecodeQueue.length > 1) {
       const removed = this.wakeDecodeQueue.shift()
       if (removed !== undefined) {
         this.wakeDecodeQueuedSamples -= Math.floor(removed.byteLength / 2)
       }
     }
-    this.drainWakeDecodeQueue(sampleRate)
+  }
+
+  private rememberWakeVadPreRoll(samples: ArrayBuffer, sampleRate: number): void {
+    this.wakeVadPreRoll.push(samples)
+    this.wakeVadPreRollSamples += Math.floor(samples.byteLength / 2)
+    const maxSamples = Math.floor(sampleRate * WAKE_VAD_PRE_ROLL_SECONDS)
+    while (this.wakeVadPreRollSamples > maxSamples && this.wakeVadPreRoll.length > 1) {
+      const removed = this.wakeVadPreRoll.shift()
+      if (removed !== undefined) {
+        this.wakeVadPreRollSamples -= Math.floor(removed.byteLength / 2)
+      }
+    }
+  }
+
+  private calculatePcm16Energy(buffer: ArrayBuffer): number[] {
+    const bytes = new Uint8Array(buffer)
+    const sampleCount = Math.floor(bytes.byteLength / 2)
+    let sumSquares = 0
+    let peak = 0
+    let measured = 0
+    for (let index = 0; index < sampleCount; index += 8) {
+      const offset = index * 2
+      let sample = bytes[offset] | (bytes[offset + 1] << 8)
+      if (sample >= 32768) {
+        sample -= 65536
+      }
+      peak = Math.max(peak, Math.abs(sample))
+      sumSquares += sample * sample
+      measured += 1
+    }
+    const rms = measured > 0 ? Math.sqrt(sumSquares / measured) : 0
+    return [rms, peak]
   }
 
   private drainWakeDecodeQueue(sampleRate: number): void {
@@ -387,6 +461,10 @@ export class VoiceAssistant {
     this.wakeDecodeGeneration += 1
     this.wakeDecodeQueue = []
     this.wakeDecodeQueuedSamples = 0
+    this.wakeVadPreRoll = []
+    this.wakeVadPreRollSamples = 0
+    this.wakeVadActiveUntil = 0
+    this.wakeVadNoiseFloor = 30
   }
 
   private async handleWakeDetected(): Promise<void> {

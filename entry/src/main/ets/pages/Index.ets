@@ -56,6 +56,10 @@ const LIGHT_CONTROL_ACK_TIMEOUT_MS: number = 12000
 const NETWORK_CRYPTO_READY_WAIT_MS: number = 15000
 const IR_COMMAND_ACK_TIMEOUT_MS: number = 8000
 const IR_LEARN_STEP_ACK_TIMEOUT_MS: number = 25000
+const VOICE_WAVEFORM_UPDATE_INTERVAL_MS: number = 480
+const CRYPTO_DIAGNOSTIC_UI_INTERVAL_MS: number = 500
+const PROVISIONING_LOG_UI_INTERVAL_MS: number = 200
+const CLOUD_ACTUATOR_HEARTBEAT_MS: number = 30000
 const IR_LEARN_KEY_LABELS: string[] = ['开机', '关机', '温度+', '温度-', '制冷', '制热']
 const VOICEPRINT_PHRASES: string[] = [
   '小禹小禹，打开客厅灯',
@@ -454,6 +458,8 @@ const OUTDOOR_WEATHER_REFRESH_MS: number = 10 * 60 * 1000
 const SENSOR_DISPLAY_REFRESH_MS: number = 10 * 1000
 // 云端传感器上报的最小间隔。告警走 queueCloudAlarmReport 独立通道，不受此限制。
 const CLOUD_SENSOR_MIN_INTERVAL_MS: number = 5 * 1000
+// 设备模式变化立即持久化；仅 lastSeen 变化时低频落盘，避免周期包持续刷新 @StorageLink。
+const DEVICE_DESCRIPTOR_HEARTBEAT_MS: number = 30 * 1000
 // 传感器逐包详细日志（含整包 JSON 序列化）。排查问题时置为 true。
 const SENSOR_VERBOSE_LOG: boolean = false
 const FACE_ENROLL_MIN_QUALITY: number = 0.50
@@ -491,6 +497,8 @@ struct Index {
     0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]
   @State voiceAssistantActive: boolean = false
   @State voiceAssistantError: boolean = false
+  private lastVoiceWaveformUiAt: number = 0
+  private voiceWaveformUiEnabled: boolean = false
 
   @State currentTime: string = '08:30'
   @State currentDate: string = '2026/05/22'
@@ -631,6 +639,11 @@ struct Index {
   @State cryptoEnabled: boolean = false
   @State cryptoLastDecrypted: string = '等待加密数据...'
   @State cryptoDebugText: string = '加密包: 等待'
+  private latestCryptoEnabled: boolean = false
+  private latestCryptoLastDecrypted: string = '等待加密数据...'
+  private latestCryptoDebugText: string = '加密包: 等待'
+  private cryptoDiagnosticDirty: boolean = false
+  private lastCryptoDiagnosticUiAt: number = 0
   @StorageLink(CRYPTO_MODE_STORAGE_KEY) cryptoMode: string = 'SM4'
   @StorageLink(DYNAMIC_AES_STORAGE_KEY) dynamicAesKeyBase64: string = ''
   @StorageLink(DYNAMIC_SM4_STORAGE_KEY) dynamicSm4KeyBase64: string = ''
@@ -752,6 +765,7 @@ struct Index {
   private lastSuccessfulDecryptAtByDevice: Map<string, number> = new Map()
   private lastDynamicDecryptAtByDevice: Map<string, number> = new Map()
   private recentEncryptedPayloads: Map<string, number> = new Map()
+  private lastDeviceDescriptorPersistAt: Map<string, number> = new Map()
   private processedHttpSensorPackets: Set<string> = new Set()
   private bridgeStateFailCount: number = 0
   private bridgeStateRefreshInFlight: boolean = false
@@ -761,6 +775,10 @@ struct Index {
   private cloudReportInFlight: boolean = false
   private cloudAlarmReportInFlight: boolean = false
   private cloudActuatorReportInFlight: boolean = false
+  private lastCloudLightSignature: string = ''
+  private lastCloudLightReportAt: number = 0
+  private lastCloudCurtainPercent: number = -1
+  private lastCloudCurtainReportAt: number = 0
   private pendingCloudAlarm: CloudIngestPacket | null = null
   private pendingCloudActuator: CloudIngestPacket | null = null
   private cloudAlarmRetryTimerId: number = -1
@@ -865,6 +883,7 @@ struct Index {
   private provisioningLogSeq: number = 0
   private provisioningLogFlushTimerId: number = -1
   private pendingProvisioningFrameLogs: string[] = []
+  private provisioningFrameLogBuffer: string[] = []
   @State showProvisioningPanel: boolean = false
   @State showProvisioningOutputPanel: boolean = false
   @State showUsbProvisioningSection: boolean = false
@@ -1154,18 +1173,50 @@ struct Index {
     this.voiceAssistant.setSpeakerProfileManager(this.speakerProfiles)
     this.voiceAssistant.setCallbacks({
       onState: (state: VoiceAssistantState, detail: string, transcript: string): void => {
-        this.voiceAssistantStatus = this.voiceAssistantStateText(state)
-        this.voiceAssistantDetail = detail
-        this.voiceAssistantTranscript = transcript
-        this.voiceAssistantActive = state === VoiceAssistantState.WAITING_WAKE ||
+        const nextStatus = this.voiceAssistantStateText(state)
+        const nextActive = state === VoiceAssistantState.WAITING_WAKE ||
           state === VoiceAssistantState.WAKE_DETECTED ||
           state === VoiceAssistantState.LISTENING_COMMAND ||
           state === VoiceAssistantState.RECOGNIZING ||
           state === VoiceAssistantState.EXECUTING ||
           state === VoiceAssistantState.VOICEPRINT_ENROLLING
-        this.voiceAssistantError = state === VoiceAssistantState.ERROR
+        const nextError = state === VoiceAssistantState.ERROR
+        const wasWaveformUiEnabled = this.voiceWaveformUiEnabled
+        const nextWaveformUiEnabled = state === VoiceAssistantState.WAKE_DETECTED ||
+          state === VoiceAssistantState.LISTENING_COMMAND ||
+          state === VoiceAssistantState.RECOGNIZING ||
+          state === VoiceAssistantState.EXECUTING ||
+          state === VoiceAssistantState.VOICEPRINT_ENROLLING
+        this.voiceWaveformUiEnabled = nextWaveformUiEnabled
+        if (wasWaveformUiEnabled && !nextWaveformUiEnabled) {
+          this.voiceWaveform = [0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04,
+            0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]
+        }
+        if (this.voiceAssistantStatus !== nextStatus) {
+          this.voiceAssistantStatus = nextStatus
+        }
+        if (this.voiceAssistantDetail !== detail) {
+          this.voiceAssistantDetail = detail
+        }
+        if (this.voiceAssistantTranscript !== transcript) {
+          this.voiceAssistantTranscript = transcript
+        }
+        if (this.voiceAssistantActive !== nextActive) {
+          this.voiceAssistantActive = nextActive
+        }
+        if (this.voiceAssistantError !== nextError) {
+          this.voiceAssistantError = nextError
+        }
       },
       onLevel: (level: number): void => {
+        if (!this.voiceWaveformUiEnabled || this.activeNav !== 'overview' || this.hasVisibleTransientPanel()) {
+          return
+        }
+        const now = Date.now()
+        if (now - this.lastVoiceWaveformUiAt < VOICE_WAVEFORM_UPDATE_INTERVAL_MS) {
+          return
+        }
+        this.lastVoiceWaveformUiAt = now
         const next = this.voiceWaveform.slice(1)
         next.push(Math.max(0.04, level))
         this.voiceWaveform = next
@@ -1195,6 +1246,45 @@ struct Index {
         console.info(`[VoiceAssistant][start-fail] ${err.message}`)
       })
     }, 500)
+  }
+
+  private hasVisibleTransientPanel(): boolean {
+    return this.showFaceEnrollPanel || this.showAcControlPanel || this.showVoiceprintPanel ||
+      this.showDeviceBindingPanel || this.showDeviceStatusPanel || this.showModelComparisonPanel ||
+      this.showProvisioningPanel || this.showBleRemoveConfirm || this.showProvisioningOutputPanel ||
+      this.showIrLearnPanel || this.showDebugPanel || this.showCriticalDialog
+  }
+
+  private updateCryptoPacketDiagnostics(debugText: string, lastDecrypted?: string, enabled?: boolean): void {
+    this.latestCryptoDebugText = debugText
+    if (lastDecrypted !== undefined) {
+      this.latestCryptoLastDecrypted = lastDecrypted
+    }
+    if (enabled !== undefined) {
+      this.latestCryptoEnabled = enabled
+    }
+    this.cryptoDiagnosticDirty = true
+    const now = Date.now()
+    if (this.showDebugPanel && now - this.lastCryptoDiagnosticUiAt >= CRYPTO_DIAGNOSTIC_UI_INTERVAL_MS) {
+      this.syncCryptoPacketDiagnostics()
+    }
+  }
+
+  private syncCryptoPacketDiagnostics(): void {
+    if (!this.cryptoDiagnosticDirty) {
+      return
+    }
+    if (this.cryptoEnabled !== this.latestCryptoEnabled) {
+      this.cryptoEnabled = this.latestCryptoEnabled
+    }
+    if (this.cryptoLastDecrypted !== this.latestCryptoLastDecrypted) {
+      this.cryptoLastDecrypted = this.latestCryptoLastDecrypted
+    }
+    if (this.cryptoDebugText !== this.latestCryptoDebugText) {
+      this.cryptoDebugText = this.latestCryptoDebugText
+    }
+    this.cryptoDiagnosticDirty = false
+    this.lastCryptoDiagnosticUiAt = Date.now()
   }
 
   async restartVoiceAssistant(): Promise<void> {
@@ -1528,20 +1618,41 @@ struct Index {
   }
 
   updateDeviceDescriptorModes(deviceId: string, transport: string = '', crypto: string = ''): void {
+    const now = Date.now()
+    const normalizedTransport = transport.length > 0 ?
+      this.normalizeProtocolMode(transport.toUpperCase()).toLowerCase() : ''
+    const normalizedCrypto = crypto.length > 0 ?
+      this.normalizeCryptoMode(crypto.toUpperCase()).toLowerCase() : ''
+    const lastPersistAt = this.lastDeviceDescriptorPersistAt.get(deviceId) ?? 0
+    const cachedTransport = this.localGatewayTransportByDevice.get(deviceId)
+    if (normalizedCrypto.length === 0 && normalizedTransport.length > 0 &&
+      cachedTransport === normalizedTransport.toUpperCase() &&
+      now - lastPersistAt < DEVICE_DESCRIPTOR_HEARTBEAT_MS) {
+      return
+    }
     const registry = this.loadDeviceRegistry()
     const descriptor = registry[deviceId]
     if (!descriptor) {
       return
     }
-    if (transport.length > 0) {
-      descriptor.transport = this.normalizeProtocolMode(transport.toUpperCase()).toLowerCase()
+    const modeChanged = (normalizedTransport.length > 0 && descriptor.transport !== normalizedTransport) ||
+      (normalizedCrypto.length > 0 && descriptor.crypto !== normalizedCrypto)
+    if (!modeChanged && now - lastPersistAt < DEVICE_DESCRIPTOR_HEARTBEAT_MS) {
+      return
     }
-    if (crypto.length > 0) {
-      descriptor.crypto = this.normalizeCryptoMode(crypto.toUpperCase()).toLowerCase()
+    if (normalizedTransport.length > 0) {
+      descriptor.transport = normalizedTransport
     }
-    descriptor.lastSeen = Date.now()
+    if (normalizedCrypto.length > 0) {
+      descriptor.crypto = normalizedCrypto
+    }
+    descriptor.lastSeen = now
     registry[deviceId] = descriptor
-    this.deviceRegistryJson = JSON.stringify(registry)
+    const nextRegistryJson = JSON.stringify(registry)
+    if (this.deviceRegistryJson !== nextRegistryJson) {
+      this.deviceRegistryJson = nextRegistryJson
+    }
+    this.lastDeviceDescriptorPersistAt.set(deviceId, now)
   }
 
   selectNextActiveDevice(): void {
@@ -2064,7 +2175,7 @@ struct Index {
           console.info(`[ECDH] HTTP cached public key topic=${cachedTopic}`)
           this.handleEcdhPublicKey(cachedTopic, this.base64ToUint8Array(bridgeResp.encrypted.payloadBase64), bridgeResp.encrypted.timestamp)
         } else if (this.cryptoPendingMode.length > 0 || this.shouldProcessBusinessSource('HTTP')) {
-          this.cryptoDebugText = `HTTP加密包 ${bridgeResp.encrypted.payloadBase64.length}B64`
+          this.updateCryptoPacketDiagnostics(`HTTP加密包 ${bridgeResp.encrypted.payloadBase64.length}B64`)
           this.handleEncryptedPayload(bridgeResp.encrypted.payloadBase64, 'HTTP', cachedTopic)
         } else {
           console.info(`[PROTO] ignore HTTP cached packet while active=${this.commandTransport} pending=${this.protocolPendingMode}`)
@@ -2236,7 +2347,7 @@ struct Index {
       this.transportForDevice(packetDeviceId) === 'HTTP' || this.shouldProcessBusinessSource('HTTP_SENSOR')) {
       const deviceText = packet.deviceId ?? this.deviceIdFromTopic(httpTopic)
       const cryptoText = packet.crypto ?? currentCryptoMode()
-      this.cryptoDebugText = `HTTP_SENSOR ${deviceText}/${cryptoText} ${packet.payloadBase64.length}B64`
+      this.updateCryptoPacketDiagnostics(`HTTP_SENSOR ${deviceText}/${cryptoText} ${packet.payloadBase64.length}B64`)
       if (this.keyExchange.isKeyExchangeTopic(httpTopic)) {
         await this.handleEcdhPublicKey(httpTopic, this.base64ToUint8Array(packet.payloadBase64), packet.timestamp)
       } else {
@@ -3952,6 +4063,24 @@ struct Index {
   }
 
   reportCloudLight(data: LightStatusPacket): void {
+    const now = Date.now()
+    const signature = `${this.livingLightOn ? 1 : 0}|${this.doorLocked ? 1 : 0}|` +
+      `${this.doorOpen ? 1 : 0}|${this.curtainPercent}`
+    if (signature === this.lastCloudLightSignature &&
+      now - this.lastCloudLightReportAt < CLOUD_ACTUATOR_HEARTBEAT_MS) {
+      return
+    }
+    this.lastCloudLightSignature = signature
+    this.lastCloudLightReportAt = now
+    const snapshot: LightStatusPacket = {
+      living: this.livingLightOn,
+      locked: this.doorLocked,
+      door: this.doorOpen,
+      percent: this.curtainPercent,
+      pirEnabled: this.pirEnabled,
+      source: data.source,
+      seq: data.seq
+    }
     const packet: CloudIngestPacket = {
       source: 'esp32',
       kind: 'ack',
@@ -3960,7 +4089,7 @@ struct Index {
       topic: 'esp32/sensor',
       text: '执行器状态已同步',
       crypto: this.cloudCryptoText(),
-      light: data,
+      light: snapshot,
       state: '已同步'
     }
     this.queueCloudActuatorReport(packet)
@@ -3968,6 +4097,13 @@ struct Index {
 
   reportCloudCurtain(percent: number, source: string = 'esp32'): void {
     const normalized = Math.max(0, Math.min(100, Math.round(percent)))
+    const now = Date.now()
+    if (normalized === this.lastCloudCurtainPercent &&
+      now - this.lastCloudCurtainReportAt < CLOUD_ACTUATOR_HEARTBEAT_MS) {
+      return
+    }
+    this.lastCloudCurtainPercent = normalized
+    this.lastCloudCurtainReportAt = now
     const packet: CloudIngestPacket = {
       source,
       kind: 'ack',
@@ -4046,11 +4182,13 @@ struct Index {
     const nextDoorLocked = this.findBoolLike(rawData, ['doorLocked', 'locked', 'dl'])
     if ((nextDoorOpen !== null || nextDoorLocked !== null) &&
       deviceId === this.deviceForCapability('door')) {
-      if (nextDoorOpen !== null) {
+      if (nextDoorOpen !== null && this.doorOpen !== nextDoorOpen) {
         this.doorOpen = nextDoorOpen
+      }
+      if (nextDoorOpen !== null) {
         this.hasDoorOpenStatus = true
       }
-      if (nextDoorLocked !== null) {
+      if (nextDoorLocked !== null && this.doorLocked !== nextDoorLocked) {
         this.doorLocked = nextDoorLocked
       }
     }
@@ -4091,11 +4229,17 @@ struct Index {
     if (this.hasActiveDeviceAlarm()) {
       this.refreshAlarmPresentation()
     } else {
-      this.alertLevel = Math.max(0, Math.min(3, nextLevel))
-      this.alertMessage = this.userFacingDeviceText(msg)
+      const normalizedLevel = Math.max(0, Math.min(3, nextLevel))
+      const normalizedMessage = this.userFacingDeviceText(msg)
+      if (this.alertLevel !== normalizedLevel) {
+        this.alertLevel = normalizedLevel
+      }
+      if (this.alertMessage !== normalizedMessage) {
+        this.alertMessage = normalizedMessage
+      }
       if (this.alertLevel >= 3) {
         this.triggerLocalAlarm(this.alertLevel, this.alertMessage)
-      } else {
+      } else if (this.showCriticalDialog) {
         this.showCriticalDialog = false
       }
     }
@@ -4122,9 +4266,10 @@ struct Index {
     // A successfully decrypted business packet carrying proto is authoritative
     // for the device's current Wi-Fi command route. MQTT key exchange / hello
     // traffic is only a maintenance channel and must not overwrite this route.
-    this.localGatewayTransportByDevice.set(deviceId, observed)
     this.updateDeviceDescriptorModes(deviceId, observed, '')
-    if (deviceId === this.activeDeviceId && this.protocolPendingMode.length === 0) {
+    this.localGatewayTransportByDevice.set(deviceId, observed)
+    if (deviceId === this.activeDeviceId && this.protocolPendingMode.length === 0 &&
+      this.commandTransport !== observed) {
       this.commandTransport = observed
     }
     if (deviceId !== this.activeDeviceId) {
@@ -4167,11 +4312,11 @@ struct Index {
       }
       this.applySensorData(data, source, deviceId)
       if (deviceId === this.activeDeviceId && this.cryptoPendingMode.length === 0) {
-        this.cryptoDebugText = `${source}解析OK ${this.sensorDisplay[0]}/${this.sensorDisplay[1]}`
+        this.updateCryptoPacketDiagnostics(`${source}解析OK ${this.sensorDisplay[0]}/${this.sensorDisplay[1]}`)
       }
     } catch (err) {
       if (deviceId === this.activeDeviceId && this.cryptoPendingMode.length === 0) {
-        this.cryptoDebugText = `${source}JSON失败 ${(err as Error).message}`
+        this.updateCryptoPacketDiagnostics(`${source}JSON失败 ${(err as Error).message}`)
       }
       console.info(`[Sensor][json-fail] ${JSON.stringify(err)}, raw=${jsonStr}`)
     }
@@ -4262,11 +4407,13 @@ struct Index {
       }
       this.livingLightOptimisticUntil = 0
       this.setLivingLightFromDevice(ledState)
+      let nextLightAckText = '设备状态已同步'
       if (data.ledLock?.owner === 'dayu') {
         const ttl = typeof data.ledLock.ttlMs === 'number' ? Math.max(0, Math.round(data.ledLock.ttlMs)) : 0
-        this.livingLightAckText = ttl > 0 ? `已锁定 ${Math.ceil(ttl / 1000)}s` : '已同步'
-      } else {
-        this.livingLightAckText = '设备状态已同步'
+        nextLightAckText = ttl > 0 ? `已锁定 ${Math.ceil(ttl / 1000)}s` : '已同步'
+      }
+      if (this.livingLightAckText !== nextLightAckText) {
+        this.livingLightAckText = nextLightAckText
       }
     }
     if (typeof data.living === 'boolean') {
@@ -4293,24 +4440,34 @@ struct Index {
         console.info(`[LED][living-ignore] ${source} cached=${data.living} hasLiveLedStatus=${this.hasLiveLedStatus}`)
       }
     }
-    if (typeof data.bedroom === 'boolean') {
+    if (typeof data.bedroom === 'boolean' && this.bedroomLightOn !== data.bedroom) {
       this.bedroomLightOn = data.bedroom
     }
-    if (typeof data.pirEnabled === 'boolean') {
+    if (typeof data.pirEnabled === 'boolean' && this.pirEnabled !== data.pirEnabled) {
       this.pirEnabled = data.pirEnabled
     }
     const lockedState = this.readBoolLike(data.locked)
     const doorOpenState = this.readBoolLike(data.door)
     if (lockedState !== null) {
-      this.doorLocked = lockedState
+      if (this.doorLocked !== lockedState) {
+        this.doorLocked = lockedState
+      }
       const owner = data.doorLock?.owner ?? data.source ?? 'esp32'
-      this.doorAckText = owner === 'dayu' ? '大禹门锁状态已同步' : '设备门锁状态已同步'
+      const nextDoorAckText = owner === 'dayu' ? '大禹门锁状态已同步' : '设备门锁状态已同步'
+      if (this.doorAckText !== nextDoorAckText) {
+        this.doorAckText = nextDoorAckText
+      }
     }
     if (doorOpenState !== null) {
-      this.doorOpen = doorOpenState
+      if (this.doorOpen !== doorOpenState) {
+        this.doorOpen = doorOpenState
+      }
       this.hasDoorOpenStatus = true
       const owner = data.doorLock?.owner ?? data.source ?? 'esp32'
-      this.doorAckText = owner === 'dayu' ? '大禹开门状态已同步' : '设备开门状态已同步'
+      const nextDoorAckText = owner === 'dayu' ? '大禹开门状态已同步' : '设备开门状态已同步'
+      if (this.doorAckText !== nextDoorAckText) {
+        this.doorAckText = nextDoorAckText
+      }
     }
     const reportedLocked = lockedState
     if (this.doorPending && reportedLocked !== null && reportedLocked === this.doorPendingTargetLocked) {
@@ -4984,6 +5141,10 @@ struct Index {
    */
   async handleEncryptedRaw(raw: Uint8Array, topic: string = 'esp32/sensor',
     deviceId: string = this.activeDeviceId): Promise<void> {
+    if (this.isDuplicateEncryptedPayload(topic, this.uint8ArrayToBase64(raw))) {
+      console.info(`[Crypto][duplicate-skip] topic=${topic} source=MQTT ${raw.length}B`)
+      return
+    }
     if (SENSOR_VERBOSE_LOG) {
       console.info(`[Crypto] decrypting ${raw.length} bytes raw encrypted payload on ${topic}`)
     }
@@ -5015,9 +5176,9 @@ struct Index {
       }
       if (deviceId === this.activeDeviceId) {
         this.decryptFailCount = 0
-        this.cryptoEnabled = true
-        this.cryptoLastDecrypted = new Date().toLocaleTimeString() + ' OK'
-        this.cryptoDebugText = `MQTT解密OK ${decrypted.mode} ${jsonStr.substring(0, 24)}`
+        this.updateCryptoPacketDiagnostics(
+          `MQTT解密OK ${decrypted.mode} ${jsonStr.substring(0, 24)}`,
+          new Date().toLocaleTimeString() + ' OK', true)
       }
       if (deviceId === this.activeDeviceId && this.tryCompleteProtocolSwitchFromJson(jsonStr, 'MQTT')) {
         return
@@ -5041,8 +5202,7 @@ struct Index {
       console.info(`[Crypto][decrypt-fail] ${message}`)
       this.handleDecryptFailure(deviceId, 'MQTT')
       if (deviceId === this.activeDeviceId) {
-        this.cryptoLastDecrypted = 'decrypt fail'
-        this.cryptoDebugText = `MQTT解密失败 ${message}`
+        this.updateCryptoPacketDiagnostics(`MQTT解密失败 ${message}`, 'decrypt fail')
       }
       this.addMqttMessage(topic, `[err] ${raw.length}B decrypt fail ${message}`)
     }
@@ -5098,9 +5258,9 @@ struct Index {
       }
       if (deviceId === this.activeDeviceId) {
         this.decryptFailCount = 0
-        this.cryptoEnabled = true
-        this.cryptoLastDecrypted = new Date().toLocaleTimeString() + ' ✓'
-        this.cryptoDebugText = `${payloadSource}解密OK ${decrypted.mode} ${jsonStr.substring(0, 24)}`
+        this.updateCryptoPacketDiagnostics(
+          `${payloadSource}解密OK ${decrypted.mode} ${jsonStr.substring(0, 24)}`,
+          new Date().toLocaleTimeString() + ' ✓', true)
       }
 
       if (!isCachedBridgeState && deviceId === this.activeDeviceId &&
@@ -5139,8 +5299,7 @@ struct Index {
         this.handleDecryptFailure(deviceId, source)
       }
       if (deviceId === this.activeDeviceId) {
-        this.cryptoLastDecrypted = '解密失败: ' + message
-        this.cryptoDebugText = `${source}解密失败 ${message}`
+        this.updateCryptoPacketDiagnostics(`${source}解密失败 ${message}`, '解密失败: ' + message)
       }
       this.addMqttMessage(topic, `[err] ${source} ${payloadBase64.length}B64 decrypt fail ${message}`)
     }
@@ -5540,7 +5699,7 @@ struct Index {
     if (encrypted?.enabled === true && encrypted.payloadBase64 && encrypted.timestamp &&
       encrypted.timestamp > this.lastEncryptedTimestamp) {
       this.lastEncryptedTimestamp = encrypted.timestamp
-      this.cryptoDebugText = `BridgeTLS缓存包 ${encrypted.payloadBase64.length}B64`
+      this.updateCryptoPacketDiagnostics(`BridgeTLS缓存包 ${encrypted.payloadBase64.length}B64`)
       const cachedTopic = encrypted.topic ?? 'esp32/sensor'
       const cachedDeviceId = this.registerDeviceId(this.deviceIdFromScopedTopic(cachedTopic))
       if (this.keyExchange.isKeyExchangeTopic(cachedTopic)) {
@@ -11772,7 +11931,7 @@ struct Index {
     if (this.provisioningLogFlushTimerId === -1) {
       this.provisioningLogFlushTimerId = setTimeout(() => {
         this.flushProvisioningEsp32Log()
-      }, 50)
+      }, PROVISIONING_LOG_UI_INTERVAL_MS)
     }
   }
 
@@ -11781,11 +11940,22 @@ struct Index {
     if (this.pendingProvisioningFrameLogs.length === 0) {
       return
     }
-    const scrollOffset = this.captureDebugInfoScrollOffset()
-    const next = [...this.provisioningFrameLog, ...this.pendingProvisioningFrameLogs]
+    const next = [...this.provisioningFrameLogBuffer, ...this.pendingProvisioningFrameLogs]
     this.pendingProvisioningFrameLogs = []
-    this.provisioningFrameLog = next.slice(-200)
-    this.restoreDebugInfoScrollPosition(scrollOffset)
+    this.provisioningFrameLogBuffer = next.slice(-200)
+    if (this.showProvisioningOutputPanel) {
+      this.provisioningFrameLog = this.provisioningFrameLogBuffer.slice()
+    }
+  }
+
+  openProvisioningOutputPanel(): void {
+    if (this.provisioningLogFlushTimerId !== -1) {
+      clearTimeout(this.provisioningLogFlushTimerId)
+      this.provisioningLogFlushTimerId = -1
+    }
+    this.flushProvisioningEsp32Log()
+    this.provisioningFrameLog = this.provisioningFrameLogBuffer.slice()
+    this.showProvisioningOutputPanel = true
   }
 
   private captureDebugInfoScrollOffset(): number {
@@ -11827,6 +11997,7 @@ struct Index {
       this.provisioningLogFlushTimerId = -1
     }
     this.pendingProvisioningFrameLogs = []
+    this.provisioningFrameLogBuffer = []
     this.provisioningFrameLog = []
   }
 
@@ -11857,6 +12028,7 @@ struct Index {
       this.debugPanelTapCount = 0
       this.debugShowAllDevices = false
       this.mqttMessages = this.mqttMessageBuffer.slice()
+      this.syncCryptoPacketDiagnostics()
       this.showDebugPanel = true
       setTimeout(() => {
         if (this.showDebugPanel) {
@@ -11926,11 +12098,7 @@ struct Index {
       return
     }
     if (action === 'ir') {
-      // Force a fresh panel instance so a stale invisible overlay cannot swallow the next open.
-      this.showIrLearnPanel = false
-      setTimeout(() => {
-        this.openIrLearnPanel()
-      }, 16)
+      this.openIrLearnPanel()
       return
     }
     if (action === 'voiceprint') {
@@ -12616,6 +12784,63 @@ struct Index {
     })
   }
 
+  private dismissTransientPanelsForNavigation(): void {
+    if (this.showVoiceprintPanel) {
+      this.closeVoiceprintManager()
+    }
+    if (this.showIrLearnPanel) {
+      this.exitIrLearning(true).catch((err: Error) => {
+        console.info(`[IR][navigation-exit-fail] ${err.message}`)
+        this.showIrLearnPanel = false
+      })
+    }
+    if (this.showProvisioningPanel) {
+      this.closeProvisioningPanel()
+    }
+    if (this.showFaceEnrollPanel) {
+      this.stopFacePreview().catch((err: Error) => {
+        console.info(`[FaceAccess][navigation-stop-fail] ${err.message}`)
+      })
+    }
+    if (this.showFaceEnrollPanel) {
+      this.showFaceEnrollPanel = false
+    }
+    if (this.showAcControlPanel) {
+      this.showAcControlPanel = false
+    }
+    if (this.showDeviceBindingPanel) {
+      this.showDeviceBindingPanel = false
+    }
+    if (this.showDeviceStatusPanel) {
+      this.showDeviceStatusPanel = false
+    }
+    if (this.showModelComparisonPanel) {
+      this.showModelComparisonPanel = false
+    }
+    if (this.showProvisioningOutputPanel) {
+      this.showProvisioningOutputPanel = false
+    }
+    if (this.showBleRemoveConfirm) {
+      this.showBleRemoveConfirm = false
+    }
+    if (this.showDebugPanel) {
+      this.showDebugPanel = false
+    }
+  }
+
+  private navigateTo(key: string): void {
+    if (this.activeNav === key) {
+      return
+    }
+    if (this.hasVisibleTransientPanel()) {
+      this.dismissTransientPanelsForNavigation()
+    }
+    this.activeNav = key
+    if (key === 'overview') {
+      this.lastVoiceWaveformUiAt = 0
+    }
+  }
+
   @Builder
   NavItem(key: string, label: string, icon: Resource) {
     Column() {
@@ -12643,7 +12868,7 @@ struct Index {
     .shadow({ radius: this.activeNav === key ? 12 : 0, color: this.activeNav === key ? this.accentGlowColor() : '#00000000', offsetY: 3 })
     .margin({ bottom: 10 })
     .onClick(() => {
-      this.activeNav = key
+      this.navigateTo(key)
     })
   }
 
@@ -13665,7 +13890,7 @@ struct Index {
         .borderRadius(18)
         .margin({ top: 10 })
         .onClick(() => {
-          this.showProvisioningOutputPanel = true
+          this.openProvisioningOutputPanel()
         })
     }
     .width('100%')
@@ -16859,7 +17084,7 @@ struct Index {
               .border({ width: 1, color: this.hairlineColor() })
               .borderRadius(8)
               .onClick(() => {
-                this.showProvisioningOutputPanel = true
+                this.openProvisioningOutputPanel()
               })
             Text('点击“自动探测”，进入配网模式之后点击“发送配置”，上方状态显示收到之后点击“保存重启”，完成设备接入')
               .fontSize(11)
@@ -17786,83 +18011,20 @@ struct Index {
     Stack() {
       this.MainShell()
 
-      if (this.showFaceEnrollPanel) {
+      if (this.showCriticalDialog) {
         Stack({ alignContent: Alignment.Center }) {
-          Stack({ alignContent: Alignment.Center }) {
-            this.FaceEnrollPanel()
-          }
-          .width(810)
-          .height(410)
+          CriticalDialogPanel({
+            alarmDialogTarget: this.alarmDialogTarget,
+            alarmAckText: this.alarmAckText,
+            alarmClearPending: this.alarmClearPending,
+            onCancel: () => { this.showCriticalDialog = false },
+            onConfirm: () => { this.requestAlarmClear().catch((err: Error) => { console.info(`[ALARM][off-ui-fail] ${err.message}`) }) }
+          })
         }
         .width('100%')
         .height('100%')
-        .backgroundColor('rgba(32, 36, 42, 0.52)')
-      }
-
-      if (this.showAcControlPanel) {
-        Stack({ alignContent: Alignment.Center }) {
-          this.OverviewAcPanel()
-        }
-        .width('100%')
-        .height('100%')
-        .backgroundColor('rgba(32, 36, 42, 0.52)')
-      }
-
-      if (this.showVoiceprintPanel) {
-        Stack({ alignContent: Alignment.Center }) {
-          this.VoiceprintPanel()
-        }
-        .width('100%')
-        .height('100%')
-        .backgroundColor('rgba(32, 36, 42, 0.58)')
-      }
-
-      if (this.showDeviceBindingPanel) {
-        Stack({ alignContent: Alignment.Center }) {
-          this.DeviceBindingPanel()
-        }
-        .width('100%')
-        .height('100%')
-        .backgroundColor('rgba(32, 36, 42, 0.58)')
-      }
-
-      if (this.showDeviceStatusPanel) {
-        Stack({ alignContent: Alignment.Center }) {
-          this.DeviceStatusPanel()
-        }
-        .width('100%')
-        .height('100%')
-        .backgroundColor('rgba(32, 36, 42, 0.58)')
-      }
-
-      if (this.showModelComparisonPanel) {
-        Stack({ alignContent: Alignment.Center }) {
-          this.ModelComparisonPanel()
-        }
-        .width('100%')
-        .height('100%')
-        .backgroundColor('rgba(32, 36, 42, 0.64)')
-      }
-
-      if (this.showProvisioningPanel) {
-        Stack({ alignContent: Alignment.Center }) {
-          this.ProvisioningPanel()
-        }
-        .width('100%')
-        .height('100%')
-        .backgroundColor('rgba(32, 36, 42, 0.52)')
-      }
-
-      if (this.showBleRemoveConfirm) {
-        Stack({ alignContent: Alignment.Center }) {
-          this.BleRemoveConfirmPanel()
-        }
-        .width('100%')
-        .height('100%')
-        .backgroundColor('rgba(32, 36, 42, 0.68)')
-      }
-
-      if (this.showProvisioningOutputPanel) {
+        .backgroundColor('rgba(94, 34, 42, 0.34)')
+      } else if (this.showProvisioningOutputPanel) {
         Stack({ alignContent: Alignment.Center }) {
           ProvisioningOutputView({
             frameLog: this.provisioningFrameLog,
@@ -17879,39 +18041,80 @@ struct Index {
         .width('100%')
         .height('100%')
         .backgroundColor('rgba(32, 36, 42, 0.68)')
-      }
-
-      if (this.showIrLearnPanel) {
+      } else if (this.showBleRemoveConfirm) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.BleRemoveConfirmPanel()
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.68)')
+      } else if (this.showModelComparisonPanel) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.ModelComparisonPanel()
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.64)')
+      } else if (this.showFaceEnrollPanel) {
+        Stack({ alignContent: Alignment.Center }) {
+          Stack({ alignContent: Alignment.Center }) {
+            this.FaceEnrollPanel()
+          }
+          .width(810)
+          .height(410)
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.52)')
+      } else if (this.showAcControlPanel) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.OverviewAcPanel()
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.52)')
+      } else if (this.showVoiceprintPanel) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.VoiceprintPanel()
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.58)')
+      } else if (this.showDeviceBindingPanel) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.DeviceBindingPanel()
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.58)')
+      } else if (this.showDeviceStatusPanel) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.DeviceStatusPanel()
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.58)')
+      } else if (this.showProvisioningPanel) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.ProvisioningPanel()
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.52)')
+      } else if (this.showIrLearnPanel) {
         Stack({ alignContent: Alignment.Center }) {
           this.IrLearningPanel()
         }
         .width('100%')
         .height('100%')
         .backgroundColor('rgba(32, 36, 42, 0.58)')
-      }
-
-      if (this.showDebugPanel) {
+      } else if (this.showDebugPanel) {
         Stack({ alignContent: Alignment.Center }) {
           this.DebugInfoPanel()
         }
         .width('100%')
         .height('100%')
         .backgroundColor('rgba(32, 36, 42, 0.52)')
-      }
-
-      if (this.showCriticalDialog) {
-        Stack({ alignContent: Alignment.Center }) {
-          CriticalDialogPanel({
-            alarmDialogTarget: this.alarmDialogTarget,
-            alarmAckText: this.alarmAckText,
-            alarmClearPending: this.alarmClearPending,
-            onCancel: () => { this.showCriticalDialog = false },
-            onConfirm: () => { this.requestAlarmClear().catch((err: Error) => { console.info(`[ALARM][off-ui-fail] ${err.message}`) }) }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .backgroundColor('rgba(94, 34, 42, 0.34)')
       }
 
     }

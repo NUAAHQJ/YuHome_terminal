@@ -17,8 +17,11 @@ const SERIAL_NONE: number = -1
 const WCH_VENDOR_ID: number = 0x1A86
 const CP210X_VENDOR_ID: number = 0x10C4
 const READ_TIMEOUT_MS: number = 250
-const USB_READ_TIMEOUT_MS: number = 1000
-const USB_READ_RETRY_DELAY_MS: number = 250
+// A pending USB IN transfer completes immediately when data arrives. A longer
+// idle timeout avoids waking ArkTS and the USB service every second while the
+// BLE gateway is connected but quiet, without adding receive latency.
+const USB_READ_TIMEOUT_MS: number = 5000
+const USB_READ_RETRY_DELAY_MS: number = 500
 const USB_READ_BUFFER_SIZE: number = 1024
 const READ_ACTIVE_DELAY_MS: number = 0
 // 分级空闲退避：刚空闲时保持较快轮询以压低首字节延迟，
