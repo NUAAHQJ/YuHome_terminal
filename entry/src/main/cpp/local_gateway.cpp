@@ -49,7 +49,9 @@ namespace {
 
 constexpr size_t MAX_REQUEST_BYTES = 256 * 1024;
 constexpr size_t MAX_COMMANDS_PER_DEVICE = 20;
+constexpr size_t MAX_HTTPS_KEEP_ALIVE_REQUESTS = 128;
 constexpr int64_t PROTOCOL_COMMAND_TTL_MS = 10 * 1000;
+constexpr int64_t CONTROL_COMMAND_TTL_MS = 30 * 1000;
 
 int64_t NowMs()
 {
@@ -177,6 +179,7 @@ struct GatewayCommand {
     std::string id;
     std::string topic;
     std::string payloadBase64;
+    std::string queueKey;
     int32_t bytes = 0;
     int64_t timestamp = 0;
 };
@@ -338,27 +341,51 @@ public:
     }
 
     std::string Enqueue(const std::string &deviceId, const std::string &topic,
-        const std::string &payloadBase64, int32_t bytes)
+        const std::string &payloadBase64, int32_t bytes, const std::string &queueKey = "")
     {
         GatewayCommand command;
         command.timestamp = NowMs();
         command.id = std::to_string(command.timestamp) + "-" + std::to_string(++commandSequence_);
         command.topic = topic;
         command.payloadBase64 = payloadBase64;
+        command.queueKey = queueKey;
         command.bytes = bytes;
         std::lock_guard<std::mutex> lock(mutex_);
         auto &queue = commands_[deviceId];
-        if (bytes >= 64 && bytes <= 69) {
+        if (!queueKey.empty()) {
+            for (auto it = queue.begin(); it != queue.end();) {
+                it = it->queueKey == queueKey ? queue.erase(it) : std::next(it);
+            }
+        } else if (bytes >= 64 && bytes <= 69) {
             for (auto it = queue.begin(); it != queue.end();) {
                 it = it->bytes >= 64 && it->bytes <= 69 ? queue.erase(it) : std::next(it);
             }
         }
         const std::string commandId = command.id;
-        queue.push_back(std::move(command));
+        // Protocol changes must be consumed before stale ECDH/status traffic.
+        // Each device has its own queue, so this does not reorder commands for
+        // the other ESP32.
+        if (queueKey == "proto" || queueKey == "crypto") {
+            queue.push_front(std::move(command));
+        } else {
+            queue.push_back(std::move(command));
+        }
         while (queue.size() > MAX_COMMANDS_PER_DEVICE) {
             queue.pop_front();
         }
         return commandId;
+    }
+
+    size_t ClearCommands(const std::string &deviceId)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = commands_.find(deviceId);
+        if (found == commands_.end()) {
+            return 0;
+        }
+        const size_t cleared = found->second.size();
+        commands_.erase(found);
+        return cleared;
     }
 
     std::vector<GatewayEvent> DrainEvents()
@@ -448,40 +475,65 @@ private:
             }
         }
         handshakeLock.unlock();
-        std::string request;
+        std::string pending;
         unsigned char buffer[4096];
-        size_t expectedBytes = 0;
-        while (request.size() < MAX_REQUEST_BYTES) {
-            result = mbedtls_ssl_read(&ssl, buffer, sizeof(buffer));
-            if (result == MBEDTLS_ERR_SSL_WANT_READ || result == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                continue;
-            }
-            if (result <= 0) {
-                break;
-            }
-            request.append(reinterpret_cast<const char *>(buffer), static_cast<size_t>(result));
-            const size_t headerEnd = request.find("\r\n\r\n");
-            if (headerEnd != std::string::npos) {
-                if (expectedBytes == 0) {
-                    expectedBytes = headerEnd + 4 + ContentLength(request.substr(0, headerEnd));
-                }
-                if (request.size() >= expectedBytes) {
+        bool connected = true;
+        size_t servedRequests = 0;
+        while (connected && servedRequests < MAX_HTTPS_KEEP_ALIVE_REQUESTS) {
+            std::string request;
+            while (connected && request.empty()) {
+                const size_t headerEnd = pending.find("\r\n\r\n");
+                if (headerEnd != std::string::npos) {
+                    const size_t expectedBytes = headerEnd + 4 + ContentLength(pending.substr(0, headerEnd));
+                    if (expectedBytes > MAX_REQUEST_BYTES) {
+                        connected = false;
+                        break;
+                    }
+                    if (pending.size() >= expectedBytes) {
+                        request.assign(pending.data(), expectedBytes);
+                        pending.erase(0, expectedBytes);
+                        break;
+                    }
+                } else if (pending.size() >= MAX_REQUEST_BYTES) {
+                    connected = false;
                     break;
                 }
+
+                result = mbedtls_ssl_read(&ssl, buffer, sizeof(buffer));
+                if (result == MBEDTLS_ERR_SSL_WANT_READ || result == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                    continue;
+                }
+                if (result <= 0) {
+                    connected = false;
+                    break;
+                }
+                pending.append(reinterpret_cast<const char *>(buffer), static_cast<size_t>(result));
             }
-        }
-        const std::string response = ProxyToLocalHttp(request);
-        size_t sent = 0;
-        while (sent < response.size()) {
-            result = mbedtls_ssl_write(&ssl,
-                reinterpret_cast<const unsigned char *>(response.data() + sent), response.size() - sent);
-            if (result == MBEDTLS_ERR_SSL_WANT_READ || result == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                continue;
-            }
-            if (result <= 0) {
+            if (request.empty()) {
                 break;
             }
-            sent += static_cast<size_t>(result);
+
+            const bool keepAlive = RequestKeepsConnectionAlive(request) &&
+                servedRequests + 1 < MAX_HTTPS_KEEP_ALIVE_REQUESTS;
+            std::string response = ProxyToLocalHttp(request);
+            RewriteConnectionHeader(response, keepAlive);
+            size_t sent = 0;
+            while (sent < response.size()) {
+                result = mbedtls_ssl_write(&ssl,
+                    reinterpret_cast<const unsigned char *>(response.data() + sent), response.size() - sent);
+                if (result == MBEDTLS_ERR_SSL_WANT_READ || result == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                    continue;
+                }
+                if (result <= 0) {
+                    connected = false;
+                    break;
+                }
+                sent += static_cast<size_t>(result);
+            }
+            ++servedRequests;
+            if (!keepAlive) {
+                break;
+            }
         }
         mbedtls_ssl_close_notify(&ssl);
         mbedtls_ssl_free(&ssl);
@@ -603,6 +655,7 @@ private:
             std::string deviceId;
             std::string topic;
             std::string payloadBase64;
+            std::string queueKey;
             if (root == nullptr || !ReadJsonString(root, "deviceId", deviceId) ||
                 !ReadJsonString(root, "topic", topic) || !ReadJsonString(root, "payloadBase64", payloadBase64) ||
                 !IsValidDeviceId(deviceId) || !TopicMatchesDevice(topic, deviceId) || payloadBase64.empty()) {
@@ -610,9 +663,10 @@ private:
                 SendJson(client, 400, "{\"ok\":false,\"message\":\"invalid command payload\"}");
                 return;
             }
+            ReadJsonString(root, "queueKey", queueKey);
             const int32_t bytes = Base64DecodedBytes(payloadBase64);
             cJSON_Delete(root);
-            const std::string commandId = Enqueue(deviceId, topic, payloadBase64, bytes);
+            const std::string commandId = Enqueue(deviceId, topic, payloadBase64, bytes, queueKey);
             std::ostringstream json;
             json << "{\"ok\":true,\"deviceId\":\"" << JsonEscape(deviceId)
                  << "\",\"topic\":\"" << JsonEscape(topic)
@@ -648,6 +702,60 @@ private:
             ++at;
         }
         return static_cast<size_t>(std::strtoul(headers.c_str() + at, nullptr, 10));
+    }
+
+    static std::string AsciiLower(std::string value)
+    {
+        for (char &ch : value) {
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch - 'A' + 'a');
+            }
+        }
+        return value;
+    }
+
+    static bool RequestKeepsConnectionAlive(const std::string &request)
+    {
+        const size_t firstLineEnd = request.find("\r\n");
+        const size_t headerEnd = request.find("\r\n\r\n");
+        if (firstLineEnd == std::string::npos || headerEnd == std::string::npos) {
+            return false;
+        }
+        const std::string firstLine = request.substr(0, firstLineEnd);
+        const std::string headers = AsciiLower(request.substr(firstLineEnd + 2,
+            headerEnd - firstLineEnd - 2));
+        if (headers.find("connection: close") != std::string::npos) {
+            return false;
+        }
+        if (firstLine.find("HTTP/1.0") != std::string::npos) {
+            return headers.find("connection: keep-alive") != std::string::npos;
+        }
+        return true;
+    }
+
+    static void RewriteConnectionHeader(std::string &response, bool keepAlive)
+    {
+        const size_t headerEnd = response.find("\r\n\r\n");
+        if (headerEnd == std::string::npos) {
+            return;
+        }
+        const std::string connectionLine = keepAlive ? "Connection: keep-alive" : "Connection: close";
+        const std::string lowerHeaders = AsciiLower(response.substr(0, headerEnd));
+        const size_t connectionAt = lowerHeaders.find("\r\nconnection:");
+        if (connectionAt != std::string::npos) {
+            const size_t lineStart = connectionAt + 2;
+            const size_t lineEnd = response.find("\r\n", lineStart);
+            response.replace(lineStart, lineEnd - lineStart, connectionLine);
+        } else {
+            response.insert(headerEnd, "\r\n" + connectionLine);
+        }
+        if (keepAlive) {
+            const size_t updatedHeaderEnd = response.find("\r\n\r\n");
+            const std::string updatedHeaders = AsciiLower(response.substr(0, updatedHeaderEnd));
+            if (updatedHeaders.find("\r\nkeep-alive:") == std::string::npos) {
+                response.insert(updatedHeaderEnd, "\r\nKeep-Alive: timeout=8, max=128");
+            }
+        }
     }
 
     static void SendJson(int client, int status, const std::string &body)
@@ -687,8 +795,18 @@ private:
             return "{\"ok\":true,\"hasCommand\":false,\"deviceId\":\"" +
                 JsonEscape(deviceId) + "\"}";
         }
-        while (!found->second.empty() && found->second.front().bytes >= 64 &&
-            found->second.front().bytes <= 69 && NowMs() - found->second.front().timestamp > PROTOCOL_COMMAND_TTL_MS) {
+        while (!found->second.empty()) {
+            const GatewayCommand &front = found->second.front();
+            const int64_t age = NowMs() - front.timestamp;
+            const bool shortLived = front.queueKey == "ecdh" || front.queueKey == "proto" ||
+                front.queueKey == "crypto" ||
+                (front.queueKey.empty() && front.bytes >= 64 && front.bytes <= 69);
+            const bool stateControl = front.queueKey == "led" || front.queueKey == "door" ||
+                front.queueKey == "ac" || front.queueKey == "curtain" || front.queueKey == "alarm";
+            if ((!shortLived || age <= PROTOCOL_COMMAND_TTL_MS) &&
+                (!stateControl || age <= CONTROL_COMMAND_TTL_MS)) {
+                break;
+            }
             found->second.pop_front();
         }
         if (found->second.empty()) {
@@ -871,8 +989,8 @@ napi_value StartHttps(napi_env env, napi_callback_info info)
 
 napi_value EnqueueCommand(napi_env env, napi_callback_info info)
 {
-    size_t argc = 4;
-    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    size_t argc = 5;
+    napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 4) {
         napi_throw_type_error(env, nullptr, "Expected deviceId, topic, payloadBase64 and bytes");
@@ -880,10 +998,29 @@ napi_value EnqueueCommand(napi_env env, napi_callback_info info)
     }
     int32_t bytes = 0;
     napi_get_value_int32(env, argv[3], &bytes);
+    std::string queueKey;
+    if (argc > 4) {
+        queueKey = ReadString(env, argv[4]);
+    }
     LocalGateway::Instance().Enqueue(ReadString(env, argv[0]), ReadString(env, argv[1]),
-        ReadString(env, argv[2]), bytes);
+        ReadString(env, argv[2]), bytes, queueKey);
     napi_value result = nullptr;
     napi_get_boolean(env, true, &result);
+    return result;
+}
+
+napi_value ClearCommands(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        napi_throw_type_error(env, nullptr, "Expected deviceId");
+        return nullptr;
+    }
+    const size_t cleared = LocalGateway::Instance().ClearCommands(ReadString(env, argv[0]));
+    napi_value result = nullptr;
+    napi_create_int32(env, static_cast<int32_t>(cleared), &result);
     return result;
 }
 
@@ -951,6 +1088,7 @@ napi_value Init(napi_env env, napi_value exports)
         {"stop", nullptr, Stop, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getStatus", nullptr, GetStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"enqueueCommand", nullptr, EnqueueCommand, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"clearCommands", nullptr, ClearCommands, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"pollEvents", nullptr, PollEvents, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"usbControlLineState", nullptr, UsbControlLineState, nullptr, nullptr, nullptr, napi_default, nullptr}
     };

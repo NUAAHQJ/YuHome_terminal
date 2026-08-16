@@ -26,7 +26,8 @@ declare module 'liblocal_gateway.so' {
     startHttps(port: number, certificatePem: string, privateKeyPem: string): LocalGatewayStartResult
     stop(): boolean
     getStatus(): LocalGatewayStatus
-    enqueueCommand(deviceId: string, topic: string, payloadBase64: string, bytes: number): boolean
+    enqueueCommand(deviceId: string, topic: string, payloadBase64: string, bytes: number, queueKey?: string): boolean
+    clearCommands(deviceId: string): number
     pollEvents(): LocalGatewayEvent[]
     usbControlLineState(fileDescriptor: number, interfaceId: number, asserted: boolean): number
   }

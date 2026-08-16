@@ -4,7 +4,7 @@ import wifiManager from '@ohos.wifiManager'
 import preferences from '@ohos.data.preferences'
 import { common } from '@kit.AbilityKit'
 import { util } from '@kit.ArkTS'
-import { CryptoDecryptResult, clearDeviceDynamicCryptoKeys, clearDynamicCryptoKeys, decryptWithExpectedMode, decryptWithExpectedModeForDevice, decryptWithMode, decryptWithProvidedKey, decryptWithStaticExpectedMode, encryptWithMode, encryptWithModeForDevice, getDeviceDynamicAesKey, getDeviceDynamicSm4Key, getDynamicAesKey, getDynamicSm4Key, looksEncrypted, selfTest, currentCryptoMode, setCryptoMode, setDeviceDynamicCryptoKeys, setDynamicCryptoKeys } from '../crypto/CryptoLayer'
+import { CryptoDecryptResult, clearDeviceDynamicCryptoKeys, clearDynamicCryptoKeys, decryptWithExpectedModeForDevice, decryptWithMode, decryptWithProvidedKey, decryptWithStaticExpectedMode, encryptWithMode, encryptWithModeForDevice, getDeviceDynamicAesKey, getDeviceDynamicSm4Key, getDynamicAesKey, getDynamicSm4Key, looksEncrypted, selfTest, currentCryptoMode, setCryptoMode, setDeviceDynamicCryptoKeys, setDynamicCryptoKeys } from '../crypto/CryptoLayer'
 import { MqttClient } from '../mqtt/MqttClient'
 import { ensureTlsCaFile } from '../mqtt/TlsIdentityFiles'
 import { BridgeTlsClient, BridgeTlsJson } from '../bridge/BridgeTlsClient'
@@ -51,8 +51,15 @@ const GATEWAY_REBOOT_CLOSE_DELAY_MS: number = 900
 const BLE_BUSINESS_START_TIMEOUT_MS: number = 120000
 const NETWORK_FAILOVER_START_GRACE_MS: number = 30000
 const NETWORK_STATIC_PACKET_AFTER_ECDH_GRACE_MS: number = 10000
+const NETWORK_ECDH_PENDING_MAX_AGE_MS: number = 8000
+const NETWORK_ECDH_RETRY_COOLDOWN_MS: number = 3000
 const BLE_CRYPTO_SWITCH_TIMEOUT_MS: number = 12000
+const NETWORK_CRYPTO_SWITCH_TIMEOUT_MS: number = 8000
+const NETWORK_CRYPTO_SWITCH_MAX_RETRIES: number = 1
+const NETWORK_PROTOCOL_SWITCH_TIMEOUT_MS: number = 8000
+const NETWORK_PROTOCOL_SWITCH_MAX_RETRIES: number = 1
 const LIGHT_CONTROL_ACK_TIMEOUT_MS: number = 12000
+const AC_CONTROL_ACK_TIMEOUT_HTTP_MS: number = 25000
 const NETWORK_CRYPTO_READY_WAIT_MS: number = 15000
 const IR_COMMAND_ACK_TIMEOUT_MS: number = 8000
 const IR_LEARN_STEP_ACK_TIMEOUT_MS: number = 25000
@@ -733,6 +740,9 @@ struct Index {
   private networkCommandFailureCount: number = 0
   private networkCryptoValidationRequiredAt: number = Date.now()
   private networkCryptoRecoveryDevices: Set<string> = new Set()
+  private networkResumePendingDevices: Set<string> = new Set()
+  private lastNetworkEcdhStartAtByDevice: Map<string, number> = new Map()
+  private networkCryptoResetAtByDevice: Map<string, number> = new Map()
 
   private timerId: number = -1
   private pollTimerId: number = -1
@@ -759,6 +769,7 @@ struct Index {
   private voiceAssistant: VoiceAssistant = new VoiceAssistant()
   private speakerProfiles: SpeakerProfileManager = new SpeakerProfileManager()
   private localGateway: LocalGatewayService = new LocalGatewayService()
+  private localGatewayEventChain: Promise<void> = Promise.resolve()
   private lastEncryptedTimestamp: number = 0
   private lastHttpSensorTimestamp: number = 0
   private lastSuccessfulDecryptAt: number = 0
@@ -793,9 +804,17 @@ struct Index {
   private cryptoModeAutoCorrectHoldUntil: number = 0
   private cryptoSwitchSeq: number = 0
   private cryptoPendingSeq: number = 0
+  private cryptoSwitchTargets: string[] = []
+  private cryptoSwitchAckDevices: Set<string> = new Set()
+  private cryptoSwitchFromModes: Map<string, string> = new Map()
+  private cryptoSwitchRetryCount: number = 0
   private protocolSwitchTimerId: number = -1
   private protocolSwitchSeq: number = 0
   private protocolPendingSeq: number = 0
+  private protocolSwitchTargets: string[] = []
+  private protocolSwitchAckDevices: Set<string> = new Set()
+  private protocolSwitchFromModes: Map<string, string> = new Map()
+  private protocolSwitchRetryCount: number = 0
   private ledCommandSeq: number = 0
   private ledPendingSeq: number = 0
   private suppressLivingLightChange: boolean = false
@@ -853,7 +872,7 @@ struct Index {
   @State faceEnrollBusy: boolean = false
   @State faceIdentifyBusy: boolean = false
   @State showVoiceprintPanel: boolean = false
-  @State showDeviceStatusPanel: boolean = false
+  @State showFederatedLearningPanel: boolean = false
   @State voiceprintUsers: SpeakerProfile[] = []
   @State voiceprintProtectionEnabled: boolean = false
   @State voiceprintModelReady: boolean = false
@@ -935,6 +954,8 @@ struct Index {
   private gatewayBleReconnectTimerId: number = -1
   private gatewayBleSuspendPendingSeq: number = -1
   private postProvisionBleRecoverySeq: number = 0
+  private bleProvisionAwaitingDeviceId: string = ''
+  private bleProvisionWifiReady: boolean = false
   private gatewayBleCandidateAddresses: string[] = []
   private gatewayBleControlSeq: number = 0
   private bleProvisionCommandSeq: number = 0
@@ -1018,7 +1039,7 @@ struct Index {
     this.federatedCollector.start((): FederatedObservation => this.buildFederatedObservation(),
       (observation: FederatedObservation): void => this.handleBehaviorObservation(observation))
     const gatewayStart = this.localGateway.start(3000, (event: LocalGatewayEvent): void => {
-      this.handleLocalGatewayEvent(event)
+      this.enqueueLocalGatewayEvent(event)
     })
     console.info(`[LocalGateway] start ok=${gatewayStart.ok} port=${gatewayStart.port} ${gatewayStart.message}`)
     this.setupLocalMqtt()
@@ -1148,10 +1169,7 @@ struct Index {
     this.provisioningPort.close().catch((err: Error) => {
       console.info(`[Provisioning][close-fail] ${err.message}`)
     })
-    if (this.cryptoSwitchTimerId !== -1) {
-      clearTimeout(this.cryptoSwitchTimerId)
-      this.cryptoSwitchTimerId = -1
-    }
+    this.clearCryptoSwitchContext()
     if (this.protocolSwitchTimerId !== -1) {
       clearTimeout(this.protocolSwitchTimerId)
       this.protocolSwitchTimerId = -1
@@ -1250,7 +1268,7 @@ struct Index {
 
   private hasVisibleTransientPanel(): boolean {
     return this.showFaceEnrollPanel || this.showAcControlPanel || this.showVoiceprintPanel ||
-      this.showDeviceBindingPanel || this.showDeviceStatusPanel || this.showModelComparisonPanel ||
+      this.showDeviceBindingPanel || this.showFederatedLearningPanel || this.showModelComparisonPanel ||
       this.showProvisioningPanel || this.showBleRemoveConfirm || this.showProvisioningOutputPanel ||
       this.showIrLearnPanel || this.showDebugPanel || this.showCriticalDialog
   }
@@ -1472,7 +1490,16 @@ struct Index {
     return bridgeUrl
   }
 
-  handleLocalGatewayEvent(event: LocalGatewayEvent): void {
+  enqueueLocalGatewayEvent(event: LocalGatewayEvent): void {
+    const nextChain = this.localGatewayEventChain.then(async (): Promise<void> => {
+      await this.handleLocalGatewayEvent(event)
+    }).catch((err: Error): void => {
+      console.info(`[LocalGateway][HTTP-QUEUE] ${err.message}`)
+    })
+    this.localGatewayEventChain = nextChain
+  }
+
+  async handleLocalGatewayEvent(event: LocalGatewayEvent): Promise<void> {
     if (event.type !== 'http_sensor' || event.body.length === 0) {
       return
     }
@@ -1493,7 +1520,7 @@ struct Index {
       this.observeDeviceTransport(deviceId, 'HTTP_SENSOR')
       const raw = this.base64ToUint8Array(payloadBase64)
       if (this.keyExchange.isKeyExchangeTopic(topic)) {
-        this.handleEcdhPublicKey(topic, raw, event.timestamp)
+        await this.handleEcdhPublicKey(topic, raw, event.timestamp)
         return
       }
       if (this.bleBusinessDesired) {
@@ -1503,7 +1530,7 @@ struct Index {
         return
       }
       if (looksEncrypted(raw)) {
-        this.handleEncryptedPayload(payloadBase64, 'HTTP_SENSOR', topic, deviceId, true)
+        await this.handleEncryptedPayload(payloadBase64, 'HTTP_SENSOR', topic, deviceId, true)
         return
       }
       const text = new util.TextDecoder().decodeWithStream(raw)
@@ -1517,15 +1544,11 @@ struct Index {
   }
 
   resetCommunicationModesOnStartup(): void {
-    this.commandTransport = 'MQTT'
-    this.protocolPendingMode = ''
-    this.cryptoPendingMode = ''
-    this.cryptoMode = 'SM4'
-    setCryptoMode('SM4')
+    this.clearProtocolSwitchContext()
+    this.clearCryptoSwitchContext()
     this.bleDebugCryptoMode = 'SM4'
     this.bleBusinessDesired = false
     this.bleBusinessState = 'off'
-    this.bleBusinessStatus = '蓝牙模式已关闭 · 默认 MQTT / SM4'
     this.bleBusinessAutoFailover = false
     this.bleBusinessCryptoPendingMode = ''
     this.bleBusinessAwaitingGatewayReboot = false
@@ -1534,15 +1557,28 @@ struct Index {
     this.localGatewayTransportByDevice.clear()
 
     const registry = this.loadDeviceRegistry()
-    Object.keys(registry).forEach((deviceId: string) => {
-      registry[deviceId].transport = 'mqtt'
-      registry[deviceId].crypto = 'sm4'
-    })
-    if (Object.keys(registry).length > 0) {
-      this.deviceRegistryJson = JSON.stringify(registry)
+    const deviceIds = Object.keys(registry)
+    for (let i = 0; i < deviceIds.length; i += 1) {
+      const deviceId = deviceIds[i]
+      const transport = registry[deviceId].transport.length > 0 ?
+        this.normalizeProtocolMode(registry[deviceId].transport.toUpperCase()) : 'MQTT'
+      this.localGatewayTransportByDevice.set(deviceId, transport)
     }
-    this.cryptoDebugText = '启动默认 MQTT + SM4'
-    console.info('[PROTO][startup-reset] all devices reset to MQTT + SM4')
+    const startupDeviceId = registry[this.activeDeviceId] !== undefined ? this.activeDeviceId :
+      (deviceIds.length > 0 ? deviceIds[0] : this.activeDeviceId)
+    const startupDescriptor = registry[startupDeviceId]
+    const startupTransport = startupDescriptor && startupDescriptor.transport.length > 0 ?
+      this.normalizeProtocolMode(startupDescriptor.transport.toUpperCase()) : 'MQTT'
+    const startupCrypto = startupDescriptor && startupDescriptor.crypto.length > 0 ?
+      this.normalizeCryptoMode(startupDescriptor.crypto.toUpperCase()) : 'SM4'
+    this.commandTransport = startupTransport
+    this.cryptoMode = startupCrypto
+    setCryptoMode(startupCrypto)
+    const protocolSummary = this.networkProtocolSummary()
+    this.bleBusinessStatus = `蓝牙模式已关闭 · 备用 ${protocolSummary} / ${startupCrypto}`
+    this.cryptoDebugText = `启动恢复 ${protocolSummary} + ${startupCrypto}`
+    console.info(`[PROTO][startup-restore] devices=${deviceIds.length} ` +
+      `active=${startupDeviceId} protocol=${protocolSummary} crypto=${startupCrypto}`)
   }
 
   normalizeDeviceId(deviceId: string): string {
@@ -1682,6 +1718,32 @@ struct Index {
       return topic
     }
     return deviceId === 'esp32' ? 'dayu/cmd' : `dayu/cmd/${deviceId}`
+  }
+
+  httpCommandQueueKey(jsonCmd: string): string {
+    try {
+      const data = JSON.parse(jsonCmd) as Record<string, Object>
+      const command = data['cmd'] as string
+      if (command === 'led' || command === 'door' || command === 'ac' ||
+        command === 'curtain' || command === 'alarm' || command === 'proto' ||
+        command === 'crypto') {
+        return command
+      }
+    } catch (_) {
+      // Opaque payloads such as IR data retain FIFO delivery.
+    }
+    return ''
+  }
+
+  clearLocalHttpCommandQueue(deviceId: string, reason: string): void {
+    try {
+      const cleared = this.localGateway.clearCommands(deviceId)
+      if (cleared > 0) {
+        console.info(`[HTTP-QUEUE][clear] device=${deviceId} count=${cleared} reason=${reason}`)
+      }
+    } catch (err) {
+      console.info(`[HTTP-QUEUE][clear-fail] device=${deviceId} reason=${reason} ${(err as Error).message}`)
+    }
   }
 
   deviceForCapability(capability: string): string {
@@ -1845,6 +1907,53 @@ struct Index {
       this.normalizeCryptoMode(descriptor.crypto.toUpperCase()) : this.normalizeCryptoMode(currentCryptoMode())
   }
 
+  networkTargetDeviceIds(): string[] {
+    const registeredIds = Object.keys(this.loadDeviceRegistry())
+    const candidates = registeredIds.length > 0 ? registeredIds : this.knownDeviceIds
+    const targets: string[] = []
+    for (let i = 0; i < candidates.length; i += 1) {
+      const deviceId = this.normalizeDeviceId(candidates[i])
+      if (targets.indexOf(deviceId) < 0) {
+        targets.push(deviceId)
+      }
+    }
+    if (targets.length === 0) {
+      targets.push(this.normalizeDeviceId(this.activeDeviceId))
+    }
+    return targets
+  }
+
+  networkCryptoTargetDeviceIds(): string[] {
+    return this.networkTargetDeviceIds()
+  }
+
+  networkCryptoAllInMode(mode: string): boolean {
+    const target = this.normalizeCryptoMode(mode)
+    return this.networkCryptoTargetDeviceIds().every((deviceId: string) =>
+      this.cryptoModeForDevice(deviceId) === target)
+  }
+
+  networkProtocolAllInMode(mode: string): boolean {
+    const target = this.normalizeProtocolMode(mode)
+    return this.networkTargetDeviceIds().every((deviceId: string) =>
+      this.transportForDevice(deviceId) === target)
+  }
+
+  networkProtocolSummary(): string {
+    if (this.protocolPendingMode.length > 0) {
+      const total = this.protocolSwitchTargets.length
+      const confirmed = this.protocolSwitchAckDevices.size
+      return total > 0 ? `切换 ${confirmed}/${total}` : `切换到 ${this.protocolPendingMode}`
+    }
+    if (this.networkProtocolAllInMode('MQTT')) {
+      return 'MQTT'
+    }
+    if (this.networkProtocolAllInMode('HTTP')) {
+      return 'HTTP'
+    }
+    return 'MQTT / HTTP 混合'
+  }
+
   loadDeviceRegistry(): Record<string, DeviceDescriptor> {
     if (this.deviceRegistryJson.length === 0) {
       return {}
@@ -1927,6 +2036,7 @@ struct Index {
 
   clearDeviceRemoved(deviceId: string): void {
     const normalized = this.normalizeDeviceId(deviceId)
+    this.clearLocalHttpCommandQueue(normalized, 'device-readded')
     const removed = this.loadRemovedDeviceIds()
     if (removed.indexOf(normalized) >= 0) {
       const storedJson = JSON.stringify(removed.filter((item: string): boolean => item !== normalized))
@@ -1964,12 +2074,14 @@ struct Index {
       const existingDescriptor = this.loadDeviceRegistry()[announcedId]
       // device_hello reports the device's observation, but must not overwrite
       // the transport/crypto mode selected and persisted by Dayu.
-      const configuredTransport = existingDescriptor && existingDescriptor.transport.length > 0 ?
-        this.normalizeProtocolMode(existingDescriptor.transport.toUpperCase()) : 'MQTT'
-      const configuredCrypto = existingDescriptor && existingDescriptor.crypto.length > 0 ?
-        this.normalizeCryptoMode(existingDescriptor.crypto.toUpperCase()) : 'SM4'
       const reportedTransport = typeof data['transport'] === 'string' ? data['transport'] as string : ''
       const reportedCrypto = typeof data['crypto'] === 'string' ? data['crypto'] as string : ''
+      const configuredTransport = existingDescriptor && existingDescriptor.transport.length > 0 ?
+        this.normalizeProtocolMode(existingDescriptor.transport.toUpperCase()) :
+        (reportedTransport.length > 0 ? this.normalizeProtocolMode(reportedTransport.toUpperCase()) : this.commandTransport)
+      const configuredCrypto = existingDescriptor && existingDescriptor.crypto.length > 0 ?
+        this.normalizeCryptoMode(existingDescriptor.crypto.toUpperCase()) :
+        (reportedCrypto.length > 0 ? this.normalizeCryptoMode(reportedCrypto.toUpperCase()) : this.normalizeCryptoMode(currentCryptoMode()))
       const descriptor: DeviceDescriptor = {
         deviceId: announcedId,
         name: typeof data['name'] === 'string' ? data['name'] as string : announcedId,
@@ -2035,6 +2147,62 @@ struct Index {
       return descriptor.name.trim()
     }
     return deviceId === 'esp32' ? '兼容设备' : '智能设备'
+  }
+
+  gatewayBleDeviceForId(deviceId: string): GatewayBleDeviceInfo | undefined {
+    const normalized = this.normalizeDeviceId(deviceId)
+    return this.gatewayBleDevices.find((device: GatewayBleDeviceInfo) =>
+      this.normalizeDeviceId(device.deviceId) === normalized)
+  }
+
+  deviceWifiChannelText(deviceId: string): string {
+    const transport = this.transportForDevice(deviceId) === 'HTTP' ? 'HTTP' : 'MQTT'
+    return `${transport} · ${this.cryptoModeForDevice(deviceId)}-GCM`
+  }
+
+  deviceBleChannelText(deviceId: string): string {
+    const device = this.gatewayBleDeviceForId(deviceId)
+    if (device === undefined) {
+      return '未在蓝牙网关登记'
+    }
+    if (device.commissioning || !device.claimed) {
+      return device.connected ? '已连接 · 待完成设备认领' : '待完成设备认领'
+    }
+    if (!device.connected) {
+      return '已绑定 · 当前未连接'
+    }
+    if (!this.bleDebugHasDynamicKey(deviceId)) {
+      return '已连接 · 正在建立安全通道'
+    }
+    return `已连接 · 安全通道就绪 · ${this.bleDebugCryptoMode}-GCM`
+  }
+
+  deviceBleChannelColor(deviceId: string): string {
+    const device = this.gatewayBleDeviceForId(deviceId)
+    if (device === undefined) {
+      return this.subTextColor()
+    }
+    if (device.connected && this.bleDebugHasDynamicKey(deviceId)) {
+      return this.accentGreen()
+    }
+    if (device.connected) {
+      return this.accentOrange()
+    }
+    return this.warningRed()
+  }
+
+  addedBleConnectedCount(): number {
+    return this.deviceBindingIds().filter((deviceId: string) => {
+      const device = this.gatewayBleDeviceForId(deviceId)
+      return device !== undefined && device.connected
+    }).length
+  }
+
+  addedBleSecureCount(): number {
+    return this.deviceBindingIds().filter((deviceId: string) => {
+      const device = this.gatewayBleDeviceForId(deviceId)
+      return device !== undefined && device.connected && this.bleDebugHasDynamicKey(deviceId)
+    }).length
   }
 
   deviceBindingCapabilitiesForId(deviceId: string): string {
@@ -2173,10 +2341,13 @@ struct Index {
         const cachedTopic = bridgeResp.encrypted.topic ?? 'esp32/sensor'
         if (this.keyExchange.isKeyExchangeTopic(cachedTopic)) {
           console.info(`[ECDH] HTTP cached public key topic=${cachedTopic}`)
-          this.handleEcdhPublicKey(cachedTopic, this.base64ToUint8Array(bridgeResp.encrypted.payloadBase64), bridgeResp.encrypted.timestamp)
+          await this.handleEcdhPublicKey(cachedTopic,
+            this.base64ToUint8Array(bridgeResp.encrypted.payloadBase64), bridgeResp.encrypted.timestamp)
         } else if (this.cryptoPendingMode.length > 0 || this.shouldProcessBusinessSource('HTTP')) {
           this.updateCryptoPacketDiagnostics(`HTTP加密包 ${bridgeResp.encrypted.payloadBase64.length}B64`)
-          this.handleEncryptedPayload(bridgeResp.encrypted.payloadBase64, 'HTTP', cachedTopic)
+          const cachedDeviceId = this.registerDeviceId(this.deviceIdFromScopedTopic(cachedTopic))
+          await this.handleEncryptedPayload(
+            bridgeResp.encrypted.payloadBase64, 'HTTP', cachedTopic, cachedDeviceId)
         } else {
           console.info(`[PROTO] ignore HTTP cached packet while active=${this.commandTransport} pending=${this.protocolPendingMode}`)
         }
@@ -2185,7 +2356,8 @@ struct Index {
       const keyExchange = bridgeResp.keyExchange
       if (keyExchange?.pending === true && keyExchange.payloadBase64 && keyExchange.topic) {
         console.info(`[ECDH] HTTP pending public key topic=${keyExchange.topic}`)
-        this.handleEcdhPublicKey(keyExchange.topic, this.base64ToUint8Array(keyExchange.payloadBase64), keyExchange.timestamp ?? Date.now())
+        await this.handleEcdhPublicKey(keyExchange.topic,
+          this.base64ToUint8Array(keyExchange.payloadBase64), keyExchange.timestamp ?? Date.now())
       }
       if (keyExchange?.devices) {
         await this.handleCachedKeyExchangeDevices(keyExchange.devices)
@@ -2267,7 +2439,9 @@ struct Index {
   }
 
   shouldPollHttpBridge(): boolean {
-    return this.commandTransport === 'HTTP' || this.protocolPendingMode === 'HTTP' || this.cryptoPendingMode.length > 0
+    return this.networkTargetDeviceIds().some((deviceId: string) =>
+      this.transportForDevice(deviceId) === 'HTTP') ||
+      this.protocolPendingMode === 'HTTP' || this.cryptoPendingMode.length > 0
   }
 
   async refreshBridgeKeyExchangeState(force: boolean = false): Promise<void> {
@@ -2294,14 +2468,16 @@ struct Index {
       const encrypted = bridgeResp.encrypted
       if (encrypted?.enabled === true && encrypted.payloadBase64 && encrypted.timestamp && encrypted.topic &&
         this.keyExchange.isKeyExchangeTopic(encrypted.topic)) {
-        this.handleEcdhPublicKey(encrypted.topic, this.base64ToUint8Array(encrypted.payloadBase64), encrypted.timestamp)
+        await this.handleEcdhPublicKey(encrypted.topic,
+          this.base64ToUint8Array(encrypted.payloadBase64), encrypted.timestamp)
       }
       const keyExchange = bridgeResp.keyExchange
       if (keyExchange?.pending === true && keyExchange.payloadBase64 && keyExchange.topic) {
-        this.handleEcdhPublicKey(keyExchange.topic, this.base64ToUint8Array(keyExchange.payloadBase64), keyExchange.timestamp ?? Date.now())
+        await this.handleEcdhPublicKey(keyExchange.topic,
+          this.base64ToUint8Array(keyExchange.payloadBase64), keyExchange.timestamp ?? Date.now())
       }
       if (keyExchange?.devices) {
-        this.handleCachedKeyExchangeDevices(keyExchange.devices)
+        await this.handleCachedKeyExchangeDevices(keyExchange.devices)
       }
     } catch (err) {
       this.bridgeLastError = `${baseUrl} ${(err as Error).message}`
@@ -2344,7 +2520,8 @@ struct Index {
     const httpTopic = packet.topic ?? 'esp32/sensor'
     const isStatusTopic = httpTopic === 'esp32/status' || httpTopic.endsWith('/status')
     if (isStatusTopic || this.cryptoPendingMode.length > 0 ||
-      this.transportForDevice(packetDeviceId) === 'HTTP' || this.shouldProcessBusinessSource('HTTP_SENSOR')) {
+      this.transportForDevice(packetDeviceId) === 'HTTP' ||
+      this.shouldProcessBusinessSource('HTTP_SENSOR', packetDeviceId)) {
       const deviceText = packet.deviceId ?? this.deviceIdFromTopic(httpTopic)
       const cryptoText = packet.crypto ?? currentCryptoMode()
       this.updateCryptoPacketDiagnostics(`HTTP_SENSOR ${deviceText}/${cryptoText} ${packet.payloadBase64.length}B64`)
@@ -2379,19 +2556,21 @@ struct Index {
   }
 
   async selectCryptoMode(mode: string): Promise<void> {
+    const target = this.normalizeCryptoMode(mode)
     if (this.bleBusinessDesired) {
-      await this.requestBleBusinessCryptoModeSwitch(mode)
+      await this.requestBleBusinessCryptoModeSwitch(target)
       return
     }
-    if (mode === this.cryptoMode) {
-      this.cryptoDebugText = `当前已是 ${mode}-GCM`
+    if (this.networkCryptoAllInMode(target)) {
+      this.applyCryptoMode(target)
+      this.cryptoDebugText = `全部 WiFi 设备当前已是 ${target}-GCM`
       return
     }
     if (this.cryptoPendingMode.length > 0) {
       this.cryptoDebugText = `正在切换到 ${this.cryptoPendingMode}-GCM`
       return
     }
-    await this.requestCryptoModeSwitch(mode)
+    await this.requestCryptoModeSwitch(target)
   }
 
   normalizeCryptoMode(mode: string): string {
@@ -2464,6 +2643,7 @@ struct Index {
       return
     }
     this.bleBusinessDesired = true
+    this.networkResumePendingDevices.clear()
     // A disconnect-all ACK can arrive after the user has already enabled BLE.
     // Cancel its ownership here; the ACK handler will recover the gateway if
     // the command was already executed on the wire.
@@ -2517,6 +2697,12 @@ struct Index {
     this.gatewayBleReconnectSeq = 0
     this.gatewayBleConnectionEventSeq = 0
     this.bleBusinessCryptoPendingMode = ''
+    this.networkCryptoValidationRequiredAt = Date.now()
+    this.networkResumePendingDevices.clear()
+    this.networkTargetDeviceIds().forEach((deviceId: string) => {
+      this.networkResumePendingDevices.add(deviceId)
+      this.clearLocalHttpCommandQueue(deviceId, 'leave-ble')
+    })
     if (this.provisioningConnected && this.provisioningPort.isOpen()) {
       await this.requestGatewayBleSuspend()
     } else {
@@ -2549,72 +2735,181 @@ struct Index {
     }
   }
 
+  updateBleProvisionCompletion(deviceId: string, networkReady: boolean = false): void {
+    const normalizedDeviceId = this.normalizeDeviceId(deviceId)
+    if (normalizedDeviceId.length === 0 || normalizedDeviceId !== this.bleProvisionAwaitingDeviceId) {
+      return
+    }
+    if (networkReady) {
+      this.bleProvisionWifiReady = true
+    }
+    if (this.bleBusinessDesired) {
+      if (!this.bleDebugHasDynamicKey(normalizedDeviceId)) {
+        this.bleProvisionStatus = '设备配置已保存，正在重建 BLE 安全通道'
+        return
+      }
+      // BLE business mode deliberately suspends network polling. A restored
+      // dynamic key is the authoritative readiness signal in this mode.
+      this.bleProvisionStatus = '设备添加完成 · BLE 安全通道已就绪'
+    } else {
+      if (!this.bleProvisionWifiReady) {
+        return
+      }
+      this.bleProvisionStatus = '设备添加完成 · Wi-Fi 已上线'
+    }
+    this.addProvisioningDiagnosticLog(`${this.bleProvisionStatus} device=${normalizedDeviceId}`)
+    this.bleProvisionAwaitingDeviceId = ''
+    this.bleProvisionWifiReady = false
+  }
+
   markNetworkBusinessHealthy(source: string, deviceId: string): void {
     const protocol = this.protocolFromSource(source)
     if (protocol === 'BLE' || protocol !== this.transportForDevice(deviceId)) {
       return
     }
+    this.updateBleProvisionCompletion(deviceId, true)
     this.networkCommandFailureCount = 0
+    const normalizedDeviceId = this.normalizeDeviceId(deviceId)
+    if (this.networkResumePendingDevices.delete(normalizedDeviceId)) {
+      const remaining = this.networkResumePendingDevices.size
+      console.info(`[BLE-MODE][network-resume] device=${normalizedDeviceId} remaining=${remaining}`)
+      if (remaining === 0 && !this.bleBusinessDesired &&
+        (this.bleBusinessState === 'closing' || this.bleBusinessState === 'network-recovering')) {
+        this.bleBusinessState = 'off'
+        this.bleBusinessStatus = `蓝牙模式已关闭 · 当前 ${this.commandTransport} / ${this.cryptoModeForDevice(this.activeDeviceId)}`
+        this.gatewayBleStatus = 'WiFi 通道已恢复，家居设备可继续网络控制'
+      } else if (!this.bleBusinessDesired && this.bleBusinessState === 'network-recovering') {
+        this.bleBusinessStatus = `正在恢复 WiFi 通道，还差 ${remaining} 台设备`
+      }
+    }
   }
 
-  recoverFromStaticNetworkPayload(deviceId: string, source: string, keySource: string | undefined): void {
-    if (keySource !== 'static' || this.isIrLearningKeyExchangeLocked() ||
-      this.networkCryptoRecoveryDevices.has(deviceId)) {
+  async waitForNetworkResume(deviceId: string): Promise<void> {
+    const normalizedDeviceId = this.normalizeDeviceId(deviceId)
+    if (!this.networkResumePendingDevices.has(normalizedDeviceId)) {
       return
-    }
-    const hasDynamicKeys = getDeviceDynamicAesKey(deviceId) !== null &&
-      getDeviceDynamicSm4Key(deviceId) !== null
-    if (!hasDynamicKeys) {
-      return
-    }
-    const installedAt = this.lastEcdhInstallTimeByDevice.get(deviceId) ?? 0
-    if (installedAt > 0 && Date.now() - installedAt < NETWORK_STATIC_PACKET_AFTER_ECDH_GRACE_MS) {
-      console.info(`[ECDH][static-delayed] ${source} device=${deviceId}; keep newly confirmed dynamic session`)
-      return
-    }
-    this.networkCryptoRecoveryDevices.add(deviceId)
-    console.info(`[ECDH][static-observed] ${source} device=${deviceId}; replacing stale dynamic session`)
-    this.switchDeviceToStaticCryptoSession(deviceId, `static-observed-${source}`,
-      this.cryptoModeForDevice(deviceId))
-    this.startKeyExchange(deviceId, `static-observed-${source}`).catch((err: Error) => {
-      console.info(`[ECDH][static-observed-fail] ${source} device=${deviceId} ${err.message}`)
-    }).finally(() => {
-      this.networkCryptoRecoveryDevices.delete(deviceId)
-    })
-  }
-
-  async waitForNetworkCryptoSession(deviceId: string): Promise<void> {
-    const requiredAt = this.networkCryptoValidationRequiredAt
-    const successfulAt = this.lastDynamicDecryptAtByDevice.get(deviceId) ?? 0
-    const installedAt = this.lastEcdhInstallTimeByDevice.get(deviceId) ?? 0
-    if (successfulAt >= requiredAt || installedAt >= requiredAt) {
-      return
-    }
-    let hasPendingKey = this.keyExchange.getPendingKeys(deviceId) !== null
-    if (!hasPendingKey && !this.networkCryptoRecoveryDevices.has(deviceId)) {
-      this.networkCryptoRecoveryDevices.add(deviceId)
-      this.switchDeviceToStaticCryptoSession(deviceId, 'command-session-validation',
-        this.cryptoModeForDevice(deviceId))
-      this.startKeyExchange(deviceId, 'command-session-validation').catch((err: Error) => {
-        console.info(`[CMD][CRYPTO] active ECDH failed device=${deviceId} ${err.message}`)
-      }).finally(() => {
-        this.networkCryptoRecoveryDevices.delete(deviceId)
-      })
-      hasPendingKey = true
     }
     const startedAt = Date.now()
-    this.cryptoDebugText = `等待 WiFi 密钥确认 ${deviceId}`
-    console.info(`[CMD][CRYPTO] wait for verified Wi-Fi session device=${deviceId}`)
+    this.cryptoDebugText = `等待 WiFi 通道恢复 ${normalizedDeviceId}`
     while (Date.now() - startedAt < NETWORK_CRYPTO_READY_WAIT_MS) {
-      const nextSuccessfulAt = this.lastDynamicDecryptAtByDevice.get(deviceId) ?? 0
-      const nextInstalledAt = this.lastEcdhInstallTimeByDevice.get(deviceId) ?? 0
-      if (nextSuccessfulAt >= requiredAt || nextInstalledAt >= requiredAt) {
-        console.info(`[CMD][CRYPTO] Wi-Fi session ready device=${deviceId} waited=${Date.now() - startedAt}ms`)
+      if (!this.networkResumePendingDevices.has(normalizedDeviceId)) {
+        console.info(`[BLE-MODE][network-resume-ready] device=${normalizedDeviceId} waited=${Date.now() - startedAt}ms`)
         return
       }
       await new Promise<void>((resolve: () => void) => setTimeout(resolve, 100))
     }
-    throw new Error(`WiFi 密钥协商未完成：${deviceId}`)
+    throw new Error(`WiFi 通道尚未恢复：${normalizedDeviceId}`)
+  }
+
+  hasFreshNetworkEcdhPending(deviceId: string, now: number = Date.now()): boolean {
+    if (this.keyExchange.getPendingKeys(deviceId) === null) {
+      return false
+    }
+    const pendingAt = this.lastEcdhPendingTimeByDevice.get(deviceId) ?? 0
+    return pendingAt > 0 && now - pendingAt < NETWORK_ECDH_PENDING_MAX_AGE_MS
+  }
+
+  clearExpiredNetworkEcdhPending(deviceId: string, source: string,
+    now: number = Date.now()): boolean {
+    if (this.keyExchange.getPendingKeys(deviceId) === null) {
+      return false
+    }
+    const pendingAt = this.lastEcdhPendingTimeByDevice.get(deviceId) ?? 0
+    if (pendingAt > 0 && now - pendingAt < NETWORK_ECDH_PENDING_MAX_AGE_MS) {
+      return false
+    }
+    const ageText = pendingAt > 0 ? `${now - pendingAt}ms` : 'unknown'
+    console.info(`[ECDH][pending-expired] device=${deviceId} source=${source} age=${ageText}`)
+    this.switchDeviceToStaticCryptoSession(deviceId, `pending-expired-${source}`,
+      this.cryptoModeForDevice(deviceId))
+    this.lastNetworkEcdhStartAtByDevice.delete(deviceId)
+    return true
+  }
+
+  startNetworkEcdhRecovery(deviceId: string, source: string): boolean {
+    const targetDeviceId = this.normalizeDeviceId(deviceId)
+    if (this.isIrLearningKeyExchangeLocked() ||
+      this.networkCryptoRecoveryDevices.has(targetDeviceId) ||
+      this.hasFreshNetworkEcdhPending(targetDeviceId)) {
+      return false
+    }
+    const now = Date.now()
+    const lastStartedAt = this.lastNetworkEcdhStartAtByDevice.get(targetDeviceId) ?? 0
+    if (lastStartedAt > 0 && now - lastStartedAt < NETWORK_ECDH_RETRY_COOLDOWN_MS) {
+      return false
+    }
+    this.lastNetworkEcdhStartAtByDevice.set(targetDeviceId, now)
+    this.networkCryptoRecoveryDevices.add(targetDeviceId)
+    console.info(`[ECDH][recovery-start] device=${targetDeviceId} source=${source}`)
+    this.startKeyExchange(targetDeviceId, source).catch((err: Error) => {
+      console.info(`[ECDH][recovery-fail] device=${targetDeviceId} source=${source} ${err.message}`)
+    }).finally(() => {
+      this.networkCryptoRecoveryDevices.delete(targetDeviceId)
+    })
+    return true
+  }
+
+  recoverFromStaticNetworkPayload(deviceId: string, source: string, keySource: string | undefined): void {
+    if (keySource !== 'static' || this.isIrLearningKeyExchangeLocked()) {
+      return
+    }
+    const targetDeviceId = this.normalizeDeviceId(deviceId)
+    const now = Date.now()
+    this.clearExpiredNetworkEcdhPending(targetDeviceId, `static-${source}`, now)
+    if (this.networkCryptoRecoveryDevices.has(targetDeviceId) ||
+      this.hasFreshNetworkEcdhPending(targetDeviceId, now)) {
+      return
+    }
+    const hasDynamicKeys = getDeviceDynamicAesKey(targetDeviceId) !== null &&
+      getDeviceDynamicSm4Key(targetDeviceId) !== null
+    const installedAt = this.lastEcdhInstallTimeByDevice.get(targetDeviceId) ?? 0
+    if (hasDynamicKeys && installedAt > 0 && now - installedAt < NETWORK_STATIC_PACKET_AFTER_ECDH_GRACE_MS) {
+      console.info(`[ECDH][static-delayed] ${source} device=${targetDeviceId}; keep newly confirmed dynamic session`)
+      return
+    }
+    if (hasDynamicKeys) {
+      console.info(`[ECDH][static-observed] ${source} device=${targetDeviceId}; replacing stale dynamic session`)
+      this.switchDeviceToStaticCryptoSession(targetDeviceId, `static-observed-${source}`,
+        this.cryptoModeForDevice(targetDeviceId))
+    } else {
+      console.info(`[ECDH][static-observed] ${source} device=${targetDeviceId}; no dynamic session, requesting ECDH`)
+    }
+    this.startNetworkEcdhRecovery(targetDeviceId, `static-observed-${source}`)
+  }
+
+  async waitForNetworkCryptoSession(deviceId: string): Promise<void> {
+    const targetDeviceId = this.normalizeDeviceId(deviceId)
+    const requiredAt = this.networkCryptoValidationRequiredAt
+    const successfulAt = this.lastDynamicDecryptAtByDevice.get(targetDeviceId) ?? 0
+    const installedAt = this.lastEcdhInstallTimeByDevice.get(targetDeviceId) ?? 0
+    if (successfulAt >= requiredAt || installedAt >= requiredAt) {
+      return
+    }
+    this.clearExpiredNetworkEcdhPending(targetDeviceId, 'command-start')
+    const hasDynamicKeys = getDeviceDynamicAesKey(targetDeviceId) !== null &&
+      getDeviceDynamicSm4Key(targetDeviceId) !== null
+    if (hasDynamicKeys && !this.hasFreshNetworkEcdhPending(targetDeviceId)) {
+      this.switchDeviceToStaticCryptoSession(targetDeviceId, 'command-session-validation',
+        this.cryptoModeForDevice(targetDeviceId))
+    }
+    this.startNetworkEcdhRecovery(targetDeviceId, 'command-session-validation')
+    const startedAt = Date.now()
+    this.cryptoDebugText = `等待 WiFi 密钥确认 ${targetDeviceId}`
+    console.info(`[CMD][CRYPTO] wait for verified Wi-Fi session device=${targetDeviceId}`)
+    while (Date.now() - startedAt < NETWORK_CRYPTO_READY_WAIT_MS) {
+      const nextSuccessfulAt = this.lastDynamicDecryptAtByDevice.get(targetDeviceId) ?? 0
+      const nextInstalledAt = this.lastEcdhInstallTimeByDevice.get(targetDeviceId) ?? 0
+      if (nextSuccessfulAt >= requiredAt || nextInstalledAt >= requiredAt) {
+        console.info(`[CMD][CRYPTO] Wi-Fi session ready device=${targetDeviceId} waited=${Date.now() - startedAt}ms`)
+        return
+      }
+      this.clearExpiredNetworkEcdhPending(targetDeviceId, 'command-wait')
+      if (!this.hasFreshNetworkEcdhPending(targetDeviceId)) {
+        this.startNetworkEcdhRecovery(targetDeviceId, 'command-wait')
+      }
+      await new Promise<void>((resolve: () => void) => setTimeout(resolve, 100))
+    }
+    throw new Error(`WiFi 密钥协商未完成：${targetDeviceId}`)
   }
 
   monitorBusinessTransportHealth(): void {
@@ -2716,7 +3011,7 @@ struct Index {
       if (data['type'] !== 'ack' || data['cmd'] !== 'crypto') {
         return false
       }
-      const seq = typeof data['seq'] === 'number' ? data['seq'] as number : 0
+      const seq = typeof data['seq'] === 'number' ? data['seq'] as number : -1
       const value = typeof data['val'] === 'string' ? (data['val'] as string).toUpperCase() : ''
       if (data['ok'] !== true || seq !== this.bleBusinessCryptoPendingSeq ||
         value !== this.bleBusinessCryptoPendingMode) {
@@ -2739,20 +3034,28 @@ struct Index {
     }
   }
 
-  protocolAckAllowed(source: string): boolean {
+  protocolAckAllowed(source: string, deviceId: string = this.activeDeviceId): boolean {
     const normalizedSource = this.protocolFromSource(source)
-    return this.protocolPendingMode.length > 0 && normalizedSource === this.protocolPendingMode
+    const normalizedDeviceId = this.normalizeDeviceId(deviceId)
+    if (this.protocolPendingMode.length === 0 ||
+      this.protocolSwitchTargets.indexOf(normalizedDeviceId) < 0) {
+      return false
+    }
+    const fromProtocol = this.protocolSwitchFromModes.get(normalizedDeviceId) ??
+      this.transportRouteForDevice(normalizedDeviceId)
+    return normalizedSource === this.protocolPendingMode || normalizedSource === fromProtocol
   }
 
-  shouldProcessBusinessSource(source: string): boolean {
+  shouldProcessBusinessSource(source: string, deviceId: string = this.activeDeviceId): boolean {
     const normalizedSource = this.protocolFromSource(source)
     if (this.bleBusinessDesired) {
       return normalizedSource === 'BLE'
     }
-    if (this.protocolAckAllowed(source)) {
+    if (this.protocolAckAllowed(source, deviceId)) {
       return true
     }
-    return this.protocolPendingMode.length === 0 && normalizedSource === this.commandTransport
+    return this.protocolPendingMode.length === 0 &&
+      normalizedSource === this.transportRouteForDevice(deviceId)
   }
 
   protocolFromSource(source: string): string {
@@ -2777,22 +3080,9 @@ struct Index {
     if (source !== 'HTTP_SENSOR' && source !== 'MQTT') {
       return
     }
-    const observed = this.protocolFromSource(source)
-    if (deviceId !== this.activeDeviceId) {
-      return
-    }
     if (this.protocolPendingMode.length > 0) {
-      if (observed === this.protocolPendingMode) {
-        this.completeProtocolSwitch(observed, JSON.stringify({
-          type: 'ack',
-          cmd: 'proto',
-          ok: true,
-          val: observed.toLowerCase(),
-          inferred: true,
-          source,
-          reason: 'broker-route'
-        }))
-      }
+      // Broker routing proves reachability only. The encrypted payload must
+      // explicitly declare its protocol before it can confirm a switch.
       return
     }
     // A device may keep the old transport alive briefly, or deliberately use
@@ -2938,17 +3228,22 @@ struct Index {
   }
 
   switchDeviceToStaticCryptoSession(deviceId: string, source: string, mode: string): void {
-    clearDeviceDynamicCryptoKeys(deviceId)
-    this.removePersistedDeviceKeys(deviceId)
-    this.keyExchange.resetDevice(deviceId)
-    this.lastKeyExchangeTimestampByTopic.delete(`key/ecdh/pub/${deviceId}`)
-    this.lastSuccessfulDecryptAtByDevice.delete(deviceId)
-    this.lastDynamicDecryptAtByDevice.delete(deviceId)
-    this.decryptFailCountByDevice.delete(deviceId)
-    this.lastEcdhPendingTimeByDevice.delete(deviceId)
-    this.lastEcdhInstallTimeByDevice.delete(deviceId)
-    this.updateDeviceDescriptorModes(deviceId, '', mode)
-    if (deviceId === this.activeDeviceId) {
+    const targetDeviceId = this.normalizeDeviceId(deviceId)
+    const resetAt = Date.now()
+    this.networkCryptoResetAtByDevice.set(targetDeviceId, resetAt)
+    this.lastNetworkEcdhStartAtByDevice.delete(targetDeviceId)
+    this.clearLocalHttpCommandQueue(targetDeviceId, `crypto-reset-${source}`)
+    clearDeviceDynamicCryptoKeys(targetDeviceId)
+    this.removePersistedDeviceKeys(targetDeviceId)
+    this.keyExchange.resetDevice(targetDeviceId)
+    this.lastKeyExchangeTimestampByTopic.delete(`key/ecdh/pub/${targetDeviceId}`)
+    this.lastSuccessfulDecryptAtByDevice.delete(targetDeviceId)
+    this.lastDynamicDecryptAtByDevice.delete(targetDeviceId)
+    this.decryptFailCountByDevice.delete(targetDeviceId)
+    this.lastEcdhPendingTimeByDevice.delete(targetDeviceId)
+    this.lastEcdhInstallTimeByDevice.delete(targetDeviceId)
+    this.updateDeviceDescriptorModes(targetDeviceId, '', mode)
+    if (targetDeviceId === this.activeDeviceId) {
       clearDynamicCryptoKeys()
       this.dynamicAesKeyBase64 = ''
       this.dynamicSm4KeyBase64 = ''
@@ -2958,7 +3253,7 @@ struct Index {
       this.deviceKeySource = 'static'
       this.applyCryptoMode(mode)
     }
-    console.info(`[Crypto][static-session] device=${deviceId} ${source} mode=${mode}; outgoing commands now use static key`)
+    console.info(`[Crypto][static-session] device=${targetDeviceId} ${source} mode=${mode}; outgoing commands now use static key`)
   }
 
   ensureOutgoingCryptoKey(mode: string, source: string): string {
@@ -2981,32 +3276,72 @@ struct Index {
   }
 
   async requestCryptoModeSwitch(targetMode: string): Promise<void> {
-    const fromMode = this.normalizeCryptoMode(currentCryptoMode())
     const normalizedTarget = this.normalizeCryptoMode(targetMode)
-    const targetVal = normalizedTarget.toLowerCase()
+    const targets = this.networkCryptoTargetDeviceIds()
+    const fromMode = this.cryptoModeForDevice(this.activeDeviceId)
+    const pendingTargets: string[] = []
+    for (let i = 0; i < targets.length; i += 1) {
+      if (this.cryptoModeForDevice(targets[i]) !== normalizedTarget) {
+        pendingTargets.push(targets[i])
+      }
+    }
+    if (pendingTargets.length === 0) {
+      this.applyCryptoMode(normalizedTarget)
+      this.cryptoDebugText = `全部 ${targets.length} 台 WiFi 设备已是 ${normalizedTarget}-GCM`
+      return
+    }
+
     const seq = this.nextCryptoSwitchSeq()
-    const cmd = JSON.stringify({ cmd: 'crypto', val: targetVal, seq })
+    this.cryptoPendingMode = normalizedTarget
+    this.cryptoPendingSeq = seq
+    this.cryptoSwitchTargets = targets.slice()
+    this.cryptoSwitchAckDevices.clear()
+    this.cryptoSwitchFromModes.clear()
+    this.cryptoSwitchRetryCount = 0
+    for (let i = 0; i < targets.length; i += 1) {
+      const deviceId = targets[i]
+      const deviceMode = this.cryptoModeForDevice(deviceId)
+      this.cryptoSwitchFromModes.set(deviceId, deviceMode)
+      if (deviceMode === normalizedTarget) {
+        this.cryptoSwitchAckDevices.add(deviceId)
+      }
+    }
+    this.cryptoDebugText = `正在统一 ${targets.length} 台 WiFi 设备到 ${normalizedTarget}-GCM`
+    this.cryptoLastDecrypted = `等待设备确认 0/${pendingTargets.length}`
+    console.info(`[Crypto][switch-all] request ${fromMode}->${normalizedTarget} seq=${seq} targets=${targets.join(',')}`)
+
+    try {
+      for (let i = 0; i < pendingTargets.length; i += 1) {
+        await this.waitForNetworkCryptoSession(pendingTargets[i])
+      }
+    } catch (err) {
+      this.finishIncompleteCryptoSwitch(normalizedTarget, seq,
+        `密钥准备失败：${(err as Error).message}`)
+      return
+    }
 
     this.cryptoSwitchHttpSensorBaseline = this.lastHttpSensorTimestamp
     this.cryptoSwitchEncryptedBaseline = this.lastEncryptedTimestamp
-    this.cryptoPendingMode = normalizedTarget
-    this.cryptoPendingSeq = seq
-    this.cryptoDebugText = `切换中 ${fromMode}->${normalizedTarget}`
-    this.cryptoLastDecrypted = '等待切换ACK'
-    console.info(`[Crypto][switch] request ${fromMode}->${normalizedTarget} seq=${seq} ui=${this.cryptoMode} active=${currentCryptoMode()}: ${cmd}`)
-
-    try {
-      await this.sendEncryptedCommandUsingCurrentSession(this.normalizeBridgeUrl(this.bridgeUrl), cmd, this.commandTransport)
-      this.startCryptoSwitchTimeout(fromMode, normalizedTarget)
-      if (this.commandTransport === 'HTTP') {
-        this.pollHttpCryptoSwitchAck(normalizedTarget)
+    const sendErrors: string[] = []
+    for (let i = 0; i < pendingTargets.length; i += 1) {
+      const deviceId = pendingTargets[i]
+      try {
+        await this.sendNetworkCryptoSwitchCommand(deviceId, normalizedTarget, seq)
+      } catch (err) {
+        sendErrors.push(`${deviceId}: ${(err as Error).message}`)
       }
-    } catch (err) {
-      this.cryptoPendingMode = ''
-      this.cryptoPendingSeq = 0
-      this.cryptoLastDecrypted = '切换发送失败'
-      this.cryptoDebugText = `切换失败 ${(err as Error).message}`
-      console.info(`[Crypto][switch][send-fail] ${JSON.stringify(err)}`)
+    }
+    if (this.cryptoPendingMode !== normalizedTarget || this.cryptoPendingSeq !== seq) {
+      return
+    }
+    if (sendErrors.length > 0) {
+      this.cryptoDebugText = `WiFi 算法指令部分发送失败，等待重试 ${sendErrors.length} 台`
+      console.info(`[Crypto][switch-all][send-partial] ${sendErrors.join(' | ')}`)
+    }
+    this.startCryptoSwitchTimeout(normalizedTarget, seq)
+    if (this.cryptoSwitchTargets.some((deviceId: string) =>
+      this.transportRouteForDevice(deviceId) === 'HTTP')) {
+      this.pollHttpCryptoSwitchAck(normalizedTarget, seq)
     }
   }
 
@@ -3015,30 +3350,103 @@ struct Index {
     return this.cryptoSwitchSeq
   }
 
-  startCryptoSwitchTimeout(fromMode: string, targetMode: string): void {
+  clearCryptoSwitchTimer(): void {
     if (this.cryptoSwitchTimerId !== -1) {
       clearTimeout(this.cryptoSwitchTimerId)
-    }
-    this.cryptoSwitchTimerId = setTimeout(() => {
-      if (this.cryptoPendingMode === targetMode) {
-        this.cryptoPendingMode = ''
-        this.cryptoPendingSeq = 0
-        this.applyCryptoMode(fromMode)
-        this.cryptoLastDecrypted = '切换超时'
-        this.cryptoDebugText = `${fromMode}->${targetMode} ACK超时`
-        console.info(`[Crypto][switch][timeout] ${fromMode}->${targetMode}`)
-      }
       this.cryptoSwitchTimerId = -1
-    }, 15000)
+    }
   }
 
-  async pollHttpCryptoSwitchAck(targetMode: string): Promise<void> {
+  clearCryptoSwitchContext(): void {
+    this.clearCryptoSwitchTimer()
+    this.cryptoPendingMode = ''
+    this.cryptoPendingSeq = 0
+    this.cryptoSwitchTargets = []
+    this.cryptoSwitchAckDevices.clear()
+    this.cryptoSwitchFromModes.clear()
+    this.cryptoSwitchRetryCount = 0
+  }
+
+  async sendNetworkCryptoSwitchCommand(deviceId: string, targetMode: string, seq: number): Promise<void> {
+    const cmd = JSON.stringify({ cmd: 'crypto', val: targetMode.toLowerCase(), seq })
+    const protocol = this.transportRouteForDevice(deviceId)
+    console.info(`[Crypto][switch-all][send] device=${deviceId} protocol=${protocol} target=${targetMode} seq=${seq}`)
+    await this.sendEncryptedCommandUsingCurrentSession(
+      this.normalizeBridgeUrl(this.bridgeUrl), cmd, protocol, 'dayu/cmd', deviceId)
+  }
+
+  startCryptoSwitchTimeout(targetMode: string, seq: number): void {
+    this.clearCryptoSwitchTimer()
+    this.cryptoSwitchTimerId = setTimeout(() => {
+      this.cryptoSwitchTimerId = -1
+      if (this.cryptoPendingMode !== targetMode || this.cryptoPendingSeq !== seq) {
+        return
+      }
+      const missing = this.cryptoSwitchTargets.filter((deviceId: string) =>
+        !this.cryptoSwitchAckDevices.has(deviceId))
+      if (missing.length === 0) {
+        this.completeCryptoSwitch(targetMode, 'all acknowledgements received')
+        return
+      }
+      if (this.cryptoSwitchRetryCount < NETWORK_CRYPTO_SWITCH_MAX_RETRIES) {
+        this.cryptoSwitchRetryCount += 1
+        this.cryptoDebugText = `正在重试 ${missing.length} 台未确认的 WiFi 设备`
+        this.retryPendingCryptoSwitch(targetMode, seq, missing).catch((err: Error) => {
+          this.finishIncompleteCryptoSwitch(targetMode, seq, `重试失败：${err.message}`)
+        })
+        return
+      }
+      this.finishIncompleteCryptoSwitch(targetMode, seq,
+        `${missing.length} 台设备确认超时`)
+    }, NETWORK_CRYPTO_SWITCH_TIMEOUT_MS)
+  }
+
+  async retryPendingCryptoSwitch(targetMode: string, seq: number, missing: string[]): Promise<void> {
+    const errors: string[] = []
+    for (let i = 0; i < missing.length; i += 1) {
+      if (this.cryptoPendingMode !== targetMode || this.cryptoPendingSeq !== seq ||
+        this.cryptoSwitchAckDevices.has(missing[i])) {
+        continue
+      }
+      try {
+        await this.sendNetworkCryptoSwitchCommand(missing[i], targetMode, seq)
+      } catch (err) {
+        errors.push(`${missing[i]}: ${(err as Error).message}`)
+      }
+    }
+    if (this.cryptoPendingMode !== targetMode || this.cryptoPendingSeq !== seq) {
+      return
+    }
+    if (errors.length > 0) {
+      console.info(`[Crypto][switch-all][retry-partial] ${errors.join(' | ')}`)
+    }
+    this.startCryptoSwitchTimeout(targetMode, seq)
+    if (missing.some((deviceId: string) => this.transportRouteForDevice(deviceId) === 'HTTP')) {
+      this.pollHttpCryptoSwitchAck(targetMode, seq)
+    }
+  }
+
+  finishIncompleteCryptoSwitch(targetMode: string, seq: number, reason: string): void {
+    if (this.cryptoPendingMode !== targetMode || this.cryptoPendingSeq !== seq) {
+      return
+    }
+    const total = this.cryptoSwitchTargets.length
+    const confirmed = this.cryptoSwitchAckDevices.size
+    const activeMode = this.cryptoModeForDevice(this.activeDeviceId)
+    this.clearCryptoSwitchContext()
+    this.applyCryptoMode(activeMode)
+    this.cryptoLastDecrypted = `仅 ${confirmed}/${total} 台确认`
+    this.cryptoDebugText = `WiFi 算法未统一：${reason}`
+    console.info(`[Crypto][switch-all][incomplete] target=${targetMode} confirmed=${confirmed}/${total} reason=${reason}`)
+  }
+
+  async pollHttpCryptoSwitchAck(targetMode: string, seq: number): Promise<void> {
     for (let i = 0; i < 14; i += 1) {
-      if (this.cryptoPendingMode !== targetMode || this.commandTransport !== 'HTTP') {
+      if (this.cryptoPendingMode !== targetMode || this.cryptoPendingSeq !== seq) {
         return
       }
       await new Promise<void>((resolve) => setTimeout(resolve, 700))
-      if (this.cryptoPendingMode !== targetMode || this.commandTransport !== 'HTTP') {
+      if (this.cryptoPendingMode !== targetMode || this.cryptoPendingSeq !== seq) {
         return
       }
       try {
@@ -3050,22 +3458,21 @@ struct Index {
   }
 
   completeCryptoSwitch(mode: string, jsonStr: string): void {
-    if (this.cryptoSwitchTimerId !== -1) {
-      clearTimeout(this.cryptoSwitchTimerId)
-      this.cryptoSwitchTimerId = -1
+    const targets = this.cryptoSwitchTargets.slice()
+    const count = targets.length
+    for (let i = 0; i < targets.length; i += 1) {
+      this.updateDeviceDescriptorModes(targets[i], '', mode)
+      this.decryptFailCountByDevice.delete(targets[i])
     }
     this.applyCryptoMode(mode)
-    this.updateDeviceDescriptorModes(this.activeDeviceId, '', mode)
     this.decryptFailCount = 0
-    this.decryptFailCountByDevice.delete(this.activeDeviceId)
-    this.cryptoPendingMode = ''
-    this.cryptoPendingSeq = 0
     this.cryptoModeAutoCorrectHoldUntil = Date.now() + 20000
     this.cryptoEnabled = true
-    this.cryptoLastDecrypted = new Date().toLocaleTimeString() + ' ACK'
-    this.cryptoDebugText = `${mode}-GCM 已生效`
-    this.addMqttMessage('esp32/sensor', jsonStr)
-    console.info(`[Crypto][switch][ack] mode=${mode} raw=${jsonStr}`)
+    this.cryptoLastDecrypted = new Date().toLocaleTimeString() + ' 全部ACK'
+    this.cryptoDebugText = `${count} 台 WiFi 设备已统一为 ${mode}-GCM`
+    this.clearCryptoSwitchContext()
+    this.addMqttMessage('crypto/switch', jsonStr)
+    console.info(`[Crypto][switch-all][complete] mode=${mode} devices=${targets.join(',')} raw=${jsonStr}`)
   }
 
   isCryptoSwitchAck(jsonStr: string, mode: string): boolean {
@@ -3129,15 +3536,60 @@ struct Index {
     return false
   }
 
-  async tryHandleCryptoSwitchAck(raw: Uint8Array): Promise<boolean> {
-    if (this.cryptoPendingMode.length === 0) {
+  cryptoSwitchDeviceIdFromPlaintext(text: string, fallbackDeviceId: string): string {
+    try {
+      const data = JSON.parse(text) as Record<string, Object>
+      const declaredDeviceId = data['deviceId']
+      if (typeof declaredDeviceId === 'string') {
+        const normalized = this.normalizeDeviceId(declaredDeviceId as string)
+        if (this.cryptoSwitchTargets.indexOf(normalized) >= 0) {
+          return normalized
+        }
+      }
+    } catch (_) {
+      // The encrypted packet route remains authoritative when metadata is absent.
+    }
+    return fallbackDeviceId
+  }
+
+  recordCryptoSwitchAck(deviceId: string, targetMode: string, jsonStr: string,
+    decryptMode: string, keySource: string, inferred: boolean): boolean {
+    if (this.cryptoPendingMode !== targetMode || this.cryptoPendingSeq <= 0 ||
+      this.cryptoSwitchTargets.indexOf(deviceId) < 0) {
+      return false
+    }
+    if (!this.cryptoSwitchAckDevices.has(deviceId)) {
+      this.cryptoSwitchAckDevices.add(deviceId)
+      this.updateDeviceDescriptorModes(deviceId, '', targetMode)
+      this.decryptFailCountByDevice.delete(deviceId)
+      if (deviceId === this.activeDeviceId) {
+        this.applyCryptoMode(targetMode)
+        this.decryptFailCount = 0
+      }
+    }
+    const confirmed = this.cryptoSwitchAckDevices.size
+    const total = this.cryptoSwitchTargets.length
+    this.cryptoLastDecrypted = `设备确认 ${confirmed}/${total}`
+    this.cryptoDebugText = confirmed < total ?
+      `WiFi 算法切换确认 ${confirmed}/${total}` : `正在完成 ${targetMode}-GCM 切换`
+    console.info(`[Crypto][switch-all][${inferred ? 'observed' : 'ack'}] device=${deviceId} ` +
+      `target=${targetMode} decrypt=${decryptMode}/${keySource} confirmed=${confirmed}/${total}`)
+    if (this.cryptoSwitchTargets.every((targetId: string) =>
+      this.cryptoSwitchAckDevices.has(targetId))) {
+      this.completeCryptoSwitch(targetMode, jsonStr)
+    }
+    return true
+  }
+
+  async tryHandleCryptoSwitchAck(raw: Uint8Array, deviceId: string): Promise<boolean> {
+    if (this.cryptoPendingMode.length === 0 || this.cryptoSwitchTargets.indexOf(deviceId) < 0) {
       return false
     }
     const targetMode = this.cryptoPendingMode
     const candidates: string[] = [
       targetMode,
-      this.normalizeCryptoMode(currentCryptoMode()),
-      this.normalizeCryptoMode(this.cryptoMode),
+      this.cryptoSwitchFromModes.get(deviceId) ?? this.cryptoModeForDevice(deviceId),
+      this.cryptoModeForDevice(deviceId),
       this.otherCryptoMode(targetMode)
     ]
     const modes: string[] = []
@@ -3151,47 +3603,51 @@ struct Index {
     for (let i = 0; i < modes.length; i += 1) {
       const decryptMode = modes[i]
       try {
-        const decrypted = await decryptWithExpectedMode(raw, decryptMode)
-        if (this.tryCompleteCryptoSwitchFromPlaintext(decrypted.plaintext, targetMode, decryptMode, decrypted.keySource ?? 'active')) {
+        const decrypted = await decryptWithExpectedModeForDevice(raw, decryptMode, deviceId)
+        if (this.tryCompleteCryptoSwitchFromPlaintext(
+          decrypted.plaintext, targetMode, decryptMode, decrypted.keySource ?? 'device-dynamic', deviceId)) {
           return true
         }
-        console.info(`[Crypto][switch][ack-not-match] target=${targetMode} decrypt=${decryptMode}/${decrypted.keySource ?? 'active'} text=${decrypted.plaintext.substring(0, 80)}`)
+        console.info(`[Crypto][switch-all][ack-not-match] device=${deviceId} target=${targetMode} ` +
+          `decrypt=${decryptMode}/${decrypted.keySource ?? 'device-dynamic'} text=${decrypted.plaintext.substring(0, 80)}`)
       } catch (err) {
-        lastError = `${decryptMode} active ${(err as Error).message}`
+        lastError = `${decryptMode} device ${(err as Error).message}`
       }
       try {
         const staticDecrypted = await decryptWithStaticExpectedMode(raw, decryptMode)
-        if (this.tryCompleteCryptoSwitchFromPlaintext(staticDecrypted.plaintext, targetMode, decryptMode, 'static')) {
+        if (this.tryCompleteCryptoSwitchFromPlaintext(
+          staticDecrypted.plaintext, targetMode, decryptMode, 'static', deviceId)) {
           return true
         }
-        console.info(`[Crypto][switch][ack-not-match] target=${targetMode} decrypt=${decryptMode}/static text=${staticDecrypted.plaintext.substring(0, 80)}`)
+        console.info(`[Crypto][switch-all][ack-not-match] device=${deviceId} target=${targetMode} ` +
+          `decrypt=${decryptMode}/static text=${staticDecrypted.plaintext.substring(0, 80)}`)
       } catch (err) {
         lastError = `${decryptMode} static ${(err as Error).message}`
       }
     }
-    console.info(`[Crypto][switch][ack-decrypt-fail] target=${targetMode} last=${lastError}`)
+    console.info(`[Crypto][switch-all][ack-decrypt-fail] device=${deviceId} target=${targetMode} last=${lastError}`)
     return false
   }
 
-  tryCompleteCryptoSwitchFromPlaintext(text: string, targetMode: string, decryptMode: string, keySource: string): boolean {
+  tryCompleteCryptoSwitchFromPlaintext(text: string, targetMode: string, decryptMode: string,
+    keySource: string, routedDeviceId: string): boolean {
+    const deviceId = this.cryptoSwitchDeviceIdFromPlaintext(text, routedDeviceId)
     if (this.isCryptoSwitchAck(text, targetMode)) {
-      this.completeCryptoSwitch(targetMode, text)
-      console.info(`[Crypto][switch][ack-mode] target=${targetMode} decrypt=${decryptMode}/${keySource}`)
-      return true
+      return this.recordCryptoSwitchAck(deviceId, targetMode, text, decryptMode, keySource, false)
     }
-    if (this.cryptoPendingSeq === 0 && decryptMode === targetMode && this.looksLikeJsonObject(text)) {
+    if (decryptMode === targetMode && this.looksLikeJsonObject(text)) {
       const inferredAck = JSON.stringify({
         type: 'ack',
         cmd: 'crypto',
         ok: true,
         val: targetMode.toLowerCase(),
+        deviceId,
         inferred: true,
         reason: 'target-mode-payload',
         keySource
       })
-      this.completeCryptoSwitch(targetMode, inferredAck)
-      console.info(`[Crypto][switch][observed-target] target=${targetMode} decrypt=${decryptMode}/${keySource} text=${text.substring(0, 80)}`)
-      return true
+      return this.recordCryptoSwitchAck(deviceId, targetMode, inferredAck,
+        decryptMode, keySource, true)
     }
     return false
   }
@@ -3207,43 +3663,68 @@ struct Index {
 
   async requestProtocolSwitch(targetProtocol: string): Promise<void> {
     const target = this.normalizeProtocolMode(targetProtocol)
-    const fromProtocol = this.transportForDevice(this.activeDeviceId)
-    this.commandTransport = fromProtocol
-    if (target === fromProtocol) {
-      this.cryptoDebugText = `当前已是 ${target}`
+    const targets = this.networkTargetDeviceIds()
+    const pendingTargets: string[] = []
+    for (let i = 0; i < targets.length; i += 1) {
+      if (this.transportForDevice(targets[i]) !== target) {
+        pendingTargets.push(targets[i])
+      }
+    }
+    if (pendingTargets.length === 0) {
+      this.commandTransport = target
+      this.cryptoDebugText = `全部 ${targets.length} 台 WiFi 设备已是 ${target}`
       return
     }
     if (this.protocolPendingMode.length > 0) {
-      this.cryptoDebugText = `协议切换中 ${fromProtocol}->${this.protocolPendingMode}`
+      this.cryptoDebugText = `WiFi 协议切换中，等待 ${this.protocolPendingMode} 确认`
       return
     }
 
     const seq = this.nextProtocolSwitchSeq()
-    const cmd = JSON.stringify({ cmd: 'proto', val: target.toLowerCase(), seq })
     this.protocolPendingMode = target
     this.protocolPendingSeq = seq
-    this.cryptoDebugText = `协议切换中 ${fromProtocol}->${target}`
-    console.info(`[PROTO][switch] request ${fromProtocol}->${target} seq=${seq}`)
-    try {
-      await this.sendEncryptedCommandUsingCurrentSession(this.normalizeBridgeUrl(this.bridgeUrl), cmd, fromProtocol)
-      this.cryptoDebugText = `协议切换命令已发送 ${fromProtocol}->${target}`
-      console.info(`[PROTO][switch][sent] active=${fromProtocol} pending=${target} seq=${seq}`)
-      this.startProtocolSwitchTimeout(fromProtocol, target, seq)
-    } catch (err) {
-      this.protocolPendingMode = ''
-      this.protocolPendingSeq = 0
-      this.commandTransport = fromProtocol
-      this.cryptoDebugText = `协议切换发送失败 ${(err as Error).message}`
-      console.info(`[PROTO][switch][send-fail] ${JSON.stringify(err)}`)
+    this.protocolSwitchTargets = targets.slice()
+    this.protocolSwitchAckDevices.clear()
+    this.protocolSwitchFromModes.clear()
+    this.protocolSwitchRetryCount = 0
+    for (let i = 0; i < targets.length; i += 1) {
+      const deviceId = targets[i]
+      const fromProtocol = this.transportRouteForDevice(deviceId)
+      this.protocolSwitchFromModes.set(deviceId, fromProtocol)
+      if (fromProtocol === target) {
+        this.protocolSwitchAckDevices.add(deviceId)
+      }
     }
+    this.cryptoDebugText = `正在统一 ${targets.length} 台 WiFi 设备到 ${target}`
+    console.info(`[PROTO][switch-all] target=${target} seq=${seq} devices=${pendingTargets.join(',')}`)
+
+    const sendErrors: string[] = []
+    for (let i = 0; i < pendingTargets.length; i += 1) {
+      const deviceId = pendingTargets[i]
+      const fromProtocol = this.protocolSwitchFromModes.get(deviceId) ?? this.transportRouteForDevice(deviceId)
+      try {
+        await this.sendProtocolSwitchCommand(deviceId, fromProtocol, target, seq)
+      } catch (err) {
+        sendErrors.push(`${deviceId}: ${(err as Error).message}`)
+      }
+    }
+    if (this.protocolPendingMode !== target || this.protocolPendingSeq !== seq) {
+      return
+    }
+    if (sendErrors.length > 0) {
+      this.cryptoDebugText = `WiFi 协议部分发送失败，等待重试 ${sendErrors.length} 台`
+      console.info(`[PROTO][switch-all][send-partial] ${sendErrors.join(' | ')}`)
+    }
+    this.startProtocolSwitchTimeout(target, seq)
   }
 
-  async sendProtocolSwitchCommand(fromProtocol: string, targetProtocol: string): Promise<void> {
+  async sendProtocolSwitchCommand(deviceId: string, fromProtocol: string,
+    targetProtocol: string, seq: number): Promise<void> {
     const target = this.normalizeProtocolMode(targetProtocol)
-    const seq = this.nextProtocolSwitchSeq()
     const cmd = JSON.stringify({ cmd: 'proto', val: target.toLowerCase(), seq })
-    console.info(`[PROTO][switch-bg] request ${fromProtocol}->${target} seq=${seq}`)
-    await this.sendEncryptedCommandUsingCurrentSession(this.normalizeBridgeUrl(this.bridgeUrl), cmd, fromProtocol)
+    console.info(`[PROTO][switch-all][send] device=${deviceId} ${fromProtocol}->${target} seq=${seq}`)
+    await this.sendEncryptedCommandUsingCurrentSession(
+      this.normalizeBridgeUrl(this.bridgeUrl), cmd, fromProtocol, 'dayu/cmd', deviceId)
   }
 
   nextProtocolSwitchSeq(): number {
@@ -3251,31 +3732,99 @@ struct Index {
     return this.protocolSwitchSeq
   }
 
-  startProtocolSwitchTimeout(fromProtocol: string, targetProtocol: string, seq: number): void {
+  clearProtocolSwitchTimer(): void {
     if (this.protocolSwitchTimerId !== -1) {
       clearTimeout(this.protocolSwitchTimerId)
-    }
-    this.protocolSwitchTimerId = setTimeout(() => {
-      if (this.protocolPendingMode === targetProtocol && this.protocolPendingSeq === seq) {
-        this.protocolPendingMode = ''
-        this.protocolPendingSeq = 0
-        this.commandTransport = fromProtocol
-        this.cryptoDebugText = `${fromProtocol}->${targetProtocol} ACK超时，已保持${fromProtocol}`
-        this.addMqttMessage('proto/switch', JSON.stringify({
-          type: 'ack',
-          cmd: 'proto',
-          ok: false,
-          val: targetProtocol.toLowerCase(),
-          reason: 'ack-timeout-keep-source',
-          seq
-        }))
-        console.info(`[PROTO][switch][timeout-keep-source] ${fromProtocol}->${targetProtocol} seq=${seq}`)
-      }
       this.protocolSwitchTimerId = -1
-    }, 8000)
+    }
   }
 
-  tryCompleteProtocolSwitchFromJson(jsonStr: string, source: string): boolean {
+  clearProtocolSwitchContext(): void {
+    this.clearProtocolSwitchTimer()
+    this.protocolPendingMode = ''
+    this.protocolPendingSeq = 0
+    this.protocolSwitchTargets = []
+    this.protocolSwitchAckDevices.clear()
+    this.protocolSwitchFromModes.clear()
+    this.protocolSwitchRetryCount = 0
+  }
+
+  startProtocolSwitchTimeout(targetProtocol: string, seq: number): void {
+    this.clearProtocolSwitchTimer()
+    this.protocolSwitchTimerId = setTimeout(() => {
+      this.protocolSwitchTimerId = -1
+      if (this.protocolPendingMode !== targetProtocol || this.protocolPendingSeq !== seq) {
+        return
+      }
+      const missing = this.protocolSwitchTargets.filter((deviceId: string) =>
+        !this.protocolSwitchAckDevices.has(deviceId))
+      if (missing.length === 0) {
+        this.completeProtocolSwitch(targetProtocol, 'all acknowledgements received')
+        return
+      }
+      if (this.protocolSwitchRetryCount < NETWORK_PROTOCOL_SWITCH_MAX_RETRIES) {
+        this.protocolSwitchRetryCount += 1
+        this.cryptoDebugText = `正在重试 ${missing.length} 台未确认的 WiFi 设备`
+        this.retryPendingProtocolSwitch(targetProtocol, seq, missing).catch((err: Error) => {
+          this.finishIncompleteProtocolSwitch(targetProtocol, seq, `重试失败：${err.message}`)
+        })
+        return
+      }
+      this.finishIncompleteProtocolSwitch(targetProtocol, seq, `${missing.length} 台设备确认超时`)
+    }, NETWORK_PROTOCOL_SWITCH_TIMEOUT_MS)
+  }
+
+  async retryPendingProtocolSwitch(targetProtocol: string, seq: number, missing: string[]): Promise<void> {
+    const errors: string[] = []
+    for (let i = 0; i < missing.length; i += 1) {
+      const deviceId = missing[i]
+      if (this.protocolPendingMode !== targetProtocol || this.protocolPendingSeq !== seq ||
+        this.protocolSwitchAckDevices.has(deviceId)) {
+        continue
+      }
+      const fromProtocol = this.protocolSwitchFromModes.get(deviceId) ?? this.transportRouteForDevice(deviceId)
+      let sent = false
+      try {
+        await this.sendProtocolSwitchCommand(deviceId, fromProtocol, targetProtocol, seq)
+        sent = true
+      } catch (err) {
+        console.info(`[PROTO][switch-all][retry-source-fail] device=${deviceId} ${(err as Error).message}`)
+      }
+      if (targetProtocol !== fromProtocol) {
+        try {
+          await this.sendProtocolSwitchCommand(deviceId, targetProtocol, targetProtocol, seq)
+          sent = true
+        } catch (err) {
+          console.info(`[PROTO][switch-all][retry-target-fail] device=${deviceId} ${(err as Error).message}`)
+        }
+      }
+      if (!sent) {
+        errors.push(deviceId)
+      }
+    }
+    if (this.protocolPendingMode !== targetProtocol || this.protocolPendingSeq !== seq) {
+      return
+    }
+    if (errors.length > 0) {
+      console.info(`[PROTO][switch-all][retry-partial] ${errors.join(',')}`)
+    }
+    this.startProtocolSwitchTimeout(targetProtocol, seq)
+  }
+
+  finishIncompleteProtocolSwitch(targetProtocol: string, seq: number, reason: string): void {
+    if (this.protocolPendingMode !== targetProtocol || this.protocolPendingSeq !== seq) {
+      return
+    }
+    const total = this.protocolSwitchTargets.length
+    const confirmed = this.protocolSwitchAckDevices.size
+    const activeMode = this.transportForDevice(this.activeDeviceId)
+    this.clearProtocolSwitchContext()
+    this.commandTransport = activeMode
+    this.cryptoDebugText = `WiFi 协议未统一：${reason}（${confirmed}/${total}）`
+    console.info(`[PROTO][switch-all][incomplete] target=${targetProtocol} confirmed=${confirmed}/${total} reason=${reason}`)
+  }
+
+  tryCompleteProtocolSwitchFromJson(jsonStr: string, source: string, routedDeviceId: string): boolean {
     if (this.protocolPendingMode.length === 0) {
       return false
     }
@@ -3291,59 +3840,113 @@ struct Index {
       if (type !== 'ack' || cmd !== 'proto' || !ok) {
         return false
       }
-      if (seq !== 0 && seq !== this.protocolPendingSeq) {
+      // A protocol ACK belongs to one switch transaction. Older firmware
+      // omitted seq; accepting it can confirm the wrong device or old route.
+      if (seq !== this.protocolPendingSeq) {
         return false
       }
       if (typeof val === 'string' && this.normalizeProtocolMode(val.toUpperCase()) !== target) {
         return false
       }
-      if (sourceProtocol !== target) {
-        console.info(`[PROTO][switch][ack-source] target=${target} source=${sourceProtocol}`)
+      const announcedId = typeof data['deviceId'] === 'string' ?
+        this.normalizeDeviceId(data['deviceId'] as string) : this.normalizeDeviceId(routedDeviceId)
+      const deviceId = this.normalizeDeviceId(routedDeviceId)
+      if (announcedId !== deviceId) {
+        console.info(`[PROTO][switch-all][ack-device-mismatch] routed=${deviceId} announced=${announcedId}`)
+        return false
       }
-      this.completeProtocolSwitch(target, jsonStr)
-      return true
+      if (sourceProtocol !== target) {
+        console.info(`[PROTO][switch-all][ack-source] device=${deviceId} target=${target} source=${sourceProtocol}`)
+      }
+      return this.recordProtocolSwitchAck(deviceId, target, jsonStr, sourceProtocol, false)
     } catch (_) {
       return false
     }
   }
 
-  tryCompleteProtocolSwitchFromObservedPayload(source: string): boolean {
+  tryCompleteProtocolSwitchFromObservedPayload(jsonStr: string, source: string, deviceId: string): boolean {
     if (this.protocolPendingMode.length === 0) {
       return false
     }
-    const sourceProtocol = this.protocolFromSource(source)
-    const target = this.protocolPendingMode
-    if (sourceProtocol !== target) {
+    try {
+      const data = JSON.parse(jsonStr) as Record<string, Object>
+      const type = typeof data['type'] === 'string' ? (data['type'] as string).toLowerCase() : ''
+      const declaredRaw = typeof data['proto'] === 'string' ? data['proto'] as string :
+        (type === 'device_hello' && typeof data['transport'] === 'string' ? data['transport'] as string : '')
+      if (declaredRaw.length === 0) {
+        return false
+      }
+      const target = this.protocolPendingMode
+      const declared = this.normalizeProtocolMode(declaredRaw.toUpperCase())
+      if (declared !== target) {
+        return false
+      }
+      const normalizedDeviceId = this.normalizeDeviceId(deviceId)
+      if (typeof data['deviceId'] === 'string' &&
+        this.normalizeDeviceId(data['deviceId'] as string) !== normalizedDeviceId) {
+        return false
+      }
+      const sourceProtocol = this.protocolFromSource(source)
+      // Periodic business state must arrive over the protocol it declares.
+      // device_hello is allowed over MQTT as a maintenance declaration while
+      // HTTP is the selected business route.
+      if (type !== 'device_hello' && sourceProtocol !== target) {
+        return false
+      }
+      const inferredAck = JSON.stringify({
+        type: 'ack',
+        cmd: 'proto',
+        ok: true,
+        val: target.toLowerCase(),
+        inferred: true,
+        source,
+        reason: type === 'device_hello' ? 'device-hello' : 'declared-proto',
+        deviceId: normalizedDeviceId
+      })
+      return this.recordProtocolSwitchAck(normalizedDeviceId, target, inferredAck, sourceProtocol, true)
+    } catch (_) {
       return false
     }
-    const inferredAck = JSON.stringify({
-      type: 'ack',
-      cmd: 'proto',
-      ok: true,
-      val: target.toLowerCase(),
-      inferred: true,
-      source
-    })
-    console.info(`[PROTO][switch][observed] active=${target} source=${source}`)
-    this.completeProtocolSwitch(target, inferredAck)
+  }
+
+  recordProtocolSwitchAck(deviceId: string, mode: string, jsonStr: string,
+    sourceProtocol: string, inferred: boolean): boolean {
+    const target = this.normalizeProtocolMode(mode)
+    const normalizedDeviceId = this.normalizeDeviceId(deviceId)
+    if (this.protocolPendingMode !== target ||
+      this.protocolSwitchTargets.indexOf(normalizedDeviceId) < 0) {
+      return false
+    }
+    this.updateDeviceDescriptorModes(normalizedDeviceId, target, '')
+    this.localGatewayTransportByDevice.set(normalizedDeviceId, target)
+    this.decryptFailCountByDevice.delete(normalizedDeviceId)
+    this.protocolSwitchAckDevices.add(normalizedDeviceId)
+    const total = this.protocolSwitchTargets.length
+    const confirmed = this.protocolSwitchAckDevices.size
+    console.info(`[PROTO][switch-all][ack] device=${normalizedDeviceId} target=${target} ` +
+      `source=${sourceProtocol} inferred=${inferred} confirmed=${confirmed}/${total}`)
+    if (confirmed >= total) {
+      this.completeProtocolSwitch(target, jsonStr)
+    } else {
+      this.cryptoDebugText = `WiFi 协议切换到 ${target}，已确认 ${confirmed}/${total}`
+    }
     return true
   }
 
   completeProtocolSwitch(mode: string, jsonStr: string): void {
-    if (this.protocolSwitchTimerId !== -1) {
-      clearTimeout(this.protocolSwitchTimerId)
-      this.protocolSwitchTimerId = -1
+    const target = this.normalizeProtocolMode(mode)
+    const targets = this.protocolSwitchTargets.slice()
+    for (let i = 0; i < targets.length; i += 1) {
+      this.updateDeviceDescriptorModes(targets[i], target, '')
+      this.localGatewayTransportByDevice.set(targets[i], target)
+      this.decryptFailCountByDevice.delete(targets[i])
     }
-    this.commandTransport = this.normalizeProtocolMode(mode)
-    this.updateDeviceDescriptorModes(this.activeDeviceId, mode, '')
-    this.localGatewayTransportByDevice.set(this.activeDeviceId, this.commandTransport)
-    this.protocolPendingMode = ''
-    this.protocolPendingSeq = 0
+    this.commandTransport = target
     this.decryptFailCount = 0
-    this.decryptFailCountByDevice.delete(this.activeDeviceId)
-    this.cryptoDebugText = `业务协议已切换到 ${this.commandTransport}`
+    this.clearProtocolSwitchContext()
+    this.cryptoDebugText = `${targets.length} 台 WiFi 设备已统一为 ${target}`
     this.addMqttMessage('proto/switch', jsonStr)
-    console.info(`[PROTO][switch][ack] active=${this.commandTransport} raw=${jsonStr}`)
+    console.info(`[PROTO][switch-all][complete] target=${target} devices=${targets.join(',')}`)
   }
 
   async decryptIncomingPayload(raw: Uint8Array, source: string,
@@ -3444,11 +4047,13 @@ struct Index {
 
   async tryDecryptPendingKeyAck(raw: Uint8Array, source: string,
     deviceId: string = this.activeDeviceId): Promise<CryptoDecryptResult | null> {
-    const pending = this.keyExchange.getPendingKeys(deviceId)
+    const targetDeviceId = this.normalizeDeviceId(deviceId)
+    this.clearExpiredNetworkEcdhPending(targetDeviceId, `ack-${source}`)
+    const pending = this.keyExchange.getPendingKeys(targetDeviceId)
     if (pending === null) {
       return null
     }
-    const firstMode = this.normalizeCryptoMode(this.cryptoMode)
+    const firstMode = this.cryptoModeForDevice(targetDeviceId)
     const secondMode = this.otherCryptoMode(firstMode)
     const modes: string[] = [firstMode, secondMode]
     let lastError = ''
@@ -3457,11 +4062,11 @@ struct Index {
       try {
         const pendingKey = mode === 'AES' ? pending.aesKey : pending.sm4Key
         const decrypted = await decryptWithProvidedKey(raw, mode, pendingKey)
-        if (this.handleKeyExchangeAckJson(decrypted.plaintext, source, mode, deviceId)) {
+        if (this.handleKeyExchangeAckJson(decrypted.plaintext, source, mode, targetDeviceId)) {
           return decrypted
         }
         if (this.looksLikeJsonObject(decrypted.plaintext)) {
-          this.activatePendingDynamicKeys(source, mode, 'observed', decrypted.plaintext, deviceId)
+          this.activatePendingDynamicKeys(source, mode, 'observed', decrypted.plaintext, targetDeviceId)
           return decrypted
         } else {
           continue
@@ -3498,6 +4103,7 @@ struct Index {
       this.addMqttMessage('key/ecdh/ack', jsonStr)
       return true
     }
+    this.clearLocalHttpCommandQueue(activated.deviceId, `crypto-activated-${reason}`)
     setDeviceDynamicCryptoKeys(activated.deviceId, activated.aesKey, activated.sm4Key)
     this.persistDeviceKeys(activated.deviceId, activated.aesKey, activated.sm4Key)
     this.decryptFailCountByDevice.delete(activated.deviceId)
@@ -3897,7 +4503,7 @@ struct Index {
         }
         const percent = Math.max(0, Math.min(100, Math.round(command.percent ?? 0)))
         this.curtainPercent = percent
-        await this.sendCurtainControl(percent)
+        await this.sendCurtainControl(percent, 'app_control')
         await this.ackCloudCommand(command.id, true, `窗帘已调整至 ${percent}%`)
         this.addMqttMessage('cloud/app/curtain', `[SENT:CLOUD] curtain=${percent}% ${command.id}`)
         return
@@ -3931,7 +4537,7 @@ struct Index {
       this.livingLightAckText = `${this.livingLightOn ? 'ON' : 'OFF'} → ${power ? 'ON' : 'OFF'}`
       this.livingLightOptimisticUntil = 0
       this.startLivingLightControlTimer()
-      await this.sendLightControl('living', power)
+      await this.sendLightControl('living', power, 'app_control')
       await this.ackCloudCommand(command.id, true, `${power ? '开灯' : '关灯'}指令已由大禹下发`)
       this.addMqttMessage('cloud/app/light', `[SENT:CLOUD] ${power ? '开灯' : '关灯'} ${command.id}`)
     } catch (err) {
@@ -4263,20 +4869,10 @@ struct Index {
       console.info(`[PROTO][sensor-ignore-stale] declared=${observed} source=${sourceProtocol}/${source}`)
       return
     }
-    // A successfully decrypted business packet carrying proto is authoritative
-    // for the device's current Wi-Fi command route. MQTT key exchange / hello
-    // traffic is only a maintenance channel and must not overwrite this route.
-    this.updateDeviceDescriptorModes(deviceId, observed, '')
-    this.localGatewayTransportByDevice.set(deviceId, observed)
-    if (deviceId === this.activeDeviceId && this.protocolPendingMode.length === 0 &&
-      this.commandTransport !== observed) {
-      this.commandTransport = observed
-    }
-    if (deviceId !== this.activeDeviceId) {
-      return
-    }
     if (this.protocolPendingMode.length > 0) {
-      if (observed === this.protocolPendingMode) {
+      const normalizedDeviceId = this.normalizeDeviceId(deviceId)
+      if (this.protocolSwitchTargets.indexOf(normalizedDeviceId) >= 0) {
+        if (observed === this.protocolPendingMode) {
         const inferredAck = JSON.stringify({
           type: 'ack',
           cmd: 'proto',
@@ -4284,15 +4880,24 @@ struct Index {
           val: observed.toLowerCase(),
           inferred: true,
           reason: 'sensor-proto',
-          source
+          source,
+          deviceId: normalizedDeviceId
         })
-        this.completeProtocolSwitch(observed, inferredAck)
+          this.recordProtocolSwitchAck(normalizedDeviceId, observed, inferredAck, sourceProtocol, true)
+        }
+        // During a global switch, old-route periodic packets must not overwrite
+        // a device that already acknowledged the new route.
+        return
       }
-      return
     }
-    // The proto field in a periodic packet can belong to the previous route.
-    // Only an explicit switch ACK, a pending-target observation, or
-    // device_hello is allowed to change the selected transport.
+    // A successfully decrypted business packet carrying proto is authoritative
+    // for the device's current Wi-Fi command route. MQTT key exchange / hello
+    // traffic is only a maintenance channel and must not overwrite this route.
+    this.updateDeviceDescriptorModes(deviceId, observed, '')
+    this.localGatewayTransportByDevice.set(deviceId, observed)
+    if (deviceId === this.activeDeviceId && this.commandTransport !== observed) {
+      this.commandTransport = observed
+    }
   }
 
   applySensorJson(jsonStr: string, source: string, deviceId: string = this.activeDeviceId): void {
@@ -4571,7 +5176,24 @@ struct Index {
             (typeof data['sq'] === 'number' ? data['sq'] as number : undefined)
         }, 'DEVICE_JSON')
       }
-      const curtainPercent = this.findNumber(data, ['percent', 'openPercent', 'curtainPercent'])
+      const acPower = this.findBoolLike(data, ['power', 'p'])
+      const acTemp = this.findNumber(data, ['temp', 'targetTemp', 'tp'])
+      const rawAcMode = typeof data['mode'] === 'string' ? (data['mode'] as string).toLowerCase() :
+        (typeof data['m'] === 'string' ? (data['m'] as string).toLowerCase() : '')
+      const acMode = rawAcMode === 'c' ? 'cool' : rawAcMode === 'h' ? 'heat' : rawAcMode
+      if (deviceId === this.deviceForCapability('ac') &&
+        (acPower !== null || acTemp !== null || acMode.length > 0)) {
+        if (!this.acPending && this.acPendingSeq === 0) {
+          if (acPower !== null) this.acPower = acPower
+          if (acTemp !== null && acTemp >= 16 && acTemp <= 30) this.acTemp = Math.round(acTemp)
+          if (acMode === 'cool' || acMode === 'heat') this.acMode = acMode
+          console.info(`[AC][status] power=${this.acPower} temp=${this.acTemp} mode=${this.acMode}`)
+        } else {
+          console.info(`[AC][status-pending] seq=${this.acPendingSeq} keep local target`)
+        }
+      }
+      const curtainPercent = this.findNumber(data,
+        ['percent', 'openPercent', 'curtainPercent', 'curtain', 'c'])
       if (curtainPercent !== null && deviceId === this.deviceForCapability('curtain')) {
         const normalized = Math.max(0, Math.min(100, Math.round(curtainPercent)))
         this.curtainPercent = normalized
@@ -4892,9 +5514,9 @@ struct Index {
       return false
     }
     const now = Date.now()
-    const pendingAt = this.lastEcdhPendingTimeByDevice.get(deviceId) ?? 0
+    this.clearExpiredNetworkEcdhPending(deviceId, 'device-boot', now)
     const installedAt = this.lastEcdhInstallTimeByDevice.get(deviceId) ?? 0
-    const hasPendingRekey = this.keyExchange.getPendingKeys(deviceId) !== null || now - pendingAt < 15000
+    const hasPendingRekey = this.hasFreshNetworkEcdhPending(deviceId, now)
     const hasFreshDynamicKey = installedAt > 0 && now - installedAt < 15000
     if (hasPendingRekey || hasFreshDynamicKey) {
       console.info(`[BOOT] stale epoch=0 ignored during/following ECDH device=${deviceId} pending=${hasPendingRekey} fresh=${hasFreshDynamicKey}`)
@@ -4914,14 +5536,19 @@ struct Index {
   }
 
   resetDeviceCryptoSession(deviceId: string, cryptoMode: string, transport: string): void {
-    clearDeviceDynamicCryptoKeys(deviceId)
-    this.lastSuccessfulDecryptAtByDevice.delete(deviceId)
-    this.lastDynamicDecryptAtByDevice.delete(deviceId)
-    this.decryptFailCountByDevice.delete(deviceId)
-    this.lastEcdhPendingTimeByDevice.delete(deviceId)
-    this.lastEcdhInstallTimeByDevice.delete(deviceId)
-    this.updateDeviceDescriptorModes(deviceId, transport, cryptoMode)
-    if (deviceId === this.activeDeviceId) {
+    const targetDeviceId = this.normalizeDeviceId(deviceId)
+    this.networkCryptoResetAtByDevice.set(targetDeviceId, Date.now())
+    this.lastNetworkEcdhStartAtByDevice.delete(targetDeviceId)
+    this.clearLocalHttpCommandQueue(targetDeviceId, 'device-boot')
+    clearDeviceDynamicCryptoKeys(targetDeviceId)
+    this.removePersistedDeviceKeys(targetDeviceId)
+    this.lastSuccessfulDecryptAtByDevice.delete(targetDeviceId)
+    this.lastDynamicDecryptAtByDevice.delete(targetDeviceId)
+    this.decryptFailCountByDevice.delete(targetDeviceId)
+    this.lastEcdhPendingTimeByDevice.delete(targetDeviceId)
+    this.lastEcdhInstallTimeByDevice.delete(targetDeviceId)
+    this.updateDeviceDescriptorModes(targetDeviceId, transport, cryptoMode)
+    if (targetDeviceId === this.activeDeviceId) {
       clearDynamicCryptoKeys()
       this.dynamicAesKeyBase64 = ''
       this.dynamicSm4KeyBase64 = ''
@@ -4937,9 +5564,9 @@ struct Index {
       this.cryptoDebugText = `设备重启，回静态${this.cryptoMode}`
       this.cryptoLastDecrypted = '设备 boot epoch=0'
     }
-    this.keyExchange.resetDevice(deviceId)
-    this.lastKeyExchangeTimestampByTopic.delete(`key/ecdh/pub/${deviceId}`)
-    this.retryKeyExchangeSoon(deviceId)
+    this.keyExchange.resetDevice(targetDeviceId)
+    this.lastKeyExchangeTimestampByTopic.delete(`key/ecdh/pub/${targetDeviceId}`)
+    this.retryKeyExchangeSoon(targetDeviceId)
   }
 
   retryKeyExchangeSoon(deviceId: string): void {
@@ -5149,7 +5776,7 @@ struct Index {
       console.info(`[Crypto] decrypting ${raw.length} bytes raw encrypted payload on ${topic}`)
     }
     try {
-      if (deviceId === this.activeDeviceId && await this.tryHandleCryptoSwitchAck(raw)) {
+      if (await this.tryHandleCryptoSwitchAck(raw, deviceId)) {
         return
       }
       const decrypted = await this.decryptIncomingPayload(raw, 'MQTT', deviceId)
@@ -5180,16 +5807,10 @@ struct Index {
           `MQTT解密OK ${decrypted.mode} ${jsonStr.substring(0, 24)}`,
           new Date().toLocaleTimeString() + ' OK', true)
       }
-      if (deviceId === this.activeDeviceId && this.tryCompleteProtocolSwitchFromJson(jsonStr, 'MQTT')) {
+      if (this.tryCompleteProtocolSwitchFromJson(jsonStr, 'MQTT', deviceId)) {
         return
       }
-      if (deviceId === this.activeDeviceId) {
-        this.tryCompleteProtocolSwitchFromObservedPayload('MQTT')
-      }
-      if (this.protocolPendingMode.length > 0) {
-        console.info(`[PROTO] ignore non-switch MQTT payload while pending=${this.protocolPendingMode}`)
-        return
-      }
+      this.tryCompleteProtocolSwitchFromObservedPayload(jsonStr, 'MQTT', deviceId)
       this.addMqttMessage(topic, jsonStr)
       setTimeout(() => {
         if (this.handleDeviceStatusJson(jsonStr, deviceId)) {
@@ -5225,7 +5846,7 @@ struct Index {
       const raw = this.base64ToUint8Array(payloadBase64)
       console.info(`[Crypto] received topic=${topic} source=${source} ${raw.length} bytes encrypted payload`)
 
-      if (deviceId === this.activeDeviceId && await this.tryHandleCryptoSwitchAck(raw)) {
+      if (await this.tryHandleCryptoSwitchAck(raw, deviceId)) {
         return
       }
 
@@ -5263,16 +5884,12 @@ struct Index {
           new Date().toLocaleTimeString() + ' ✓', true)
       }
 
-      if (!isCachedBridgeState && deviceId === this.activeDeviceId &&
-        this.tryCompleteProtocolSwitchFromJson(jsonStr, payloadSource)) {
+      if (!isCachedBridgeState &&
+        this.tryCompleteProtocolSwitchFromJson(jsonStr, payloadSource, deviceId)) {
         return
       }
-      if (!isCachedBridgeState && deviceId === this.activeDeviceId) {
-        this.tryCompleteProtocolSwitchFromObservedPayload(payloadSource)
-      }
-      if (this.protocolPendingMode.length > 0) {
-        console.info(`[PROTO] ignore non-switch ${payloadSource} payload while pending=${this.protocolPendingMode}`)
-        return
+      if (!isCachedBridgeState) {
+        this.tryCompleteProtocolSwitchFromObservedPayload(jsonStr, payloadSource, deviceId)
       }
 
       this.addMqttMessage(topic, jsonStr)
@@ -5348,8 +5965,8 @@ struct Index {
       console.info(`[ECDH][recover-skip] ${source} device=${deviceId} has a successful decrypt ${now - successfulAt}ms ago`)
       return
     }
-    const pendingAt = this.lastEcdhPendingTimeByDevice.get(deviceId) ?? 0
-    if (this.keyExchange.getPendingKeys(deviceId) !== null && now - pendingAt < 15000) {
+    this.clearExpiredNetworkEcdhPending(deviceId, `decrypt-${source}`, now)
+    if (this.hasFreshNetworkEcdhPending(deviceId, now)) {
       console.info(`[ECDH][recover-skip] ${source} decrypt failed while waiting key ACK`)
       return
     }
@@ -5398,13 +6015,15 @@ struct Index {
       console.info(`[ECDH][locked-by-ir] defer start source=${source} device=${deviceId}`)
       return
     }
+    this.clearExpiredNetworkEcdhPending(deviceId, `start-${source}`)
     await this.refreshBridgeKeyExchangeState(true)
     if (this.keyExchange.getPendingKeys(deviceId) !== null) {
-      this.lastEcdhPendingTime = Date.now()
-      this.lastEcdhPendingTimeByDevice.set(deviceId, this.lastEcdhPendingTime)
-      this.cryptoDebugText = `ECDH等待ACK ${deviceId}`
-      this.addMqttMessage(`key/ecdh/pub/${deviceId}`, `[ECDH:PENDING:${source}] cached device public key`)
-      return
+      if (this.hasFreshNetworkEcdhPending(deviceId)) {
+        this.cryptoDebugText = `ECDH等待ACK ${deviceId}`
+        this.addMqttMessage(`key/ecdh/pub/${deviceId}`, `[ECDH:PENDING:${source}] cached device public key`)
+        return
+      }
+      this.clearExpiredNetworkEcdhPending(deviceId, `refresh-${source}`)
     }
 
     await this.requestDevicePublicKey(deviceId, source)
@@ -5596,7 +6215,7 @@ struct Index {
 
     const isStatusTopic = topic === 'esp32/status' || topic.endsWith('/status')
     if (!isStatusTopic && this.transportForDevice(packetDeviceId) !== 'MQTT' &&
-      !this.shouldProcessBusinessSource('MQTT')) {
+      !this.shouldProcessBusinessSource('MQTT', packetDeviceId)) {
       console.info(`[PROTO] ignore MQTT ${topic} while active=${this.commandTransport} pending=${this.protocolPendingMode}`)
       return
     }
@@ -5757,6 +6376,11 @@ struct Index {
     try {
       const ageMs = Date.now() - timestamp
       const deviceId = this.deviceIdFromScopedTopic(topic)
+      const resetAt = this.networkCryptoResetAtByDevice.get(deviceId) ?? 0
+      if (timestamp > 0 && resetAt > 0 && timestamp < resetAt) {
+        console.info(`[ECDH] ignored pre-reset public key topic=${topic} timestamp=${timestamp} resetAt=${resetAt}`)
+        return
+      }
       const hasDeviceKeys = getDeviceDynamicAesKey(deviceId) !== null &&
         getDeviceDynamicSm4Key(deviceId) !== null
       const lastTimestamp = this.lastKeyExchangeTimestampByTopic.get(topic) ?? 0
@@ -5835,6 +6459,22 @@ struct Index {
     }, delayMs)
   }
 
+  clearPendingEcdhReplyForDevice(deviceId: string): void {
+    if (this.pendingEcdhReplyDeviceId !== deviceId) {
+      return
+    }
+    if (this.ecdhReplyRetryTimerId !== -1) {
+      clearTimeout(this.ecdhReplyRetryTimerId)
+      this.ecdhReplyRetryTimerId = -1
+    }
+    this.ecdhReplyRetryAttempt = 0
+    this.pendingEcdhReplyDeviceId = ''
+    this.pendingEcdhRemoteTopic = ''
+    this.pendingEcdhRemotePublicKey = null
+    this.pendingEcdhReplyTopic = ''
+    this.pendingEcdhReplyPublicKey = null
+  }
+
   async flushPendingEcdhReply(): Promise<void> {
     if (this.isIrLearningKeyExchangeLocked()) {
       console.info('[ECDH][locked-by-ir] defer pending public key reply')
@@ -5893,7 +6533,7 @@ struct Index {
     if (this.localGatewayDeviceIds.has(targetDeviceId)) {
       try {
         if (this.transportRouteForDevice(targetDeviceId) === 'HTTP') {
-          this.localGateway.enqueueCommand(targetDeviceId, topic, payloadBase64, publicKey.length)
+          this.localGateway.enqueueCommand(targetDeviceId, topic, payloadBase64, publicKey.length, 'ecdh')
           this.rememberSentEcdhPublicKey(publicKey)
           console.info(`[ECDH] local HTTP public key queued ${topic}`)
           return true
@@ -7344,6 +7984,9 @@ struct Index {
     this.syncBleDebugDoorStatus(jsonStr, deviceId)
     this.syncBleDebugAcStatus(jsonStr, deviceId)
     this.syncBleDebugCurtainStatus(jsonStr, deviceId)
+    if (this.handleBleActuatorStatusJson(jsonStr, deviceId)) {
+      return
+    }
     if (this.handleBleCompactAlarmJson(jsonStr, deviceId)) {
       return
     }
@@ -7442,6 +8085,7 @@ struct Index {
         setDeviceDynamicCryptoKeys(sessionId, activated.aesKey, activated.sm4Key)
         this.markBleDebugKeyReady(deviceId)
         this.bleDebugKeyReadyDeviceId = deviceId
+        this.updateBleProvisionCompletion(deviceId)
         this.bleKeyRetryByDevice.delete(deviceId)
         this.bleKeyDecryptFailuresByDevice.delete(deviceId)
         this.clearBleKeyTimer()
@@ -7679,9 +8323,13 @@ struct Index {
     try {
       const data = JSON.parse(jsonStr) as Record<string, Object>
       if (data['type'] === 'ack') return
-      const power = this.readBoolLike(data['power'] as boolean | number | string | undefined)
-      const temp = this.readNumber(data['temp'] as number | string | undefined)
-      const mode = typeof data['mode'] === 'string' ? (data['mode'] as string).toLowerCase() : ''
+      const powerValue = data['power'] !== undefined ? data['power'] : data['p']
+      const tempValue = data['temp'] !== undefined ? data['temp'] : data['tp']
+      const modeValue = data['mode'] !== undefined ? data['mode'] : data['m']
+      const power = this.readBoolLike(powerValue as boolean | number | string | undefined)
+      const temp = this.readNumber(tempValue as number | string | undefined)
+      const rawMode = typeof modeValue === 'string' ? (modeValue as string).toLowerCase() : ''
+      const mode = rawMode === 'c' ? 'cool' : rawMode === 'h' ? 'heat' : rawMode
       if (power !== null) this.bleDebugAcPower = power
       if (temp !== null && temp >= 16 && temp <= 30) this.bleDebugAcTemp = Math.round(temp)
       if (mode === 'cool' || mode === 'heat') this.bleDebugAcMode = mode
@@ -7709,6 +8357,39 @@ struct Index {
       }
     } catch (err) {
       console.info(`[BLE][curtain-status-parse-fail] ${(err as Error).message}`)
+    }
+  }
+
+  handleBleActuatorStatusJson(jsonStr: string, deviceId: string): boolean {
+    if (deviceId !== this.deviceForBleCapability('ac')) {
+      return false
+    }
+    try {
+      const data = JSON.parse(jsonStr) as Record<string, Object>
+      if (data['t'] !== 's') {
+        return false
+      }
+      const power = this.readBoolLike(data['p'] as boolean | number | string | undefined)
+      const temp = this.readNumber(data['tp'] as number | string | undefined)
+      const rawMode = typeof data['m'] === 'string' ? (data['m'] as string).toLowerCase() : ''
+      const mode = rawMode === 'h' ? 'heat' : rawMode === 'c' ? 'cool' : ''
+      const curtain = this.readNumber(data['c'] as number | string | undefined)
+      const seq = typeof data['sq'] === 'number' ? data['sq'] as number : 0
+
+      if (power !== null) this.acPower = power
+      if (temp !== null && temp >= 16 && temp <= 30) this.acTemp = Math.round(temp)
+      if (mode.length > 0) this.acMode = mode
+      if (curtain !== null) {
+        const normalized = Math.max(0, Math.min(100, Math.round(curtain)))
+        this.curtainPercent = normalized
+        this.reportCloudCurtain(normalized)
+      }
+      console.info(`[BLE][actuator-status] power=${this.acPower} temp=${this.acTemp} ` +
+        `mode=${this.acMode} curtain=${this.curtainPercent} seq=${seq}`)
+      return true
+    } catch (err) {
+      console.info(`[BLE][actuator-status-parse-fail] ${(err as Error).message}`)
+      return false
     }
   }
 
@@ -8398,6 +9079,7 @@ struct Index {
     })
     this.deviceRegistryJson = JSON.stringify(registry)
     this.knownDeviceIds = this.knownDeviceIds.filter((knownId: string) => knownId !== deviceId)
+    this.clearLocalHttpCommandQueue(deviceId, 'device-removed')
     this.localGatewayDeviceIds.delete(deviceId)
     this.localGatewayTransportByDevice.delete(deviceId)
 
@@ -8414,9 +9096,13 @@ struct Index {
     this.lastDynamicDecryptAtByDevice.delete(deviceId)
     this.decryptFailCountByDevice.delete(deviceId)
     this.ecdhRecoveryDevices.delete(deviceId)
+    this.networkCryptoRecoveryDevices.delete(deviceId)
     this.lastEcdhRecoveryTimeByDevice.delete(deviceId)
     this.lastEcdhPendingTimeByDevice.delete(deviceId)
     this.lastEcdhInstallTimeByDevice.delete(deviceId)
+    this.lastNetworkEcdhStartAtByDevice.delete(deviceId)
+    this.networkCryptoResetAtByDevice.set(deviceId, Date.now())
+    this.clearPendingEcdhReplyForDevice(deviceId)
     this.invalidateBleDebugKey(deviceId)
     this.bleKeyEpochByDevice.delete(deviceId)
     this.bleKeyDecryptFailuresByDevice.delete(deviceId)
@@ -8480,6 +9166,13 @@ struct Index {
 
   prepareProvisionedDeviceRestart(deviceId: string): void {
     const recoverySeq = ++this.postProvisionBleRecoverySeq
+    const targetDeviceId = this.normalizeDeviceId(deviceId)
+    this.networkCryptoRecoveryDevices.delete(targetDeviceId)
+    this.ecdhRecoveryDevices.delete(targetDeviceId)
+    this.lastEcdhRecoveryTimeByDevice.delete(targetDeviceId)
+    this.clearPendingEcdhReplyForDevice(targetDeviceId)
+    this.switchDeviceToStaticCryptoSession(targetDeviceId, 'provisioned-device-restart',
+      this.cryptoModeForDevice(targetDeviceId))
     this.invalidateBleDebugKey(deviceId)
     this.bleKeyEpochByDevice.delete(deviceId)
     this.bleKeyDecryptFailuresByDevice.delete(deviceId)
@@ -8687,37 +9380,64 @@ struct Index {
     return this.bleDebugHasDynamicKey(deviceId)
   }
 
-  async waitForBleProvisionDeviceConnection(deviceId: string, timeoutMs: number): Promise<boolean> {
+  findBleProvisionTarget(deviceId: string, address: string): GatewayBleDeviceInfo | undefined {
+    const normalizedDeviceId = deviceId.trim()
+    const normalizedAddress = address.trim().toUpperCase()
+    const byId = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
+      normalizedDeviceId.length > 0 && item.deviceId.trim() === normalizedDeviceId)
+    if (byId !== undefined && byId.connected) {
+      return byId
+    }
+    // A stale scan entry and its promoted stable entry can coexist after an
+    // older app version. Prefer the live address match so the first add does
+    // not wait on the obsolete temporary identity.
+    if (normalizedAddress.length > 0) {
+      const connectedByAddress = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
+        item.address.trim().toUpperCase() === normalizedAddress && item.connected)
+      if (connectedByAddress !== undefined) {
+        return connectedByAddress
+      }
+    }
+    if (byId !== undefined) {
+      return byId
+    }
+    return normalizedAddress.length > 0 ? this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
+      item.address.trim().toUpperCase() === normalizedAddress) : undefined
+  }
+
+  async waitForBleProvisionDeviceConnection(deviceId: string, address: string,
+    timeoutMs: number): Promise<GatewayBleDeviceInfo | undefined> {
     const startedAt = Date.now()
     while (Date.now() - startedAt < timeoutMs) {
-      const device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
-        item.deviceId === deviceId)
+      const device = this.findBleProvisionTarget(deviceId, address)
       if (device !== undefined && device.connected) {
-        return true
+        return device
       }
       if (!this.provisioningConnected || !this.provisioningPort.isOpen()) {
-        return false
+        return undefined
       }
       const elapsed = Math.floor((Date.now() - startedAt) / 1000)
       this.bleProvisionStatus = `正在扫描并连接所选设备 · ${elapsed}s`
       await this.waitProvisioningMs(250)
     }
-    const device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
-      item.deviceId === deviceId)
-    return device !== undefined && device.connected
+    const device = this.findBleProvisionTarget(deviceId, address)
+    return device !== undefined && device.connected ? device : undefined
   }
 
-  async provisionDeviceOverBle(deviceId: string): Promise<void> {
+  async provisionDeviceOverBle(selectedDeviceId: string): Promise<void> {
     if (this.bleProvisionBusy) {
       return
     }
-    let device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+    let deviceId = selectedDeviceId
+    let device = this.findBleProvisionTarget(deviceId, deviceId)
     if (device === undefined || !device.connected) {
       if (device === undefined) {
         this.bleProvisionStatus = '所选设备已不在列表中，请重新选择'
         return
       }
     }
+    deviceId = device.deviceId
+    const targetAddress = device.address.trim().toUpperCase()
     if (device.claimed && !device.commissioning) {
       this.bleProvisionSelectedDeviceId = ''
       this.bleProvisionStatus = '该设备已经接入家庭，无需重复添加'
@@ -8742,13 +9462,15 @@ struct Index {
         this.bleProvisionStatus = `蓝牙扫描启动失败：${this.provisioningStatus}`
         return
       }
-      const connected = await this.waitForBleProvisionDeviceConnection(deviceId, 45000)
-      if (!connected) {
+      const connectedDevice = await this.waitForBleProvisionDeviceConnection(deviceId, targetAddress, 45000)
+      if (connectedDevice === undefined) {
         this.bleProvisionBusy = false
         this.bleProvisionStatus = '未能连接所选设备，请确认设备已上电并靠近网关后重试'
         return
       }
-      device = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) => item.deviceId === deviceId)
+      device = connectedDevice
+      deviceId = connectedDevice.deviceId
+      this.bleProvisionSelectedDeviceId = deviceId
       if (device === undefined || !device.connected) {
         this.bleProvisionBusy = false
         this.bleProvisionStatus = '所选设备连接状态已失效，请重试'
@@ -8811,7 +9533,9 @@ struct Index {
       await this.sendBleProvisionCommand(deviceId, { a: 'c', s: session }, 'c')
       this.bleProvisionStatus = '正在将设备添加到家庭'
       await this.claimGatewayBleDevice(deviceId)
-      this.bleProvisionStatus = '设备已保存配置并重启，等待 Wi-Fi 上线'
+      this.bleProvisionStatus = this.bleBusinessDesired ?
+        '设备已保存配置并重启，准备恢复 BLE 安全通道' :
+        '设备已保存配置并重启，等待 Wi-Fi 上线'
       const next = this.gatewayBleDevices.map((item: GatewayBleDeviceInfo): GatewayBleDeviceInfo => {
         if (item.deviceId !== deviceId) {
           return item
@@ -8838,12 +9562,18 @@ struct Index {
       if (provisionedDevice !== undefined) {
         this.restoreProvisionedDeviceFromBle(provisionedDevice, config)
       }
+      this.bleProvisionAwaitingDeviceId = this.normalizeDeviceId(deviceId)
+      this.bleProvisionWifiReady = false
       this.prepareProvisionedDeviceRestart(deviceId)
       this.bleProvisionStatus = this.bleBusinessDesired ?
-        '设备已添加，正在等待 Wi-Fi 上线并重建 BLE 安全通道' :
+        '设备配置已保存，正在重建 BLE 安全通道' :
         '设备已添加，正在等待 Wi-Fi 上线并释放配网蓝牙连接'
       this.bleProvisionSelectedDeviceId = ''
     } catch (err) {
+      if (this.bleProvisionAwaitingDeviceId === this.normalizeDeviceId(deviceId)) {
+        this.bleProvisionAwaitingDeviceId = ''
+        this.bleProvisionWifiReady = false
+      }
       this.bleProvisionStatus = `蓝牙添加失败：${(err as Error).message}`
       this.addProvisioningDiagnosticLog(this.bleProvisionStatus)
     } finally {
@@ -8866,14 +9596,12 @@ struct Index {
       await this.sendBleBusinessJson(targetDeviceId, jsonCmd, bleResponseBudget)
       return
     }
+    await this.waitForNetworkResume(targetDeviceId)
     await this.waitForNetworkCryptoSession(targetDeviceId)
-    // ECDH may take several seconds. Resolve the route afterwards so a freshly
-    // decrypted business packet can correct an outdated MQTT/HTTP route.
-    const protocol = this.protocolPendingMode.length > 0 && targetDeviceId === this.activeDeviceId ?
-      this.protocolPendingMode : this.transportRouteForDevice(targetDeviceId)
-    if (this.protocolPendingMode.length > 0 && targetDeviceId === this.activeDeviceId) {
-      console.info(`[CMD] protocol pending ${this.commandTransport}->${this.protocolPendingMode}, send via target=${protocol}`)
-    }
+    // During a global protocol switch each device may be at a different stage;
+    // use its confirmed route instead of sending every business command to the
+    // pending target route.
+    const protocol = this.transportRouteForDevice(targetDeviceId)
     await this.sendEncryptedCommandUsingCurrentSession(baseUrl, jsonCmd, protocol, topic, targetDeviceId)
   }
 
@@ -8993,7 +9721,8 @@ struct Index {
 
     if (targetProtocol === 'HTTP') {
       if (this.localGatewayDeviceIds.has(targetDeviceId)) {
-        this.localGateway.enqueueCommand(targetDeviceId, commandTopic, payloadBase64, encrypted.length)
+        this.localGateway.enqueueCommand(targetDeviceId, commandTopic, payloadBase64, encrypted.length,
+          this.httpCommandQueueKey(jsonCmd))
         this.cryptoDebugText = `本地HTTP指令已入队 ${encrypted.length}B`
         console.info(`[CMD] local HTTP queued ${encrypted.length}B: ${shortCmd}`)
         this.addMqttMessage(commandTopic, `[SENT:LOCAL-HTTP ${encrypted.length}B] ${shortCmd}`)
@@ -9443,7 +10172,9 @@ struct Index {
     const host = this.localGatewayHost.length > 0 ? this.localGatewayHost : fallbackHost
     this.applyProvisioningTlsMode(this.provisioningUseTls, host.length > 0 ? host : '192.168.3.5')
     this.provisioningCrypto = currentCryptoMode().toLowerCase()
-    this.provisioningTransport = 'mqtt'
+    // Newly claimed devices must join the current Wi-Fi protocol. Otherwise
+    // leaving BLE creates a mixed MQTT/HTTP fleet and an avoidable first switch.
+    this.provisioningTransport = this.commandTransport.toLowerCase() === 'http' ? 'http' : 'mqtt'
   }
 
   applyProvisioningTlsMode(useTls: boolean, preferredHost: string = ''): void {
@@ -10606,6 +11337,13 @@ struct Index {
       lastSeen: Date.now()
     }
 
+    // A scan entry starts with the BLE address and is promoted to the stable
+    // device ID after device_hello. Keep an in-flight add operation attached
+    // to that promoted identity so the UI and command path stay in sync.
+    if (existing !== null && existing.deviceId !== deviceId &&
+      this.bleProvisionSelectedDeviceId === existing.deviceId) {
+      this.bleProvisionSelectedDeviceId = deviceId
+    }
     if (existingIndex >= 0) {
       const next = [...this.gatewayBleDevices]
       next[existingIndex] = device
@@ -11122,9 +11860,15 @@ struct Index {
         })
         this.gatewayBleDevices = this.gatewayBleDevices.slice()
         this.persistGatewayBleDevices()
-        this.bleBusinessState = 'off'
-        this.bleBusinessStatus = `蓝牙模式已关闭 · 当前 ${this.commandTransport} / ${this.cryptoModeForDevice(this.activeDeviceId)}`
-        this.gatewayBleStatus = 'BLE 业务已挂起，家居设备恢复网络通道'
+        if (this.networkResumePendingDevices.size > 0) {
+          this.bleBusinessState = 'network-recovering'
+          this.bleBusinessStatus = `正在恢复 WiFi 通道，还差 ${this.networkResumePendingDevices.size} 台设备`
+          this.gatewayBleStatus = 'BLE 业务已挂起，正在等待家居设备恢复网络通道'
+        } else {
+          this.bleBusinessState = 'off'
+          this.bleBusinessStatus = `蓝牙模式已关闭 · 当前 ${this.commandTransport} / ${this.cryptoModeForDevice(this.activeDeviceId)}`
+          this.gatewayBleStatus = 'WiFi 通道已恢复，家居设备可继续网络控制'
+        }
         return
       }
       if (eventType === 'ble_error') {
@@ -12039,8 +12783,23 @@ struct Index {
   }
 
   settingsProtocolIcon(): Resource {
-    return this.transportForDevice(this.activeDeviceId) === 'HTTP' ?
+    return this.networkProtocolAllInMode('HTTP') ?
       $r('app.media.settings_http_comic') : $r('app.media.settings_mqtt_comic')
+  }
+
+  settingsProtocolSubtitle(): string {
+    if (this.bleBusinessDesired) {
+      return '蓝牙模式下不可用'
+    }
+    if (this.protocolPendingMode.length > 0) {
+      const total = this.protocolSwitchTargets.length
+      return `正在统一到 ${this.protocolPendingMode} · ${this.protocolSwitchAckDevices.size}/${total}`
+    }
+    const count = this.networkTargetDeviceIds().length
+    if (this.networkProtocolAllInMode('HTTP') || this.networkProtocolAllInMode('MQTT')) {
+      return `全屋 ${count} 台 · ${this.networkProtocolSummary()}`
+    }
+    return `通道未统一 · 点击全部切到 ${this.normalizeProtocolMode(this.commandTransport)}`
   }
 
   settingsCryptoIcon(): Resource {
@@ -12062,7 +12821,16 @@ struct Index {
     if (this.bleBusinessDesired) {
       return '蓝牙'
     }
-    return this.transportForDevice(this.activeDeviceId) === 'HTTP' ? 'WiFi · HTTPS' : 'WiFi · MQTTS'
+    if (this.protocolPendingMode.length > 0) {
+      return `WiFi · ${this.networkProtocolSummary()}`
+    }
+    if (this.networkProtocolAllInMode('HTTP')) {
+      return 'WiFi · HTTP'
+    }
+    if (this.networkProtocolAllInMode('MQTT')) {
+      return 'WiFi · MQTT'
+    }
+    return 'WiFi · 混合链路'
   }
 
   settingsFeatureDimmed(action: string): boolean {
@@ -12085,12 +12853,12 @@ struct Index {
     if (this.bleBusinessDesired) {
       return this.bleBusinessStatus
     }
-    return `已关闭 · 备用 ${this.commandTransport}`
+    return `已关闭 · 备用 ${this.networkProtocolSummary()}`
   }
 
   handleSettingsFeature(action: string): void {
-    if (action === 'status') {
-      this.showDeviceStatusPanel = true
+    if (action === 'federated') {
+      this.showFederatedLearningPanel = true
       return
     }
     if (action === 'provisioning') {
@@ -12118,12 +12886,16 @@ struct Index {
     }
     if (action === 'protocol') {
       if (this.bleBusinessDesired) {
-        this.cryptoDebugText = `蓝牙模式中，备用控制通道保持 ${this.commandTransport}`
+        this.cryptoDebugText = `蓝牙模式中，备用控制通道保持 ${this.networkProtocolSummary()}`
         return
       }
       if (this.protocolPendingMode.length === 0) {
-        const currentTransport = this.transportForDevice(this.activeDeviceId)
-        this.selectCommandTransport(currentTransport === 'MQTT' ? 'HTTP' : 'MQTT')
+        if (!this.networkProtocolAllInMode('HTTP') && !this.networkProtocolAllInMode('MQTT')) {
+          this.selectCommandTransport(this.normalizeProtocolMode(this.commandTransport))
+        } else {
+          const currentTransport = this.networkProtocolAllInMode('HTTP') ? 'HTTP' : 'MQTT'
+          this.selectCommandTransport(currentTransport === 'MQTT' ? 'HTTP' : 'MQTT')
+        }
       }
       return
     }
@@ -12365,16 +13137,17 @@ struct Index {
     if (this.bleBusinessDesired) {
       return this.bleBusinessState === 'ready' ? 'BLE' : `BLE(${this.bleBusinessState})`
     }
-    const currentTransport = this.transportForDevice(this.activeDeviceId)
     if (this.protocolPendingMode.length > 0) {
-      return `${currentTransport}->${this.protocolPendingMode}`
+      const total = this.protocolSwitchTargets.length
+      return total > 0 ? `${this.protocolPendingMode} ${this.protocolSwitchAckDevices.size}/${total}` :
+        `切换到 ${this.protocolPendingMode}`
     }
-    return currentTransport
+    return this.networkProtocolSummary()
   }
 
   selectCommandTransport(mode: string): void {
     const target = this.normalizeProtocolMode(mode)
-    const previous = this.transportForDevice(this.activeDeviceId)
+    const previous = this.networkProtocolSummary()
     if (this.protocolPendingMode.length > 0) {
       this.cryptoDebugText = `协议切换中 ${previous}->${this.protocolPendingMode}`
       console.info(`[PROTO][ui-select] ignore ${previous}->${target}; pending=${this.protocolPendingMode}`)
@@ -12458,14 +13231,17 @@ struct Index {
 
   startACAckTimer(seq: number): void {
     this.clearACAckTimer()
+    const deviceId = this.deviceForCapability('ac')
+    const route = this.bleBusinessDesired ? 'BLE' : this.transportRouteForDevice(deviceId)
+    const timeoutMs = route === 'HTTP' ? AC_CONTROL_ACK_TIMEOUT_HTTP_MS : 4500
     this.acAckTimerId = setTimeout(() => {
       if (this.acPendingSeq === seq) {
         this.acPendingSeq = 0
         this.acAckText = `设备确认超时 #${seq}`
-        console.info(`[AC][ack-timeout] seq=${seq}`)
+        console.info(`[AC][ack-timeout] seq=${seq} route=${route} timeout=${timeoutMs}ms`)
       }
       this.acAckTimerId = -1
-    }, 4500)
+    }, timeoutMs)
   }
 
   async requestACControl(reason: string): Promise<void> {
@@ -12811,8 +13587,8 @@ struct Index {
     if (this.showDeviceBindingPanel) {
       this.showDeviceBindingPanel = false
     }
-    if (this.showDeviceStatusPanel) {
-      this.showDeviceStatusPanel = false
+    if (this.showFederatedLearningPanel) {
+      this.showFederatedLearningPanel = false
     }
     if (this.showModelComparisonPanel) {
       this.showModelComparisonPanel = false
@@ -13619,9 +14395,9 @@ struct Index {
           .height(40)
           .fontSize(14)
           .fontWeight(FontWeight.Bold)
-          .fontColor(this.commandTransport === 'MQTT' ? '#FFFFFF' : this.textColor())
+          .fontColor(this.networkProtocolAllInMode('MQTT') ? '#FFFFFF' : this.textColor())
           .textAlign(TextAlign.Center)
-          .backgroundColor(this.commandTransport === 'MQTT' ? this.accentBlue() : this.softPanelBg())
+          .backgroundColor(this.networkProtocolAllInMode('MQTT') ? this.accentBlue() : this.softPanelBg())
           .border({ width: 1, color: this.hairlineColor() })
           .borderRadius(20)
           .onClick(() => {
@@ -13632,9 +14408,9 @@ struct Index {
           .height(40)
           .fontSize(14)
           .fontWeight(FontWeight.Bold)
-          .fontColor(this.commandTransport === 'HTTP' ? '#FFFFFF' : this.textColor())
+          .fontColor(this.networkProtocolAllInMode('HTTP') ? '#FFFFFF' : this.textColor())
           .textAlign(TextAlign.Center)
-          .backgroundColor(this.commandTransport === 'HTTP' ? this.accentBlue() : this.softPanelBg())
+          .backgroundColor(this.networkProtocolAllInMode('HTTP') ? this.accentBlue() : this.softPanelBg())
           .border({ width: 1, color: this.hairlineColor() })
           .borderRadius(20)
           .margin({ left: 10 })
@@ -13724,13 +14500,13 @@ struct Index {
         .backgroundColor(this.isBridgeActuallyConnected() ? this.accentGreen() : this.warningRed())
         .borderRadius(16)
         Column() {
-          Text('设备状态')
+          Text('网络状态')
             .width('100%')
             .fontSize(18)
             .fontWeight(FontWeight.Bold)
             .fontColor(this.textColor())
             .maxLines(1)
-          Text(`${this.registeredDeviceCount()} 台已发现 · ${this.isBridgeActuallyConnected() ? '在线' : '离线'}`)
+          Text(`${this.registeredDeviceCount()} 台已接入 · ${this.isBridgeActuallyConnected() ? '在线' : '离线'}`)
             .width('100%')
             .fontSize(11)
             .fontColor(this.subTextColor())
@@ -13761,7 +14537,7 @@ struct Index {
       .alignItems(VerticalAlign.Center)
       Blank()
         .height(12)
-      Text('选择协议与加密的控制目标')
+      Text('MQTT / HTTP 全屋状态')
         .fontSize(12)
         .fontWeight(FontWeight.Bold)
         .fontColor(this.subTextColor())
@@ -13770,14 +14546,14 @@ struct Index {
       Button() {
         Row() {
           Column() {
-            Text(this.activeDeviceName())
+            Text(`${this.networkTargetDeviceIds().length} 台 WiFi 设备`)
               .width('100%')
               .fontSize(13)
               .fontWeight(FontWeight.Bold)
               .fontColor(this.textColor())
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(this.deviceIdDisplayText(this.activeDeviceId))
+            Text(this.networkProtocolSummary())
               .width('100%')
               .fontSize(10)
               .fontColor(this.accentBlue())
@@ -13812,9 +14588,9 @@ struct Index {
         .borderRadius(14)
         .margin({ top: 8 })
         .onClick(() => {
-          this.selectNextActiveDevice()
+          this.handleSettingsFeature('protocol')
         })
-      Text('协议和加密设置将应用于当前选中的设备')
+      Text('WiFi 协议与 AES / SM4 都会同步全部已接入设备')
         .width('100%')
         .height(28)
         .fontSize(11)
@@ -13935,7 +14711,7 @@ struct Index {
   @Builder
   DeviceBindingSettingCard() {
     Column() {
-      SettingHeaderCell({ title: '设备绑定', desc: `${this.registeredDeviceCount()} 台已发现`, icon: $r('app.media.setting_bridge'), accent: this.accentGreen(), titleColor: this.textColor(), descColor: this.subTextColor() })
+      SettingHeaderCell({ title: '设备绑定', desc: `${this.registeredDeviceCount()} 台已接入 · Wi-Fi / 蓝牙`, icon: $r('app.media.setting_bridge'), accent: this.accentGreen(), titleColor: this.textColor(), descColor: this.subTextColor() })
 
       Image($r('app.media.device_binding_illustration_card'))
         .width('100%')
@@ -14025,7 +14801,7 @@ struct Index {
   @Builder
   SettingsFeatureIcon(icon: Resource, action: string) {
     if (action === 'protocol') {
-      if (this.transportForDevice(this.activeDeviceId) === 'HTTP') {
+      if (this.networkProtocolAllInMode('HTTP')) {
         SettingsFeatureImageCell({ icon: $r('app.media.settings_http_comic'), dimmed: this.protocolPendingMode.length > 0 })
       } else {
         SettingsFeatureImageCell({ icon: $r('app.media.settings_mqtt_comic'), dimmed: this.protocolPendingMode.length > 0 })
@@ -14092,10 +14868,10 @@ struct Index {
       Grid() {
         GridItem() {
           SettingsFeatureCardCell({
-            title: '设备状态', subtitle: '点击图标查看设备状态',
+            title: '联邦学习', subtitle: '家庭行为模型与本地训练',
             icon: $r('app.media.settings_device_status_comic'), dimmed: false,
             textColor: this.textColor(), subTextColor: this.subTextColor(), cardBg: this.cardBg(),
-            cardBorderColor: this.accentGreen(), onTap: () => { this.handleSettingsFeature('status') }
+            cardBorderColor: this.accentGreen(), onTap: () => { this.handleSettingsFeature('federated') }
           })
         }
         GridItem() {
@@ -14140,7 +14916,7 @@ struct Index {
         }
         GridItem() {
           SettingsFeatureCardCell({
-            title: '控制通道', subtitle: this.bleBusinessDesired ? '蓝牙模式下不可用' : '点击图标切换控制协议',
+            title: '控制通道', subtitle: this.settingsProtocolSubtitle(),
             icon: this.settingsProtocolIcon(), dimmed: this.settingsFeatureDimmed('protocol'),
             disabled: this.bleBusinessDesired,
             textColor: this.textColor(), subTextColor: this.subTextColor(), cardBg: this.cardBg(),
@@ -14723,9 +15499,9 @@ struct Index {
             .height(30)
             .fontSize(12)
             .fontWeight(FontWeight.Bold)
-            .fontColor(this.commandTransport === 'MQTT' ? '#FFFFFF' : this.textColor())
+            .fontColor(this.networkProtocolAllInMode('MQTT') ? '#FFFFFF' : this.textColor())
             .textAlign(TextAlign.Center)
-            .backgroundColor(this.commandTransport === 'MQTT' ? this.accentBlue() : this.softPanelBg())
+            .backgroundColor(this.networkProtocolAllInMode('MQTT') ? this.accentBlue() : this.softPanelBg())
             .border({ width: 1, color: this.hairlineColor() })
             .borderRadius(15)
             .onClick(() => {
@@ -14736,9 +15512,9 @@ struct Index {
             .height(30)
             .fontSize(12)
             .fontWeight(FontWeight.Bold)
-            .fontColor(this.commandTransport === 'HTTP' ? '#FFFFFF' : this.textColor())
+            .fontColor(this.networkProtocolAllInMode('HTTP') ? '#FFFFFF' : this.textColor())
             .textAlign(TextAlign.Center)
-            .backgroundColor(this.commandTransport === 'HTTP' ? this.accentBlue() : this.softPanelBg())
+            .backgroundColor(this.networkProtocolAllInMode('HTTP') ? this.accentBlue() : this.softPanelBg())
             .border({ width: 1, color: this.hairlineColor() })
             .borderRadius(15)
             .margin({ left: 8 })
@@ -15955,37 +16731,48 @@ struct Index {
   }
 
   @Builder
-  DeviceStatusPanel() {
+  DeviceChannelStatusRow(label: string, value: string, statusColor: string) {
+    Row() {
+      Row() {}
+        .width(8)
+        .height(8)
+        .borderRadius(4)
+        .backgroundColor(statusColor)
+      Text(label)
+        .width(54)
+        .fontSize(11)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(this.textColor())
+        .margin({ left: 8 })
+      Text(value)
+        .layoutWeight(1)
+        .fontSize(11)
+        .fontColor(statusColor)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width('100%')
+    .height(22)
+    .margin({ top: 3 })
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  FederatedLearningPanel() {
     Column() {
       Row() {
         Column() {
-          Text('设备状态')
+          Text('联邦学习')
             .fontSize(24)
             .fontWeight(FontWeight.Bold)
             .fontColor(this.textColor())
-          Text(`${this.registeredDeviceCount()} 台设备 · ${this.isBridgeActuallyConnected() ? '通信正常' : '等待连接'}`)
+          Text(`${this.modelSource} v${this.modelActiveVersion} · 本地训练与模型聚合`)
             .fontSize(12)
-            .fontColor(this.isBridgeActuallyConnected() ? this.accentGreen() : this.warningRed())
+            .fontColor(this.subTextColor())
             .margin({ top: 4 })
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
-
-        Button() {
-          Image($r('app.media.setting_refresh'))
-            .width(19)
-            .height(19)
-            .objectFit(ImageFit.Contain)
-        }
-        .width(40)
-        .height(40)
-        .padding(0)
-        .backgroundColor(this.accentBlue())
-        .borderRadius(20)
-        .margin({ right: 10 })
-        .onClick(() => {
-          this.reconnectBridge()
-        })
 
         Button('关闭')
           .width(70)
@@ -15995,7 +16782,7 @@ struct Index {
           .backgroundColor('#2E3033')
           .borderRadius(18)
           .onClick(() => {
-            this.showDeviceStatusPanel = false
+            this.showFederatedLearningPanel = false
           })
       }
       .width('100%')
@@ -16005,307 +16792,278 @@ struct Index {
 
       Scroll() {
         Column() {
-        Row() {
-          Column() {
-          Text(this.activeDeviceName())
-            .width('100%')
-            .fontSize(18)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(this.textColor())
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(this.deviceIdDisplayText(this.activeDeviceId))
-            .width('100%')
-            .fontSize(11)
-            .fontColor(this.accentBlue())
-            .margin({ top: 4 })
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-        }
-        .layoutWeight(1)
-        .alignItems(HorizontalAlign.Start)
-
-        Column() {
-          Text(`${this.transportForDevice(this.activeDeviceId)} / ${this.cryptoModeForDevice(this.activeDeviceId)}-GCM`)
-            .fontSize(14)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(this.accentGreen())
-          Text(this.activeDeviceLastSeenText())
-            .fontSize(11)
-            .fontColor(this.subTextColor())
-            .margin({ top: 4 })
-        }
-        .alignItems(HorizontalAlign.End)
-      }
-      .width('100%')
-      .height(78)
-      .padding({ left: 18, right: 18 })
-      .margin({ top: 18 })
-      .alignItems(VerticalAlign.Center)
-      .backgroundColor(this.softPanelBg())
-      .border({ width: 1.5, color: this.accentBlue() })
-      .borderRadius(12)
-
-      Column() {
-        Row() {
-          Column() {
-            Text('家庭行为模型')
-              .fontSize(16)
-              .fontWeight(FontWeight.Bold)
-              .fontColor(this.textColor())
-            Text(`${this.modelSource} v${this.modelActiveVersion} · ${this.modelStatusText}`)
-              .fontSize(11)
-              .fontColor(this.subTextColor())
-              .margin({ top: 3 })
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start)
-
-          Button('模型对比')
-            .height(32)
-            .fontSize(12)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#2E3033')
-            .borderRadius(8)
-            .onClick(() => {
-              this.showModelComparisonPanel = true
-            })
-          Button('检查更新')
-            .height(32)
-            .fontSize(12)
-            .fontColor('#FFFFFF')
-            .backgroundColor(this.accentBlue())
-            .borderRadius(8)
-            .margin({ left: 8 })
-            .onClick(() => {
-              this.refreshBehaviorModel()
-            })
-        }
-        .width('100%')
-        .alignItems(VerticalAlign.Center)
-
-        Row() {
-          Text('启用模型建议')
-            .fontSize(13)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(this.textColor())
-            .layoutWeight(1)
-          Toggle({ type: ToggleType.Switch, isOn: this.modelSuggestionEnabled })
-            .width(44)
-            .height(24)
-            .selectedColor(this.accentGreen())
-            .onChange((enabled: boolean) => {
-              this.modelSuggestionEnabled = enabled
-              if (!enabled) {
-                this.dismissModelSuggestion()
-              } else {
-                this.handleBehaviorObservation(this.buildFederatedObservation())
-              }
-            })
-        }
-        .width('100%')
-        .height(34)
-        .margin({ top: 8 })
-
-        if (this.modelSuggestionEnabled) {
           Row() {
             Column() {
-              Text('联邦需求链路')
+              Text('当前模型')
+                .fontSize(11)
+                .fontColor(this.subTextColor())
+              Text(`v${this.modelActiveVersion}`)
+                .fontSize(15)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(this.accentGreen())
+                .margin({ top: 4 })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Center)
+
+            Row() {}
+              .width(1)
+              .height(34)
+              .backgroundColor(this.hairlineColor())
+
+            Column() {
+              Text('本地样本')
+                .fontSize(11)
+                .fontColor(this.subTextColor())
+              Text(`${this.modelComparison.sample_count}`)
+                .fontSize(15)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(this.accentBlue())
+                .margin({ top: 4 })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Center)
+
+            Row() {}
+              .width(1)
+              .height(34)
+              .backgroundColor(this.hairlineColor())
+
+            Column() {
+              Text('有效操作')
+                .fontSize(11)
+                .fontColor(this.subTextColor())
+              Text(`${this.modelComparison.action_sample_count}`)
+                .fontSize(15)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(this.accentOrange())
+                .margin({ top: 4 })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Center)
+          }
+          .width('100%')
+          .height(64)
+          .padding({ left: 12, right: 12 })
+          .margin({ top: 18 })
+          .alignItems(VerticalAlign.Center)
+          .backgroundColor(this.softPanelBg())
+          .border({ width: 1, color: this.hairlineColor() })
+          .borderRadius(8)
+
+          Column() {
+            Row() {
+              Column() {
+                Text('家庭行为模型')
+                  .fontSize(16)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.textColor())
+                Text(this.modelStatusText)
+                  .fontSize(11)
+                  .fontColor(this.subTextColor())
+                  .margin({ top: 3 })
+                  .maxLines(2)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+
+              Button('模型对比')
+                .height(32)
+                .fontSize(12)
+                .fontColor('#FFFFFF')
+                .backgroundColor('#2E3033')
+                .borderRadius(8)
+                .onClick(() => {
+                  this.showModelComparisonPanel = true
+                })
+              Button('检查更新')
+                .height(32)
+                .fontSize(12)
+                .fontColor('#FFFFFF')
+                .backgroundColor(this.accentBlue())
+                .borderRadius(8)
+                .margin({ left: 8 })
+                .onClick(() => {
+                  this.refreshBehaviorModel()
+                })
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+
+            Row() {
+              Column() {
+                Text('模型来源')
+                  .fontSize(12)
+                  .fontColor(this.subTextColor())
+                Text(`${this.modelSource} · 联邦聚合`)
+                  .fontSize(13)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(this.textColor())
+                  .margin({ top: 2 })
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+              Text('原始记录保留在本地')
+                .fontSize(11)
+                .fontColor(this.accentGreen())
+            }
+            .width('100%')
+            .height(42)
+            .margin({ top: 8 })
+            .alignItems(VerticalAlign.Center)
+
+            Row() {
+              Text('启用模型建议')
                 .fontSize(13)
                 .fontWeight(FontWeight.Medium)
                 .fontColor(this.textColor())
-              Text('状态 → 需求模型 → 资格门 → 规划 → 安全门 → 工具调用')
-                .fontSize(10)
-                .fontColor(this.subTextColor())
-                .margin({ top: 2 })
-            }
-            .layoutWeight(1)
-            .alignItems(HorizontalAlign.Start)
-          }
-          .width('100%')
-          .height(40)
-
-          Row() {
-            Text('联邦演示执行')
-              .fontSize(13)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(this.textColor())
-              .layoutWeight(1)
-            Toggle({ type: ToggleType.Switch, isOn: this.federatedDemoExecutionEnabled })
-              .width(44)
-              .height(24)
-              .selectedColor(this.accentGreen())
-              .onChange((enabled: boolean) => {
-                this.federatedDemoExecutionEnabled = enabled
-                this.federatedPlan = null
-                this.federatedPlanReady = false
-                this.federatedPlanText = ''
-                this.federatedQualificationAction = ''
-                this.federatedQualificationCount = 0
-                this.modelStatusText = enabled ? '联邦演示已开启：需要两次同向状态采样并由用户确认' :
-                  '联邦演示已关闭：仅展示模型建议'
-                if (enabled) this.handleBehaviorObservation(this.buildFederatedObservation())
-              })
-          }
-          .width('100%')
-          .height(34)
-          .margin({ top: 4 })
-
-          if (this.modelSuggestionAction.length > 0) {
-            Row() {
-              Column() {
-                Text(this.modelActionText())
-                  .fontSize(14)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor(this.accentGreen())
-                Text(`${this.modelSuggestionReason} · 置信度 ${(this.modelSuggestionConfidence * 100).toFixed(1)}%`)
-                  .fontSize(10)
-                  .fontColor(this.subTextColor())
-                  .margin({ top: 3 })
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-              }
-              .layoutWeight(1)
-              .alignItems(HorizontalAlign.Start)
-              Button('忽略')
-                .height(30)
-                .fontSize(11)
-                .fontColor(this.subTextColor())
-                .backgroundColor(this.cardBg())
-                .border({ width: 1, color: this.hairlineColor() })
-                .borderRadius(8)
-                .onClick(() => this.dismissModelSuggestion())
+                .layoutWeight(1)
+              Toggle({ type: ToggleType.Switch, isOn: this.modelSuggestionEnabled })
+                .width(44)
+                .height(24)
+                .selectedColor(this.accentGreen())
+                .onChange((enabled: boolean) => {
+                  this.modelSuggestionEnabled = enabled
+                  if (!enabled) {
+                    this.dismissModelSuggestion()
+                  } else {
+                    this.handleBehaviorObservation(this.buildFederatedObservation())
+                  }
+                })
             }
             .width('100%')
-            .height(48)
-            .padding({ left: 10, right: 8 })
-            .backgroundColor(this.cardBg())
-            .border({ width: 1, color: this.accentGreen() })
-            .borderRadius(8)
+            .height(34)
+            .margin({ top: 6 })
 
-            if (this.federatedPlanReady) {
+            if (this.modelSuggestionEnabled) {
               Row() {
                 Column() {
-                  Text('待确认演示计划')
-                    .fontSize(12)
+                  Text('联邦需求链路')
+                    .fontSize(13)
                     .fontWeight(FontWeight.Medium)
                     .fontColor(this.textColor())
-                  Text(this.federatedPlanText)
+                  Text('状态 → 需求模型 → 资格门 → 规划 → 安全门 → 工具调用')
                     .fontSize(10)
                     .fontColor(this.subTextColor())
                     .margin({ top: 2 })
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
                 }
                 .layoutWeight(1)
                 .alignItems(HorizontalAlign.Start)
-                Button('执行计划')
-                  .height(30)
-                  .fontSize(11)
-                  .fontColor('#FFFFFF')
-                  .backgroundColor(this.accentBlue())
-                  .borderRadius(8)
-                  .onClick(() => {
-                    this.executeFederatedDemoPlan()
+              }
+              .width('100%')
+              .height(40)
+
+              Row() {
+                Text('联邦演示执行')
+                  .fontSize(13)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(this.textColor())
+                  .layoutWeight(1)
+                Toggle({ type: ToggleType.Switch, isOn: this.federatedDemoExecutionEnabled })
+                  .width(44)
+                  .height(24)
+                  .selectedColor(this.accentGreen())
+                  .onChange((enabled: boolean) => {
+                    this.federatedDemoExecutionEnabled = enabled
+                    this.federatedPlan = null
+                    this.federatedPlanReady = false
+                    this.federatedPlanText = ''
+                    this.federatedQualificationAction = ''
+                    this.federatedQualificationCount = 0
+                    this.modelStatusText = enabled ? '联邦演示已开启：需要两次同向状态采样并由用户确认' :
+                      '联邦演示已关闭：仅展示模型建议'
+                    if (enabled) this.handleBehaviorObservation(this.buildFederatedObservation())
                   })
               }
               .width('100%')
-              .height(48)
-              .padding({ left: 10, right: 8 })
-              .margin({ top: 6 })
-              .backgroundColor(this.cardBg())
-              .border({ width: 1, color: this.accentBlue() })
-              .borderRadius(8)
-            }
-          }
-        }
-      }
-      .width('100%')
-      .padding({ left: 14, right: 14, top: 12, bottom: 10 })
-      .margin({ top: 10 })
-      .backgroundColor(this.softPanelBg())
-      .border({ width: 1, color: this.hairlineColor() })
-      .borderRadius(10)
+              .height(34)
+              .margin({ top: 4 })
 
-      Row() {
-        Text('已发现设备')
-          .fontSize(13)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(this.textColor())
-          .layoutWeight(1)
-        Text('点击设备可切换控制目标')
-          .fontSize(11)
-          .fontColor(this.subTextColor())
-      }
-      .width('100%')
-      .margin({ top: 16, bottom: 8 })
+              if (this.modelSuggestionAction.length > 0) {
+                Row() {
+                  Column() {
+                    Text(this.modelActionText())
+                      .fontSize(14)
+                      .fontWeight(FontWeight.Bold)
+                      .fontColor(this.accentGreen())
+                    Text(`${this.modelSuggestionReason} · 置信度 ${(this.modelSuggestionConfidence * 100).toFixed(1)}%`)
+                      .fontSize(10)
+                      .fontColor(this.subTextColor())
+                      .margin({ top: 3 })
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }
+                  .layoutWeight(1)
+                  .alignItems(HorizontalAlign.Start)
+                  Button('忽略')
+                    .height(30)
+                    .fontSize(11)
+                    .fontColor(this.subTextColor())
+                    .backgroundColor(this.cardBg())
+                    .border({ width: 1, color: this.hairlineColor() })
+                    .borderRadius(8)
+                    .onClick(() => this.dismissModelSuggestion())
+                }
+                .width('100%')
+                .height(48)
+                .padding({ left: 10, right: 8 })
+                .backgroundColor(this.cardBg())
+                .border({ width: 1, color: this.accentGreen() })
+                .borderRadius(8)
 
-      List({ space: 8 }) {
-        ForEach(this.deviceBindingIds(), (deviceId: string) => {
-          ListItem() {
-            Row() {
-              Column() {
-                Text(this.deviceBindingNameForId(deviceId))
+                if (this.federatedPlanReady) {
+                  Row() {
+                    Column() {
+                      Text('待确认演示计划')
+                        .fontSize(12)
+                        .fontWeight(FontWeight.Medium)
+                        .fontColor(this.textColor())
+                      Text(this.federatedPlanText)
+                        .fontSize(10)
+                        .fontColor(this.subTextColor())
+                        .margin({ top: 2 })
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    }
+                    .layoutWeight(1)
+                    .alignItems(HorizontalAlign.Start)
+                    Button('执行计划')
+                      .height(30)
+                      .fontSize(11)
+                      .fontColor('#FFFFFF')
+                      .backgroundColor(this.accentBlue())
+                      .borderRadius(8)
+                      .onClick(() => {
+                        this.executeFederatedDemoPlan()
+                      })
+                  }
                   .width('100%')
-                  .fontSize(15)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor(this.textColor())
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                Text(`${this.deviceIdDisplayText(deviceId)} · ${this.deviceBindingCapabilitiesForId(deviceId)}`)
-                  .width('100%')
-                  .fontSize(11)
-                  .fontColor(this.subTextColor())
-                  .margin({ top: 4 })
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .height(48)
+                  .padding({ left: 10, right: 8 })
+                  .margin({ top: 6 })
+                  .backgroundColor(this.cardBg())
+                  .border({ width: 1, color: this.accentBlue() })
+                  .borderRadius(8)
+                }
               }
-              .layoutWeight(1)
-              .alignItems(HorizontalAlign.Start)
-
-              Text(deviceId === this.activeDeviceId ? '当前目标' :
-                `${this.transportForDevice(deviceId)} / ${this.cryptoModeForDevice(deviceId)}`)
-                .fontSize(11)
-                .fontWeight(FontWeight.Bold)
-                .fontColor(deviceId === this.activeDeviceId ? this.accentGreen() : this.accentBlue())
             }
-            .width('100%')
-            .height(62)
-            .padding({ left: 14, right: 14 })
-            .alignItems(VerticalAlign.Center)
-            .backgroundColor(this.softPanelBg())
-            .border({ width: 1, color: deviceId === this.activeDeviceId ?
-              this.accentGreen() : this.hairlineColor() })
-            .borderRadius(10)
-            .onClick(() => {
-              this.selectActiveDevice(deviceId)
-            })
           }
-        }, (deviceId: string) => deviceId)
-      }
-      .width('100%')
-      .height(Math.max(70, this.deviceBindingIds().length * 70))
-      .scrollBar(BarState.Auto)
-      .edgeEffect(EdgeEffect.None)
-
-      Text(`能力：${this.activeDeviceCapabilitiesText()} · 绑定：${this.activeDeviceBindingsText()} · ${this.activeDeviceKeyText()}`)
+          .width('100%')
+          .padding({ left: 14, right: 14, top: 12, bottom: 10 })
+          .margin({ top: 10, bottom: 18 })
+          .backgroundColor(this.softPanelBg())
+          .border({ width: 1, color: this.hairlineColor() })
+          .borderRadius(8)
+        }
         .width('100%')
-        .fontSize(11)
-        .fontColor(this.subTextColor())
-        .margin({ top: 10 })
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .padding({ left: 22, right: 22, bottom: 22 })
       }
       .width('100%')
-      .padding({ left: 22, right: 22, bottom: 22 })
-    }
-    .width('100%')
-    .layoutWeight(1)
-    .scrollable(ScrollDirection.Vertical)
-    .scrollBar(BarState.Auto)
-    .edgeEffect(EdgeEffect.Spring)
+      .layoutWeight(1)
+      .scrollable(ScrollDirection.Vertical)
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring)
     }
     .width(780)
     .height(500)
@@ -16436,7 +17194,7 @@ struct Index {
             .fontSize(22)
             .fontWeight(FontWeight.Bold)
             .fontColor(this.textColor())
-          Text(`${this.deviceBindingIds().length} 台设备 · 按设备能力分配控制卡片`)
+          Text(`${this.deviceBindingIds().length} 台已接入 · Wi-Fi / 蓝牙通道与控制卡片`)
             .fontSize(12)
             .fontColor(this.subTextColor())
             .margin({ top: 4 })
@@ -16457,7 +17215,8 @@ struct Index {
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      Text('设备列表')
+      Text(`蓝牙已连接 ${this.addedBleConnectedCount()} / ${this.deviceBindingIds().length} · ` +
+        `安全通道 ${this.addedBleSecureCount()} / ${this.deviceBindingIds().length}`)
         .width('100%')
         .fontSize(12)
         .fontColor(this.subTextColor())
@@ -16477,12 +17236,6 @@ struct Index {
                   .fontColor(this.textColor())
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
-                if (deviceId === this.activeDeviceId) {
-                  Text('当前目标')
-                    .fontSize(10)
-                    .fontColor(this.accentBlue())
-                    .margin({ left: 8 })
-                }
               }
               .width('100%')
               Text(this.deviceIdDisplayText(deviceId))
@@ -16499,6 +17252,15 @@ struct Index {
                 .margin({ top: 5 })
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
+              this.DeviceChannelStatusRow('Wi-Fi', this.deviceWifiChannelText(deviceId), this.accentBlue())
+              this.DeviceChannelStatusRow('蓝牙', this.deviceBleChannelText(deviceId),
+                this.deviceBleChannelColor(deviceId))
+              Text('控制卡片')
+                .width('100%')
+                .fontSize(11)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(this.subTextColor())
+                .margin({ top: 6 })
               Flex({ direction: FlexDirection.Row, wrap: FlexWrap.Wrap }) {
                 ForEach(this.bindingControlCapabilities(), (capability: string) => {
                   Button(this.bindingCapabilityLabel(capability))
@@ -16527,7 +17289,7 @@ struct Index {
             .alignItems(HorizontalAlign.Start)
             .backgroundColor(this.softPanelBg())
             .border({ width: 1, color: this.hairlineColor() })
-            .borderRadius(12)
+            .borderRadius(8)
           }
         }, (deviceId: string) => deviceId)
       }
@@ -18087,9 +18849,9 @@ struct Index {
         .width('100%')
         .height('100%')
         .backgroundColor('rgba(32, 36, 42, 0.58)')
-      } else if (this.showDeviceStatusPanel) {
+      } else if (this.showFederatedLearningPanel) {
         Stack({ alignContent: Alignment.Center }) {
-          this.DeviceStatusPanel()
+          this.FederatedLearningPanel()
         }
         .width('100%')
         .height('100%')

@@ -35,8 +35,13 @@ export class LocalGatewayService {
     return localGateway.getStatus()
   }
 
-  enqueueCommand(deviceId: string, topic: string, payloadBase64: string, bytes: number): boolean {
-    return localGateway.enqueueCommand(deviceId, topic, payloadBase64, bytes)
+  enqueueCommand(deviceId: string, topic: string, payloadBase64: string, bytes: number,
+    queueKey: string = ''): boolean {
+    return localGateway.enqueueCommand(deviceId, topic, payloadBase64, bytes, queueKey)
+  }
+
+  clearCommands(deviceId: string): number {
+    return localGateway.clearCommands(deviceId)
   }
 
   private startEventPump(): void {
