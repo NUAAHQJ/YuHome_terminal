@@ -1,16 +1,3 @@
-/**
- * 禹家终端主题配色。
- *
- * 从 Index.ets 抽出的 20 个颜色方法，全部改为纯函数：输入只有
- * isDarkMode / hasAlarm / alertLevel 三个原始值，输出颜色字符串，
- * 不引用任何 @State，方便 Index 本体和各拆分面板共用同一套配色，
- * 避免每个子组件各自复制一份判断逻辑。
- *
- * 每个函数体与原 Index.ets 中对应方法逐字保持一致，只是把
- * `this.hasActiveDeviceAlarm()` 换成参数 hasAlarm，`this.isDarkMode`
- * 换成参数 isDark。颜色取值本身未作任何修改。
- */
-
 export function pageBg(isDark: boolean, hasAlarm: boolean): string {
   if (hasAlarm) {
     return isDark ? '#2B0D12' : '#F9E8E9'

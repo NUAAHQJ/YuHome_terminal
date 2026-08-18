@@ -143,8 +143,6 @@ bool Runtime::Initialize(const std::vector<uint8_t> &modelData, const std::strin
     }
     const char *runtimeVersion = apiBase->GetVersionString();
     impl_->runtimeVersion = runtimeVersion == nullptr ? "unknown" : runtimeVersion;
-    // sherpa_onnx 1.13.3 packages ONNX Runtime 1.16.3. The v1.17.1
-    // declarations are ABI-compatible for the API 16 calls used here.
     impl_->api = apiBase->GetApi(kRequiredOrtApiVersion);
     if (impl_->api == nullptr) {
         message = "ONNX Runtime does not support the requested C API version";

@@ -98,6 +98,10 @@ export interface BehaviorModelStatus {
 
 const MODEL_FILE: string = 'yujia_behavior_model.json'
 const MIN_SUGGESTION_CONFIDENCE: number = 0.75
+const BEHAVIOR_NEED_LABELS: string[] = [
+  'no_action', 'lighting_brighten_needed', 'lighting_reduce_needed',
+  'thermal_cooler_needed', 'thermal_warmer_needed', 'away_candidate'
+]
 
 function defaultComparison(): ModelComparison {
   return {
@@ -249,9 +253,14 @@ export class BehaviorModelEngine {
     }
     if (model.architecture.length !== 4 || model.architecture[0] !== 25 ||
       model.architecture[1] !== 32 || model.architecture[2] !== 16 ||
-      model.architecture[3] !== model.labels.length || model.labels.length < 2 ||
-      model.labels[0] !== 'no_action') {
+      model.architecture[3] !== model.labels.length ||
+      model.labels.length !== BEHAVIOR_NEED_LABELS.length) {
       throw new Error('模型结构与大禹推理器不匹配')
+    }
+    for (let index = 0; index < BEHAVIOR_NEED_LABELS.length; index++) {
+      if (model.labels[index] !== BEHAVIOR_NEED_LABELS[index]) {
+        throw new Error('模型标签与需求规划协议不匹配')
+      }
     }
     this.checkMatrix(model.parameters.fc1_weight, 32, 25, 'fc1')
     this.checkVector(model.parameters.fc1_bias, 32, 'fc1_bias')

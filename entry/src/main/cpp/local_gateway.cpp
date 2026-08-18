@@ -35,9 +35,6 @@ extern "C" {
 #include "nng/supplemental/nanolib/cJSON.h"
 }
 
-// SDK 23 fortifies FD_SET through __fd_chk, while the Dayu system image does
-// not export that helper. MbedTLS validates descriptors before FD_SET, so this
-// weak compatibility definition preserves the same bounds check.
 extern "C" __attribute__((weak)) void __fd_chk(int fd)
 {
     if (fd < 0 || fd >= FD_SETSIZE) {
@@ -287,8 +284,6 @@ public:
                 MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
         }
         if (result == 0) {
-            // The HTTPS listener handles several ESP32 clients concurrently. The bundled
-            // Mbed TLS build has no threading layer, so serialize access to the shared DRBG.
             mbedtls_ssl_conf_rng(&httpsConfig_, HttpsRandom, this);
             result = mbedtls_ssl_conf_own_cert(&httpsConfig_, &httpsCertificate_, &httpsPrivateKey_);
         }
@@ -362,9 +357,6 @@ public:
             }
         }
         const std::string commandId = command.id;
-        // Protocol changes must be consumed before stale ECDH/status traffic.
-        // Each device has its own queue, so this does not reorder commands for
-        // the other ESP32.
         if (queueKey == "proto" || queueKey == "crypto") {
             queue.push_front(std::move(command));
         } else {

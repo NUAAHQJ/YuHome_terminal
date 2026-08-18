@@ -78,9 +78,6 @@ class HierarchicalBuilder:
         key = normalized_key(text)
         owner = self.seen.get(key)
         if owner is not None:
-            # Base data is ingested first.  A generated augmentation that
-            # collides with any existing utterance is omitted instead of being
-            # copied into a second split.
             return
         self.seen[key] = split
         self.rows[split].append(

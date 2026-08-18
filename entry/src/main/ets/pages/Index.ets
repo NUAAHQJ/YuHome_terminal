@@ -420,8 +420,6 @@ const BRIDGE_TLS_COMMAND_CONNECT_TIMEOUT_MS: number = 6000
 const MQTT_AUTO_CONNECT_TIMEOUT_MS: number = 8000
 const BRIDGE_TLS_AUTO_CONNECT_MIN_INTERVAL_MS: number = 8000
 const KEY_EXCHANGE_HTTP_POLL_MIN_INTERVAL_MS: number = 10000
-// This DAYU firmware only accepts strings in TLSSocket.send(), so MQTT binary
-// frames use the Broker's Base64-framed mutual-TLS bridge instead.
 const DAYU_DIRECT_MQTT_ENABLED: boolean = false
 const DAYU_PREFER_MQTT_TLS: boolean = true
 const DAYU_ALLOW_PLAIN_MQTT_FALLBACK: boolean = false
@@ -461,7 +459,6 @@ const JIANGNING_LATITUDE: number = 31.953168
 const JIANGNING_LONGITUDE: number = 118.83951
 const OUTDOOR_WEATHER_REFRESH_MS: number = 10 * 60 * 1000
 // 温湿度读数未变化时，"已更新"时间戳的最小刷新间隔。
-// ESP32 每秒上报一次，逐包刷新会让整页每秒重渲染一次。
 const SENSOR_DISPLAY_REFRESH_MS: number = 10 * 1000
 // 云端传感器上报的最小间隔。告警走 queueCloudAlarmReport 独立通道，不受此限制。
 const CLOUD_SENSOR_MIN_INTERVAL_MS: number = 5 * 1000
@@ -605,6 +602,7 @@ struct Index {
   @State modelSuggestionAction: string = ''
   @State modelSuggestionReason: string = ''
   @State modelSuggestionConfidence: number = 0
+  @State showModelSuggestionDialog: boolean = false
   @State federatedPlanText: string = ''
   @State federatedPlanReady: boolean = false
   @State modelComparison: ModelComparison = {
@@ -694,7 +692,6 @@ struct Index {
   @State bleDebugKeyReadyDeviceId: string = ''
   @State bleKeyReadyDeviceIds: string[] = []
   @State bleDebugKeyBusy: boolean = false
-  // MQTT 消息记录（替代旧 UDP 列表）
   @State mqttMessages: MessageItem[] = []
   private mqttMessageBuffer: MessageItem[] = []
   @State mqttLastMsgTime: string = '--:--:--'
@@ -1730,7 +1727,6 @@ struct Index {
         return command
       }
     } catch (_) {
-      // Opaque payloads such as IR data retain FIFO delivery.
     }
     return ''
   }
@@ -1760,8 +1756,6 @@ struct Index {
     if (capableDeviceIds.length > 0) {
       return capableDeviceIds[0]
     }
-    // The current curtain motor is hosted by the AC controller. Until a
-    // dedicated curtain binding is selected, keep both controls on that board.
     if (capability === 'curtain' && this.acDeviceId !== 'auto' && this.acDeviceId.length > 0) {
       return this.acDeviceId
     }
@@ -2072,8 +2066,6 @@ struct Index {
         })
       }
       const existingDescriptor = this.loadDeviceRegistry()[announcedId]
-      // device_hello reports the device's observation, but must not overwrite
-      // the transport/crypto mode selected and persisted by Dayu.
       const reportedTransport = typeof data['transport'] === 'string' ? data['transport'] as string : ''
       const reportedCrypto = typeof data['crypto'] === 'string' ? data['crypto'] as string : ''
       const configuredTransport = existingDescriptor && existingDescriptor.transport.length > 0 ?
@@ -2644,9 +2636,6 @@ struct Index {
     }
     this.bleBusinessDesired = true
     this.networkResumePendingDevices.clear()
-    // A disconnect-all ACK can arrive after the user has already enabled BLE.
-    // Cancel its ownership here; the ACK handler will recover the gateway if
-    // the command was already executed on the wire.
     this.gatewayBleSuspendPendingSeq = -1
     this.bleBusinessAutoFailover = automatic
     this.bleBusinessState = 'connecting'
@@ -2666,9 +2655,6 @@ struct Index {
         throw new Error('未能连接蓝牙 USB 网关')
       }
 
-      // A transport switch does not require a gateway reboot. Reuse the open
-      // USB session, verify it, then let the normal recovery handshake reconnect
-      // both peripherals and negotiate fresh BLE keys.
       this.bleBusinessState = 'recovering'
       this.bleBusinessStatus = '蓝牙网关已连接，正在恢复两台家居设备'
       if (this.gatewayBleReconnecting || this.gatewayBleScanning) {
@@ -2748,8 +2734,6 @@ struct Index {
         this.bleProvisionStatus = '设备配置已保存，正在重建 BLE 安全通道'
         return
       }
-      // BLE business mode deliberately suspends network polling. A restored
-      // dynamic key is the authoritative readiness signal in this mode.
       this.bleProvisionStatus = '设备添加完成 · BLE 安全通道已就绪'
     } else {
       if (!this.bleProvisionWifiReady) {
@@ -2937,11 +2921,6 @@ struct Index {
     if (now - this.networkHealthMonitoringStartedAt < NETWORK_FAILOVER_START_GRACE_MS) {
       return
     }
-    // Sensor/status packets are event driven and some devices can legitimately
-    // stay silent for a long time. Missing timestamps (especially immediately
-    // after manually leaving BLE mode) therefore do not prove Wi-Fi failure.
-    // Fail over only after two real command dispatch failures; any successful
-    // Wi-Fi business packet resets the counter in markNetworkBusinessHealthy().
     if (this.networkCommandFailureCount >= 2) {
       console.info(`[BLE-MODE][auto-failover] confirmed Wi-Fi command failures=${this.networkCommandFailureCount}`)
       this.enableBleBusinessMode(true).catch((err: Error) => {
@@ -3081,13 +3060,8 @@ struct Index {
       return
     }
     if (this.protocolPendingMode.length > 0) {
-      // Broker routing proves reachability only. The encrypted payload must
-      // explicitly declare its protocol before it can confirm a switch.
       return
     }
-    // A device may keep the old transport alive briefly, or deliberately use
-    // both transports for maintenance. Ordinary traffic therefore proves only
-    // reachability; it must not overwrite a confirmed protocol selection.
   }
 
   resolvePayloadSource(source: string, jsonStr: string): string {
@@ -3104,7 +3078,6 @@ struct Index {
         return this.normalizeProtocolMode(declaredProtocol.toUpperCase()) === 'HTTP' ? 'HTTP_SENSOR' : 'MQTT'
       }
     } catch (_) {
-      // Older brokers omit transport metadata; non-protocol payloads keep the legacy source.
     }
     return source
   }
@@ -3547,7 +3520,6 @@ struct Index {
         }
       }
     } catch (_) {
-      // The encrypted packet route remains authoritative when metadata is absent.
     }
     return fallbackDeviceId
   }
@@ -3840,8 +3812,6 @@ struct Index {
       if (type !== 'ack' || cmd !== 'proto' || !ok) {
         return false
       }
-      // A protocol ACK belongs to one switch transaction. Older firmware
-      // omitted seq; accepting it can confirm the wrong device or old route.
       if (seq !== this.protocolPendingSeq) {
         return false
       }
@@ -3887,9 +3857,6 @@ struct Index {
         return false
       }
       const sourceProtocol = this.protocolFromSource(source)
-      // Periodic business state must arrive over the protocol it declares.
-      // device_hello is allowed over MQTT as a maintenance declaration while
-      // HTTP is the selected business route.
       if (type !== 'device_hello' && sourceProtocol !== target) {
         return false
       }
@@ -3979,7 +3946,6 @@ struct Index {
         return staticFallback
       } catch (staticErr) {
         attempts.push((staticErr as Error).message)
-        // Continue to algorithm auto-correction below.
       }
 
       const staticOtherMode = this.otherCryptoMode(expectedMode)
@@ -3999,7 +3965,6 @@ struct Index {
         return staticOtherFallback
       } catch (staticOtherErr) {
         attempts.push((staticOtherErr as Error).message)
-        // Continue to dynamic algorithm auto-correction below.
       }
 
       if (this.cryptoPendingMode.length > 0) {
@@ -4509,8 +4474,15 @@ struct Index {
         return
       }
       if (command.kind === 'door') {
-        await this.ackCloudCommand(command.id, false, 'door control is query-only by local safety policy')
-        this.addMqttMessage('cloud/app/door', `[REJECTED:SAFETY] door write ${command.id}`)
+        if (!this.isBridgeActuallyConnected()) {
+          console.info(`[Cloud][command-retry] ${command.id} local bridge not ready`)
+          return
+        }
+        const unlock = command.unlock === true ||
+          (command.unlock === undefined && command.locked === false && command.power === true)
+        await this.sendDoorControl(unlock)
+        await this.ackCloudCommand(command.id, true, `${unlock ? '解锁' : '上锁'}指令已由大禹下发`)
+        this.addMqttMessage('cloud/app/door', `[SENT:CLOUD] door=${unlock ? 'unlock' : 'lock'} ${command.id}`)
         return
       }
       if (command.kind !== 'light') {
@@ -4631,10 +4603,6 @@ struct Index {
   }
 
   reportCloudSensor(data: SensorPacket, source: string): void {
-    // ESP32 每秒上报一次，逐包同步到云端会持续占用 UI 线程和网络。
-    // 这里按 CLOUD_SENSOR_MIN_INTERVAL_MS 节流，并保留最新一包在窗口结束后补发，
-    // 保证云端始终能收到最新读数，不会因为节流而丢掉最后一次变化。
-    // 告警不走这里，由 reportCloudAlarmState/queueCloudAlarmReport 立即上报。
     const nowMs = Date.now()
     const waited = nowMs - this.lastCloudSensorReportAt
     if (waited < CLOUD_SENSOR_MIN_INTERVAL_MS) {
@@ -4885,14 +4853,9 @@ struct Index {
         })
           this.recordProtocolSwitchAck(normalizedDeviceId, observed, inferredAck, sourceProtocol, true)
         }
-        // During a global switch, old-route periodic packets must not overwrite
-        // a device that already acknowledged the new route.
         return
       }
     }
-    // A successfully decrypted business packet carrying proto is authoritative
-    // for the device's current Wi-Fi command route. MQTT key exchange / hello
-    // traffic is only a maintenance channel and must not overwrite this route.
     this.updateDeviceDescriptorModes(deviceId, observed, '')
     this.localGatewayTransportByDevice.set(deviceId, observed)
     if (deviceId === this.activeDeviceId && this.commandTransport !== observed) {
@@ -4904,8 +4867,6 @@ struct Index {
     try {
       const data = JSON.parse(jsonStr) as SensorPacket
       this.markNetworkBusinessHealthy(source, deviceId)
-      // BLE uses compact field names to keep encrypted Notify packets below MTU.
-      // Normalize them here so the existing UI and cloud paths remain unchanged.
       if (data.temperature === undefined && data.temp === undefined && data.tp !== undefined) {
         data.temperature = data.tp
       }
@@ -5504,8 +5465,6 @@ struct Index {
     const rawKeySource = data['keySource'] as string
     const keySource = typeof rawKeySource === 'string' ? rawKeySource.toLowerCase() : ''
     const descriptor = this.loadDeviceRegistry()[deviceId]
-    // A boot report describes the device state; it is not permission to
-    // overwrite Dayu's selected transport and crypto mode.
     const bootCrypto = descriptor && descriptor.crypto.length > 0 ?
       this.normalizeCryptoMode(descriptor.crypto.toUpperCase()) : 'SM4'
     const bootTransport = descriptor && descriptor.transport.length > 0 ?
@@ -5907,8 +5866,6 @@ struct Index {
       const message = (err as Error).message
       console.info(`[Crypto][decrypt-fail] topic=${topic} source=${source} ${message}`)
       if (source === 'HTTP_SENSOR' && !allowKeyRecovery) {
-        // /api/state returns a rolling history. Old-session packets must not force
-        // the current command key back to static while the live channel is healthy.
         console.info('[ECDH][recover-skip] HTTP sensor history is not a key-recovery signal')
       } else if (this.irLearnActive && topic === 'esp32/ac') {
         console.info(`[ECDH][recover-skip] keep IR learning key after ${source} decrypt failure`)
@@ -6856,7 +6813,6 @@ struct Index {
         this.federatedCollector.recordAction(plannedCall.power ? 'ac_on' : 'ac_off', actionSource, trainingEligible)
         continue
       }
-      // The planner output contract has no dispatch path for door or alarm writes.
       throw new Error(`安全策略拒绝工具: ${plannedCall.tool}`)
     }
   }
@@ -6893,6 +6849,9 @@ struct Index {
       this.prepareFederatedDemoPlan(suggestion)
     }
     if (suggestion.action === this.lastModelSuggestionAction && now - this.lastModelSuggestionAt < 30 * 60 * 1000) {
+      if (this.federatedPlanReady) {
+        this.showModelSuggestionDialog = true
+      }
       return
     }
     if (this.modelSuggestionAction.length > 0 && now - this.lastModelSuggestionAt < 10 * 60 * 1000) {
@@ -6904,6 +6863,7 @@ struct Index {
     this.modelSuggestionReason = suggestion.reason
     this.modelSuggestionConfidence = suggestion.confidence
     this.modelStatusText = `v${suggestion.modelVersion} 已识别联邦需求，等待资格门`
+    this.showModelSuggestionDialog = true
   }
 
   private prepareFederatedDemoPlan(suggestion: BehaviorSuggestion): void {
@@ -6944,6 +6904,7 @@ struct Index {
     this.federatedPlanReady = true
     this.federatedPlanText = plan.calls.map((item: PlannerToolCall): string => this.plannerCallText(item)).join('；')
     this.modelStatusText = `资格门和规划安全门已通过，等待确认执行 ${plan.calls.length} 项`
+    this.showModelSuggestionDialog = true
   }
 
   private plannerCallText(call: PlannerToolCall): string {
@@ -6985,6 +6946,15 @@ struct Index {
     }
   }
 
+  async confirmModelSuggestion(): Promise<void> {
+    this.showModelSuggestionDialog = false
+    if (this.federatedDemoExecutionEnabled && this.federatedPlanReady) {
+      await this.executeFederatedDemoPlan()
+      return
+    }
+    this.modelStatusText = '已确认联邦建议；演示执行未开启，本次不会控制设备'
+  }
+
   modelActionText(action: string = this.modelSuggestionAction): string {
     if (action === 'lighting_brighten_needed') return '增加照明需求'
     if (action === 'lighting_reduce_needed') return '减弱照明/隐私需求'
@@ -6995,10 +6965,14 @@ struct Index {
   }
 
   dismissModelSuggestion(): void {
+    this.showModelSuggestionDialog = false
     this.modelStatusText = `已忽略：${this.modelActionText()}`
     this.modelSuggestionAction = ''
     this.modelSuggestionReason = ''
     this.modelSuggestionConfidence = 0
+    this.federatedPlan = null
+    this.federatedPlanReady = false
+    this.federatedPlanText = ''
   }
 
   refreshBehaviorModel(): void {
@@ -7828,9 +7802,6 @@ struct Index {
     clearDeviceDynamicCryptoKeys(sessionId)
     this.keyExchange.bindLocalIdentity(sessionId, deviceId, 'ble')
     this.keyExchange.resetDevice(sessionId)
-    // A process-local 1,2,3... epoch collides with encrypted packets left from
-    // a previous app run. Use wall-clock seconds as the floor and still keep it
-    // strictly increasing when several negotiations start in the same second.
     const previousEpoch = this.bleKeyEpochByDevice.get(deviceId) ?? 0
     const epochFloor = Math.floor(Date.now() / 1000) % 2147483647
     const epoch = Math.max(previousEpoch + 1, epochFloor)
@@ -8074,9 +8045,6 @@ struct Index {
       console.info(`[BLE-ECDH][RX-ACK] decrypted device=${deviceId} ${decrypted.plaintext.substring(0, 160)}`)
       const ack = JSON.parse(decrypted.plaintext) as Record<string, Object>
       const isKeyAck = ack['type'] === 'ack' && ack['cmd'] === 'key' && ack['ok'] !== false
-      // A successful GCM decrypt under the pending key proves both peers
-      // derived the same ECDH/HKDF material. Use it as confirmation when the
-      // dedicated key ACK is lost but the first encrypted device event arrives.
       if (isKeyAck || Object.keys(ack).length > 0) {
         const activated = this.keyExchange.activatePendingKeys(sessionId)
         if (activated === null) {
@@ -8206,8 +8174,6 @@ struct Index {
       return false
     }
     const seq = typeof data['seq'] === 'number' ? data['seq'] as number : 0
-    // Early Stage 2 firmware reports seq=0. With only one in-flight BLE debug
-    // command, the target deviceId is sufficient to correlate that legacy ACK.
     if (seq > 0 && seq !== this.bleDebugPendingSeq) {
       return false
     }
@@ -9198,9 +9164,6 @@ struct Index {
     })
     this.persistGatewayBleDevices()
 
-    // Provisioning uses BLE only as a secure setup channel. In network mode,
-    // release every GATT connection after claim so both ESP32 boards can resume
-    // Wi-Fi business traffic. BLE business mode owns its own reconnect flow.
     if (!this.bleBusinessDesired) {
       setTimeout((): void => {
         if (recoverySeq !== this.postProvisionBleRecoverySeq || this.bleBusinessDesired ||
@@ -9305,8 +9268,6 @@ struct Index {
       this.gatewayBleStatus = '设备已真正移除，正在扫描待添加设备'
       this.addProvisioningDiagnosticLog(`设备已移除 device=${deviceId}`)
       if (!this.bleBusinessDesired) {
-        // Removal can connect every known peripheral while recovering the
-        // target. Release them so untouched devices resume Wi-Fi traffic.
         setTimeout((): void => {
           if (!this.bleBusinessDesired && this.provisioningConnected && this.provisioningPort.isOpen()) {
             this.requestGatewayBleSuspend().catch((suspendErr: Error) => {
@@ -9315,8 +9276,6 @@ struct Index {
           }
         }, 300)
       }
-      // The peripheral acknowledges removal before its delayed reboot. Wait
-      // until it is advertising as an unclaimed device before scanning again.
       setTimeout(() => {
         if (this.showProvisioningPanel && this.provisioningConnected && !this.gatewayBleScanning) {
           this.startGatewayBleScan()
@@ -9388,9 +9347,6 @@ struct Index {
     if (byId !== undefined && byId.connected) {
       return byId
     }
-    // A stale scan entry and its promoted stable entry can coexist after an
-    // older app version. Prefer the live address match so the first add does
-    // not wait on the obsolete temporary identity.
     if (normalizedAddress.length > 0) {
       const connectedByAddress = this.gatewayBleDevices.find((item: GatewayBleDeviceInfo) =>
         item.address.trim().toUpperCase() === normalizedAddress && item.connected)
@@ -9598,9 +9554,6 @@ struct Index {
     }
     await this.waitForNetworkResume(targetDeviceId)
     await this.waitForNetworkCryptoSession(targetDeviceId)
-    // During a global protocol switch each device may be at a different stage;
-    // use its confirmed route instead of sending every business command to the
-    // pending target route.
     const protocol = this.transportRouteForDevice(targetDeviceId)
     await this.sendEncryptedCommandUsingCurrentSession(baseUrl, jsonCmd, protocol, topic, targetDeviceId)
   }
@@ -9638,8 +9591,6 @@ struct Index {
       await this.sendBleEncryptedPayload(targetDeviceId, commandTopic, payloadBase64, encrypted.length, mode)
       return
     }
-    // DAYU owns the local broker. A command is considered dispatched once it is
-    // accepted locally; an ESP32 may reconnect and consume it later.
     if (targetProtocol === 'MQTT' && this.localMqtt.isConnected()) {
       await this.withTimeout(this.localMqtt.publish(commandTopic, encrypted, 0),
         MQTT_COMMAND_PUBLISH_TIMEOUT_MS, 'local MQTT publish')
@@ -10172,8 +10123,6 @@ struct Index {
     const host = this.localGatewayHost.length > 0 ? this.localGatewayHost : fallbackHost
     this.applyProvisioningTlsMode(this.provisioningUseTls, host.length > 0 ? host : '192.168.3.5')
     this.provisioningCrypto = currentCryptoMode().toLowerCase()
-    // Newly claimed devices must join the current Wi-Fi protocol. Otherwise
-    // leaving BLE creates a mixed MQTT/HTTP fleet and an avoidable first switch.
     this.provisioningTransport = this.commandTransport.toLowerCase() === 'http' ? 'http' : 'mqtt'
   }
 
@@ -10266,8 +10215,6 @@ struct Index {
     this.clearProvisioningPendingFrame(false)
     this.provisioningBusy = false
     if (this.bleBusinessDesired) {
-      // The gateway USB session carries all BLE business traffic. Closing the
-      // device-access overlay must not tear it down while BLE mode is active.
       this.provisioningConnected = this.provisioningPort.isOpen()
       return
     }
@@ -10332,8 +10279,6 @@ struct Index {
     }
     const vid = parts[1] || ''
     const pid = parts[2] || ''
-    // The bus-address field can use any bus number (2-67, 5-42, 5-45,
-    // and so on). Interface IDs remain stable across re-enumeration.
     if (parts.length >= 7) {
       return `gw|${vid}|${pid}|${parts[5] || '-'}|${parts[6] || '-'}`
     }
@@ -10785,10 +10730,6 @@ struct Index {
     this.addProvisioningDiagnosticLog(`自动连接已找到已记住的 USB 网关：${devices[targetIndex].title}`)
     const needsAccessRight = !this.provisioningPort.hasDeviceAccessRight(devices[targetIndex])
     if (needsAccessRight) {
-      // A gateway reboot changes its USB bus address, so OpenHarmony treats it
-      // as a newly enumerated device. Continue the BLE-switch gesture through
-      // open(), which requests the new address permission, instead of waiting
-      // for a hidden debug-panel button that the user cannot see.
       this.gatewayUsbTestStatus = '网关已重新枚举，正在续接 USB 权限'
       this.provisioningStatus = '正在请求重新枚举后的 USB 网关权限'
       if (this.bleBusinessDesired) {
@@ -10809,8 +10750,6 @@ struct Index {
       return
     }
 
-    // Persist the current bus address after every successful re-enumeration.
-    // Otherwise the next reboot always starts from the obsolete address.
     this.gatewayUsbDeviceKey = this.provisioningDeviceKey(devices[targetIndex])
     this.gatewayAutoConnectAttempt = 0
     this.addProvisioningDiagnosticLog(`USB 网关已自动续接：${this.gatewayUsbDeviceKey}`)
@@ -11030,7 +10969,6 @@ struct Index {
         payloadSeq = payloadAck['seq'] as number
       }
     } catch (_) {
-      // The status below will report malformed ACK JSON after the frame is matched.
     }
 
     const expectedSeq = this.gatewayUsbTestPendingSeq
@@ -11111,8 +11049,6 @@ struct Index {
     this.gatewayBleConnectionEventSeq = this.gatewayBleScanSeq
     this.gatewayBleSuspendPendingSeq = -1
     this.gatewayBleScanning = true
-    // Keep verified devices across scans. BLE and Wi-Fi share the ESP32-S3
-    // radio, so one scan may only rediscover one of the household boards.
     this.gatewayBleCandidateCount = 0
     this.gatewayBleCandidateAddresses = []
     this.gatewayBleStatus = `正在请求扫描 #${this.gatewayBleScanSeq}，已保存 ${this.gatewayBleDevices.length} 台家居设备`
@@ -11307,9 +11243,6 @@ struct Index {
     const shouldRecoverGatewayClaim = !locallyRemoved && eventType === 'device_hello' && addressMatchesLocalClaim &&
       existing !== null && existing.claimed && !existing.commissioning && connectedFromEvent &&
       hasReportedCommissioning && !reportedCommissioning && hasReportedClaimed && !reportedClaimed
-    // An explicit commissioning=true comes from the peripheral's GATT hello
-    // and always revokes stale local/gateway ownership. A scan-time claimed=false
-    // alone is only a gateway cache miss, so keep an existing local claim.
     const commissioning = locallyRemoved ? true : (hasReportedCommissioning ? reportedCommissioning :
       (existing !== null ? existing.commissioning : true))
     const claimed = locallyRemoved || commissioning ? false :
@@ -11323,8 +11256,6 @@ struct Index {
         (existing !== null ? existing.rssi : 0),
       capabilities: capabilities.length > 0 ? capabilities :
         (existing !== null ? existing.capabilities : []),
-      // A ble_device event only means an advertisement was found. Its
-      // connected:false must never overwrite the live GATT connection state.
       connected: connectedFromEvent,
       transport: typeof data['transport'] === 'string' ? data['transport'] as string :
         (existing !== null ? existing.transport : 'ble'),
@@ -11337,9 +11268,6 @@ struct Index {
       lastSeen: Date.now()
     }
 
-    // A scan entry starts with the BLE address and is promoted to the stable
-    // device ID after device_hello. Keep an in-flight add operation attached
-    // to that promoted identity so the UI and command path stay in sync.
     if (existing !== null && existing.deviceId !== deviceId &&
       this.bleProvisionSelectedDeviceId === existing.deviceId) {
       this.bleProvisionSelectedDeviceId = deviceId
@@ -11352,9 +11280,6 @@ struct Index {
       this.gatewayBleDevices = [...this.gatewayBleDevices, device]
     }
     this.persistGatewayBleDevices()
-    // A peripheral hello with commissioning=true proves the device-side reset
-    // completed. Keep the remove transaction alive so it can still forget the
-    // gateway record and clear local bindings.
     if (commissioning && !claimed && this.bleRemovePendingDeviceId === deviceId) {
       this.bleRemoveStatus = '设备已重置，正在完成网关和本地清理'
     }
@@ -11504,11 +11429,6 @@ struct Index {
         this.scheduleGatewayRebootRecovery(delayMs + GATEWAY_REBOOT_CLOSE_DELAY_MS)
         return
       }
-      // Each GATT connection keeps the sequence of the scan/reconnect batch that
-      // created it. With two peripherals connected in parallel, valid device
-      // messages can therefore carry different sequence values. Only lifecycle
-      // events belong to one global transaction; device hello/state/data events
-      // are authenticated and matched by deviceId further below.
       const staleScanLifecycle = (eventType === 'ble_scan_started' || eventType === 'ble_scan_finished') &&
         this.gatewayBleScanning && this.gatewayBleScanSeq > 0 && payloadSeq !== this.gatewayBleScanSeq
       const staleReconnectLifecycle = (eventType === 'ble_reconnect_started' ||
@@ -11647,8 +11567,6 @@ struct Index {
           this.bleDebugAlarmGatewaySeq = 0
         }
         if (data['ok'] === true && keyResult) {
-          // GATT write succeeded; keep the handshake timer running until the
-          // peripheral public key and encrypted key ACK arrive.
           this.bleDebugKeyGatewaySeq = 0
         }
         if (data['ok'] !== true && keyResult) {
@@ -11825,9 +11743,6 @@ struct Index {
         this.addProvisioningDiagnosticLog(
           `忽略过期 BLE 挂起 ACK seq=${payloadSeq} pending=${this.gatewayBleSuspendPendingSeq} desired=${this.bleBusinessDesired}`)
         if (this.bleBusinessDesired) {
-          // The gateway has already executed disconnect-all even though this
-          // ACK no longer owns the UI state. Abort any recovery generation
-          // that the suspend just invalidated, then start a fresh handshake.
           this.gatewayBleSuspendPendingSeq = -1
           this.gatewayBleConnectionEventSeq = 0
           this.clearGatewayUsbTestTimer()
@@ -12669,8 +12584,6 @@ struct Index {
     const time = new Date().toLocaleTimeString()
     this.provisioningLogSeq = (this.provisioningLogSeq + 1) % 10000
     const seqText = this.provisioningLogSeq.toString().padStart(4, '0')
-    // Keep the log in chronological order. Inserting at the head rebuilt the
-    // scroll content on every message and visibly jumped the panel to the top.
     this.pendingProvisioningFrameLogs.push(`${time} #${seqText} ${message}`)
     if (this.provisioningLogFlushTimerId === -1) {
       this.provisioningLogFlushTimerId = setTimeout(() => {
@@ -12710,7 +12623,6 @@ struct Index {
       const offset = this.debugInfoScroller.currentOffset()
       this.debugInfoScrollOffset = Math.max(0, offset.yOffset)
     } catch (_) {
-      // The scroller may not be bound during the panel's first layout pass.
     }
     return this.debugInfoScrollOffset
   }
@@ -12720,8 +12632,6 @@ struct Index {
       clearTimeout(this.debugInfoScrollRestoreTimerId)
     }
     const targetOffset = Math.max(0, savedOffset)
-    // Reapply the user's current position after ArkUI rebuilds the log list.
-    // New messages must never force a user who is reading above back to bottom.
     this.debugInfoScrollRestoreTimerId = setTimeout(() => {
       this.debugInfoScrollRestoreTimerId = -1
       if (this.showDebugPanel) {
@@ -18786,6 +18696,25 @@ struct Index {
         .width('100%')
         .height('100%')
         .backgroundColor('rgba(94, 34, 42, 0.34)')
+      } else if (this.showModelSuggestionDialog) {
+        Stack({ alignContent: Alignment.Center }) {
+          ModelSuggestionDialogPanel({
+            action: this.modelActionText(),
+            reason: this.modelSuggestionReason,
+            confidence: this.modelSuggestionConfidence,
+            planText: this.federatedPlanReady ? this.federatedPlanText : '建议已识别，等待第二次同向采样后生成执行计划',
+            confirmLabel: this.federatedPlanReady ? '确认执行' : '确认建议',
+            onCancel: () => { this.dismissModelSuggestion() },
+            onConfirm: () => {
+              this.confirmModelSuggestion().catch((err: Error) => {
+                this.modelStatusText = `联邦建议执行失败：${err.message}`
+              })
+            }
+          })
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(32, 36, 42, 0.58)')
       } else if (this.showProvisioningOutputPanel) {
         Stack({ alignContent: Alignment.Center }) {
           ProvisioningOutputView({
@@ -18886,16 +18815,6 @@ struct Index {
   }
 }
 
-/**
- * 总览页温湿度指标单元格。
- *
- * 这里必须是独立 @Component 而不是 @Builder：ArkUI 中 @Builder 按值传参时，
- * 状态变量变化不会触发 Builder 内部刷新，会导致室内外温湿度必须切换页面
- * 才更新。改为 @Component + @Prop 后，父组件状态变化能正常驱动局部刷新，
- * 同时把重渲染范围限制在单个单元格内。
- *
- * 颜色由父组件传入，暗色模式与告警配色行为保持不变。
- */
 @Component
 struct MetricValueCell {
   @Prop label: string = ''
@@ -18950,15 +18869,6 @@ struct MetricValueCell {
   }
 }
 
-/**
- * 烟雾 / 水浸报警状态指示。
- *
- * 与 MetricValueCell 同理：原先是按值传参的 @Builder，active 变化不会触发
- * 内部刷新，报警状态必须切换页面才更新。报警属于安全相关显示，这里改为
- * 独立 @Component，确保 smokeAlarm / waterAlarm 变化立即反映到界面。
- *
- * 点击消警仍由父组件处理，通过 onTap 回调传回，行为与原实现一致。
- */
 @Component
 struct AlarmStatusCell {
   @Prop label: string = ''
@@ -19099,12 +19009,6 @@ struct SettingsFeatureImageCell {
   }
 }
 
-/**
- * 设置页八宫格功能卡片。
- *
- * 使用独立 @Component + @Prop 接收动态状态，避免 @Builder 按值参数在
- * 蓝牙模式、协议或加密状态变化后仍显示旧内容，直到切换页面才重建。
- */
 @Component
 struct SettingsFeatureCardCell {
   @Prop title: string = ''
@@ -19172,6 +19076,78 @@ struct SettingsFeatureCardCell {
  * 告警关闭确认对话框。
  * 完全使用硬编码颜色，无需父组件传入主题色。
  */
+@Component
+export struct ModelSuggestionDialogPanel {
+  @Prop action: string = ''
+  @Prop reason: string = ''
+  @Prop confidence: number = 0
+  @Prop planText: string = ''
+  @Prop confirmLabel: string = '确认建议'
+  onCancel: () => void = () => {}
+  onConfirm: () => void = () => {}
+
+  build() {
+    Column() {
+      Text('联邦模型建议')
+        .fontSize(26)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#1F3A33')
+      Text(this.action)
+        .fontSize(21)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#147A55')
+        .margin({ top: 14 })
+      Text(this.reason)
+        .width('100%')
+        .fontSize(15)
+        .fontColor('#46635A')
+        .textAlign(TextAlign.Center)
+        .margin({ top: 10 })
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+      Text(`置信度 ${(this.confidence * 100).toFixed(1)}%`)
+        .fontSize(14)
+        .fontColor('#147A55')
+        .margin({ top: 10 })
+      Text(this.planText)
+        .width('100%')
+        .fontSize(14)
+        .fontColor('#46635A')
+        .textAlign(TextAlign.Center)
+        .margin({ top: 14, bottom: 24 })
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+      Row() {
+        Button('稍后处理')
+          .layoutWeight(1)
+          .height(44)
+          .fontSize(15)
+          .fontColor('#46635A')
+          .backgroundColor('#E7F0EC')
+          .borderRadius(8)
+          .onClick(() => { this.onCancel() })
+        Button(this.confirmLabel)
+          .layoutWeight(1)
+          .height(44)
+          .fontSize(15)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#FFFFFF')
+          .backgroundColor('#16815B')
+          .borderRadius(8)
+          .margin({ left: 12 })
+          .onClick(() => { this.onConfirm() })
+      }
+      .width('100%')
+    }
+    .width(480)
+    .padding(28)
+    .borderRadius(8)
+    .backgroundColor('#F2FAF6')
+    .border({ width: 1, color: '#A5D4BE' })
+  }
+}
+
 @Component
 export struct CriticalDialogPanel {
   @Prop alarmDialogTarget: string = ''

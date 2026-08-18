@@ -9,9 +9,6 @@ from dataclasses import dataclass
 
 PUNCTUATION_RE = re.compile(r"[\s，。！？、,.!?；;：:]")
 
-# Frequent ASR substitutions observed in the held-out data.  Normalization is
-# deliberately narrow: broad phonetic rewriting could turn unrelated speech
-# into a control command.
 ASR_ALIASES = {
     "门进": "门禁",
     "门所": "门锁",

@@ -27,7 +27,6 @@ console.log = (...args) => {
   try {
     fs.appendFileSync(RUNTIME_LOG_PATH, `[${new Date().toISOString()}] ${line}\n`)
   } catch (_) {
-    // Keep broker running even if file logging fails.
   }
 }
 
@@ -261,7 +260,6 @@ function getBroadcastAddresses() {
       .forEach((item) => {
         const addrParts = item.address.split('.').map(Number)
         const maskParts = item.netmask.split('.').map(Number)
-        // 骞挎挱鍦板潃 = IP | (~瀛愮綉鎺╃爜)
         const broadcast = addrParts.map((octet, i) => (octet | (~maskParts[i] & 0xFF))).join('.')
         result.push({ name, address: item.address, broadcast })
       })
@@ -269,7 +267,6 @@ function getBroadcastAddresses() {
   return result.sort(sortLanInterfaces)
 }
 
-// UDP 骞挎挱淇℃爣锛氬悜灞€鍩熺綉鎵€鏈夎澶囧鍛?Broker 鍦板潃
 function sendUdpBeacon() {
   const beacons = getBroadcastAddresses()
   if (beacons.length === 0) {
@@ -303,7 +300,6 @@ function sendUdpBeacon() {
     })
   })
 
-  // Close the temporary socket after beacon send.
   setTimeout(() => {
     try { socket.close() } catch (_) { /* ignore */ }
   }, 500)
@@ -899,10 +895,8 @@ function handleMqttPacket(topic, payloadBuffer) {
   }
 
   const payloadText = payloadBuffer.toString('utf8')
-  // 鍏堝皾璇?JSON 瑙ｆ瀽
   try {
     const data = JSON.parse(payloadText)
-    // 鈹€鈹€ 鏄庢枃 JSON 娑堟伅 鈹€鈹€
     if (topic === TOPIC_SENSOR_INDOOR || topic === TOPIC_SENSOR_LEGACY ||
       (topic.startsWith('device/') && topic.endsWith('/sensor'))) {
       const sensor = Object.assign({}, data)
@@ -914,7 +908,6 @@ function handleMqttPacket(topic, payloadBuffer) {
       }
       state.sensor = Object.assign({}, state.sensor, sensor)
       state.lastMessage = `鏀跺埌浼犳劅鍣ㄦ暟鎹?${new Date().toLocaleTimeString()}`
-      // 鍚屾椂淇濆瓨鏄庢枃鐢ㄤ簬璋冭瘯
       state.encrypted.lastPlainText = payloadText
       state.encrypted.lastRawTime = Date.now()
       state.encrypted.lastTopic = topic
@@ -927,7 +920,6 @@ function handleMqttPacket(topic, payloadBuffer) {
       state.lastMessage = `鏀跺埌鐓ф槑鐘舵€?${new Date().toLocaleTimeString()}`
     }
   } catch (_) {
-    // 鈹€鈹€ 涓嶆槸 JSON锛屼綔涓哄姞瀵嗕簩杩涘埗 payload 澶勭悊 鈹€鈹€
     if (topic === TOPIC_STATUS || (topic.startsWith('device/') && topic.endsWith('/status'))) {
       state.lastMessage = `收到 ESP32 status ${new Date().toLocaleTimeString()} (${payloadBuffer.length}B)`
       console.log(`[MQTT] encrypted status on ${topic}: ${payloadBuffer.length} bytes (not cached)`)
@@ -1145,7 +1137,6 @@ function sendJson(res, statusCode, data) {
 
 function publishLightControl(control) {
   const payload = JSON.stringify(control)
-  // 鍚屾椂鍙戝竷鍒颁富 topic 鍜屽吋瀹瑰埆鍚?topic锛岀‘淇?ESP32 鏃犺璁㈤槄鍝釜閮借兘鏀跺埌
   const publishTargets = [TOPIC_LIGHT_SET, 'dayu/cmd']
   publishTargets.forEach((topic) => {
     aedes.publish({
@@ -1172,7 +1163,6 @@ async function handleHttpRequest(req, res) {
       ok: true,
       message: state.lastMessage,
       state,
-      // 鍔犲瘑閫氫俊瀛楁 鈥?澶х绔粠姝ゅ瓧娈佃幏鍙栧姞瀵?payload
       encrypted: state.encrypted.enabled ? {
         enabled: true,
         payloadBase64: state.encrypted.lastRawBase64,
@@ -1278,8 +1268,6 @@ async function handleHttpRequest(req, res) {
     return
   }
 
-  // Dayu -> Broker HTTP command queue. ESP32 should poll /api/http/command?deviceId=esp32
-  // while protocol mode is HTTP. This does not publish to MQTT.
   if (req.method === 'POST' && req.url === '/api/http/command') {
     try {
       const body = await readRequestBody(req)
@@ -1377,7 +1365,6 @@ async function handleHttpRequest(req, res) {
     return
   }
 
-  // UDP 杞彂锛氭帴鏀?Dayu210 娑堟伅锛孭C 绔?socket 鏉冮檺瀹屾暣鍙彂骞挎挱
   if (req.method === 'POST' && req.url === '/api/udp/send') {
     try {
       const body = await readRequestBody(req)
@@ -1584,7 +1571,6 @@ httpServer.listen(HTTP_PORT, HOST, () => {
   })
   console.log('[Bridge] API: GET /api/state, POST /api/light/control, POST /api/encrypted/command, POST /api/http/sensor')
 
-  // 鍚姩 UDP 骞挎挱淇℃爣
   if (BEACON_ENABLED) {
     sendUdpBeacon()
     beaconTimer = setInterval(sendUdpBeacon, BEACON_INTERVAL)

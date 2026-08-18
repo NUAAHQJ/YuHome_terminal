@@ -17,16 +17,10 @@ const SERIAL_NONE: number = -1
 const WCH_VENDOR_ID: number = 0x1A86
 const CP210X_VENDOR_ID: number = 0x10C4
 const READ_TIMEOUT_MS: number = 250
-// A pending USB IN transfer completes immediately when data arrives. A longer
-// idle timeout avoids waking ArkTS and the USB service every second while the
-// BLE gateway is connected but quiet, without adding receive latency.
 const USB_READ_TIMEOUT_MS: number = 5000
 const USB_READ_RETRY_DELAY_MS: number = 500
 const USB_READ_BUFFER_SIZE: number = 1024
 const READ_ACTIVE_DELAY_MS: number = 0
-// 分级空闲退避：刚空闲时保持较快轮询以压低首字节延迟，
-// 持续空闲超过 READ_IDLE_SLOW_AFTER_MS 后放慢，避免空载占满 UI 线程。
-// 配网帧重发周期为 1s、整体超时 15s，最大 120ms 的检测延迟不影响配网流程。
 const READ_IDLE_DELAY_MS: number = 20
 const READ_IDLE_SLOW_DELAY_MS: number = 120
 const READ_IDLE_SLOW_AFTER_MS: number = 1000
@@ -342,12 +336,6 @@ export class UsbSerialProvisioningPort {
         Date.now() < waitDeadline) {
         await this.waitMs(2)
       }
-      // OpenHarmony can abort an outstanding bulk-IN transfer when the same
-      // pipe is used for bulk-OUT without ever settling the original Promise.
-      // In that case the old in-flight bit would permanently prevent the IN
-      // endpoint from being armed again after this write. Move to a new read
-      // generation atomically so late callbacks from the abandoned transfer
-      // cannot clear or re-arm the new generation's slot.
       if (this.usbReadInFlightByEndpoint.some((inFlight: boolean) => inFlight)) {
         this.readGeneration += 1
         this.usbReadInFlightByEndpoint = this.usbReadEndpoints.map(() => false)
@@ -419,7 +407,6 @@ export class UsbSerialProvisioningPort {
         })
       })
     } catch (_) {
-      // Some devices expose only raw USB host APIs. Keep the raw USB fallback.
     }
   }
 
@@ -539,11 +526,6 @@ export class UsbSerialProvisioningPort {
     if (candidate.clazz === 0xFF) {
       score += 10
     }
-    // ESP32-S3's native USB Serial/JTAG is a composite device. The JTAG
-    // function can also expose bulk endpoints, but the application protocol
-    // is carried by the CDC data interface. Prefer CDC data explicitly and,
-    // when descriptors are vendor-specific, prefer the second endpoint pair
-    // conventionally used by the CDC serial function (0x02/0x82).
     if ((device.vendorId || 0) === 0x303A) {
       if (candidate.clazz === USB_CLASS_CDC_DATA) {
         score += 160
@@ -627,12 +609,6 @@ export class UsbSerialProvisioningPort {
 
     this.claimedInterfaces = [endpointSet.iface]
     this.claimRelatedInterfaces(pipe, selected, endpointSet.iface.id, endpointSet.cdcControlInterfaceId)
-    // ESP32-S3 exposes two independent bulk functions: CDC Serial and JTAG.
-    // The application protocol is carried only by the selected CDC data
-    // interface. Reading the JTAG IN endpoint concurrently makes the SDK
-    // issue competing reads on one USB pipe and can prevent CDC data from
-    // being delivered at all (the device then appears to ACK, while the host
-    // receives zero bytes).
     this.usbReadEndpoints = [{ iface: endpointSet.iface, endpoint: endpointSet.inEndpoint }]
     this.usbReadInFlightByEndpoint = this.usbReadEndpoints.map(() => false)
     this.log(`[USB] RX endpoints=${this.usbReadEndpoints.map((item: UsbBulkReadEndpoint) =>
@@ -753,8 +729,6 @@ export class UsbSerialProvisioningPort {
     dataInterfaceId: number,
     controlInterfaceId: number
   ): void {
-    // ESP32-S3 may expose Serial and JTAG as a composite USB device. Claim only
-    // the selected data interface and its paired CDC control interface.
     if (controlInterfaceId < 0 || controlInterfaceId === dataInterfaceId) {
       return
     }
@@ -918,9 +892,6 @@ export class UsbSerialProvisioningPort {
 
     try {
       await this.controlOut(0x21, 0x20, 0, interfaceId, lineCoding, 'CDC SET_LINE_CODING')
-      // Native ESP32-S3 USB CDC needs DTR asserted before it reliably sends
-      // bytes back to the host. Keep RTS low so this does not resemble the
-      // DTR/RTS auto-reset sequence used by external USB-UART bridges.
       const controlLineState = assertDtr ? 0x0001 : 0x0000
       let nativeControlResult = 0
       if (assertDtr && this.pipe !== null) {
@@ -1063,8 +1034,6 @@ export class UsbSerialProvisioningPort {
     }
 
     if (data.length === 0) {
-      // SDK 11 rejects zero-length legacy control buffers. This is an
-      // optional CDC line-state request for the raw bulk data path.
       this.log(`[USB] legacy controlTransfer cannot send zero-length request bRequest=0x${bRequest.toString(16)} value=0x${wValue.toString(16)} index=${wIndex}`)
       return 0
     }
@@ -1153,9 +1122,6 @@ export class UsbSerialProvisioningPort {
           return
         }
         this.usbReadInFlightByEndpoint[index] = false
-        // Re-arm the IN endpoint before parsing the current chunk. BLE replay
-        // sends several near-maximum frames in quick succession, and returning
-        // through the ArkTS timer queue here leaves a receive gap between them.
         this.scheduleUsbEndpointRead(index, generation, count)
         this.consumeReadBuffer(buffer, count)
       })
@@ -1180,9 +1146,6 @@ export class UsbSerialProvisioningPort {
       this.readUsbEndpointOnce(index, generation)
       return
     }
-    // OpenHarmony may abort an in-flight USB IN transfer when a control frame is
-    // written on the same pipe. During the command/ACK window, re-arm quickly so
-    // the gateway's immediate control_result and device ACK stay in the CDC queue.
     const retryDelay = Date.now() < this.burstReadUntil ? 5 : USB_READ_RETRY_DELAY_MS
     setTimeout(() => {
       this.readUsbEndpointOnce(index, generation)
@@ -1219,10 +1182,6 @@ export class UsbSerialProvisioningPort {
     }, this.nextReadDelay(lastReadCount))
   }
 
-  // 有数据时立即继续读，保证连续帧的接收速度不受影响。
-  // 空闲时先以 READ_IDLE_DELAY_MS 轮询，持续空闲超过
-  // READ_IDLE_SLOW_AFTER_MS 后退避到 READ_IDLE_SLOW_DELAY_MS，
-  // 避免没有设备或设备静默时空转占用 UI 线程。
   private nextReadDelay(lastReadCount: number): number {
     if (lastReadCount > 0) {
       this.idleReadSince = 0

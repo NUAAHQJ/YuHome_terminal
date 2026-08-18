@@ -1,5 +1,3 @@
-// Development mTLS identity signed by certs/ca.crt.
-// Production deployments should provision a per-device key through a secure keystore.
 export const DAYU_CLIENT_CERT = `-----BEGIN CERTIFICATE-----
 MIIEFjCCAv6gAwIBAgIUXi5rzWIfpvJKcx4u3IiYsh28wFowDQYJKoZIhvcNAQEL
 BQAwfDELMAkGA1UEBhMCQ04xDjAMBgNVBAgMBUxvY2FsMQ4wDAYDVQQHDAVMb2Nh
